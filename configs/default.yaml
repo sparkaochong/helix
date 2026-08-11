@@ -1,0 +1,73 @@
+# Helix default configuration.
+# Every section maps 1:1 onto a pydantic model in helix/config.py.
+
+data:
+  root: data
+  start_date: "20180101"
+  end_date: ""          # empty -> most recent trade date
+  calendar_exchange: SSE
+  requests_per_minute: 400
+  max_retries: 5
+
+universe:
+  exclude_st: true              # point-in-time, via namechange history
+  min_list_days: 120            # drop 次新股
+  exclude_exchanges: ["BJ"]     # 北交所
+  min_amount_kcny: 20000        # D0 amount >= 2000万元 (tushare unit is 千元)
+  min_close: 2.0
+  max_close: 1000.0
+
+label:
+  # Features are computed with information up to D0 close.
+  # Entry at D+1 open, target touched if D+2 high >= entry * target_ratio.
+  entry_offset: 1
+  touch_offset: 2
+  target_ratio: 1.08
+  exclude_entry_limit_up: true   # cannot fill if D+1 opens at/above the limit
+  limit_price_eps: 0.001         # yuan tolerance when comparing open to up_limit
+
+split:
+  train_days: 750        # ~3 years of trading days
+  valid_days: 120
+  test_days: 120
+  step_days: 120
+  embargo_days: 5        # >= touch_offset + 1, purges label leakage across the seam
+
+gp:
+  population: 400
+  generations: 25
+  tournament_size: 7
+  crossover_prob: 0.6
+  mutation_prob: 0.3
+  init_depth: [2, 5]
+  max_depth: 8
+  max_nodes: 40
+  windows: [3, 5, 10, 20, 60]
+  complexity_penalty: 0.0015     # subtracted per node from |gini|
+  min_daily_samples: 50
+  min_coverage: 0.4              # fraction of dates with a usable cross-section
+  max_abs_corr: 0.7              # dedup threshold against already-kept factors
+  n_keep: 24                     # factors handed to the DL stage
+  search_max_stocks: 2000        # liquidity-ranked subsample during evolution
+  hall_of_fame: 60
+  seed: 20240101
+
+dl:
+  seq_len: 20
+  hidden_size: 96
+  num_layers: 2
+  dropout: 0.2
+  batch_size: 4096
+  epochs: 30
+  lr: 0.001
+  weight_decay: 0.00001
+  early_stopping_patience: 5
+  pos_weight_cap: 20.0
+  clip_sigma: 4.0
+  seed: 20240101
+
+backtest:
+  top_k: 20
+  # Exit assumption: if the target is touched intraday on D+2 we fill at the target,
+  # otherwise we exit at the D+2 close. Costs are one-way.
+  cost_bps: 15.0

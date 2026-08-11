@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.egg-info/
+dist/
+build/
+
+# project artifacts (root-anchored: helix/data/ is source code, not data)
+/data/
+/runs/
+/artifacts/
+*.parquet
+*.ckpt
+*.pt
+
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
+
+# local agent tooling state
+.claude/
+.claude-flow/
