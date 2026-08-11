@@ -275,7 +275,12 @@ def main() -> None:
     ap.add_argument("--split-date", default="2024-09-04")
     ap.add_argument("--embargo-days", type=int, default=3)
     ap.add_argument("--top-k", type=int, default=20,
-                    help="Positions actually held per day.")
+                    help="Positions actually held per day. Ignored if --hold-grid is set.")
+    ap.add_argument("--hold-grid", default="",
+                    help="Comma-separated position counts, swept without refitting. Book "
+                         "size is the diversification axis: the same ranking spread over "
+                         "more names is the same edge with less variance, so this changes "
+                         "the shape of the curve without changing what is being predicted.")
     ap.add_argument("--signal-k", type=int, default=None,
                     help="Length of the ranked shortlist submitted. Defaults to --top-k "
                          "(no substitution). Set larger to allow filling down the list "
@@ -299,9 +304,10 @@ def main() -> None:
     # None first, so the ungated book is always the reference every gate is read against.
     gates: list[float | None] = [None] + [float(s) for s in args.min_score_grid.split(",")
                                           if s.strip()]
-    signal_k = args.signal_k if args.signal_k is not None else args.top_k
-    if signal_k < args.top_k:
-        raise SystemExit(f"--signal-k {signal_k} 小于持仓数 {args.top_k}，候选不够建仓")
+    holds = ([int(s) for s in args.hold_grid.split(",") if s.strip()] or [args.top_k])
+    signal_k = args.signal_k if args.signal_k is not None else max(holds)
+    if signal_k < max(holds):
+        raise SystemExit(f"--signal-k {signal_k} 小于最大持仓数 {max(holds)}，候选不够建仓")
 
     features = feature_columns(args.input)
     price_cols = ["label_px_d1_open", "label_px_d2_high", "label_px_d2_close"]
@@ -341,14 +347,14 @@ def main() -> None:
                          f"{STAMP_SELL_BPS}bp 单一税率会低估这段时间的成本")
 
     report = {"features": len(features), "train_end": train_end, "test_start": test_start,
-              "seeds": seeds, "top_k": args.top_k, "signal_k": signal_k,
+              "seeds": seeds, "hold_grid": holds, "signal_k": signal_k,
               "target_ratio": args.target_ratio, "min_score_grid": gates,
               "rank_by": args.rank_by, "return_col": args.return_col,
               "cost_bps": {"commission": COMMISSION_BPS, "transfer": TRANSFER_BPS,
                            "stamp_sell": STAMP_SELL_BPS},
               "runs": [], "summary": {}}
 
-    books: dict[tuple[str, float, float | None], list[dict]] = {}
+    books: dict[tuple[int, str, float, float | None], list[dict]] = {}
     series: list[pd.DataFrame] = []
     for seed in seeds:
         scored = test[["trade_date", args.label, args.ic_target, args.return_col,
@@ -360,48 +366,52 @@ def main() -> None:
         # its correlation with the peak, which is the classifier's home turf.
         ic_ret = daily_ic(scored, "score", args.return_col)
 
-        for exit_rule in ("target", "close"):
-            for slip in slippages:
-                for gate in gates:
-                    book, daily = run_book(scored, args.top_k, signal_k, args.target_ratio,
-                                           exit_rule, slip, gate)
-                    book |= {"seed": seed, "exit": exit_rule, "slippage_bps": slip,
-                             "min_score": gate,
-                             "ic_mean": round(ic, 6), "ic_vs_return": round(ic_ret, 6)}
-                    report["runs"].append(book)
-                    books.setdefault((exit_rule, slip, gate), []).append(book)
-                    series.append(daily.assign(seed=seed, exit=exit_rule,
-                                               slippage_bps=slip, min_score=gate))
-        base = books[("close", slippages[0], gates[0])][-1]
+        for hold in holds:
+            for exit_rule in ("target", "close"):
+                for slip in slippages:
+                    for gate in gates:
+                        book, daily = run_book(scored, hold, signal_k, args.target_ratio,
+                                               exit_rule, slip, gate)
+                        book |= {"seed": seed, "hold_k": hold, "exit": exit_rule,
+                                 "slippage_bps": slip, "min_score": gate,
+                                 "ic_mean": round(ic, 6), "ic_vs_return": round(ic_ret, 6)}
+                        report["runs"].append(book)
+                        books.setdefault((hold, exit_rule, slip, gate), []).append(book)
+                        series.append(daily.assign(seed=seed, hold_k=hold, exit=exit_rule,
+                                                   slippage_bps=slip, min_score=gate))
+        base = books[(holds[0], "close", slippages[0], gates[0])][-1]
         print(f"  seed {seed}  IC(peak) {ic:+.5f}  IC(ret) {ic_ret:+.5f}  "
               f"命中 {100 * base['hit_rate']:.2f}%  "
               f"收盘口径毛 {100 * base['gross_per_trade']:+.3f}%/笔")
 
-    sample = books[("close", slippages[0], gates[0])]
-    print(f"\n持仓 {args.top_k} / 候选 {signal_k} 收益分解（{len(seeds)} 个种子均值）：命中组"
-          f"持到 D+2 收盘 {100 * float(np.mean([r['win_to_close'] for r in sample])):+.2f}%"
-          f"  |  未命中组 {100 * float(np.mean([r['loss_to_close'] for r in sample])):+.2f}%")
-    print(f"实际建仓 {float(np.mean([r['avg_positions'] for r in sample])):.2f}/{args.top_k}"
-          f"  |  平均用到候选第 {float(np.mean([r['avg_fill_depth'] for r in sample])):.2f} 名"
-          f"  |  候选不够建满的交易日 "
-          f"{100 * float(np.mean([r['short_day_rate'] for r in sample])):.2f}%")
-    print(f"交易日 {float(np.mean([r['n_days'] for r in sample])):.0f}"
+    sample = books[(holds[0], "close", slippages[0], gates[0])]
+    print(f"\n候选 {signal_k}  |  交易日 {float(np.mean([r['n_days'] for r in sample])):.0f}"
           f"  |  止盈档 {args.target_ratio}  |  门槛网格 {gates}")
+    # Fill depth and the win/loss split both move with book size -- a deeper book reaches
+    # further down the shortlist and dilutes the hit group -- so this is per hold, not once.
+    for hold in holds:
+        runs = books[(hold, "close", slippages[0], gates[0])]
+        print(f"持仓 {hold:>2}：命中组持到 D+2 收盘 "
+              f"{100 * float(np.mean([r['win_to_close'] for r in runs])):+.2f}%"
+              f"  |  未命中组 {100 * float(np.mean([r['loss_to_close'] for r in runs])):+.2f}%"
+              f"  |  实际建仓 {float(np.mean([r['avg_positions'] for r in runs])):.2f}/{hold}"
+              f"  |  用到候选第 {float(np.mean([r['avg_fill_depth'] for r in runs])):.2f} 名"
+              f"  |  建不满 {100 * float(np.mean([r['short_day_rate'] for r in runs])):.2f}%")
 
     print(f"\n=== {len(seeds)} 个种子 均值 ± 标准差 ===")
-    print(f"{'退出假设':<16}{'滑点':>6}{'门槛':>7}{'空仓日':>8}{'净收益/笔':>17}{'CAGR':>17}"
-          f"{'Sharpe':>15}{'最大回撤':>10}")
-    for (exit_rule, slip, gate), runs in books.items():
+    print(f"{'退出假设':<16}{'持仓':>5}{'滑点':>6}{'门槛':>7}{'空仓日':>8}{'净收益/笔':>17}"
+          f"{'CAGR':>17}{'Sharpe':>15}{'最大回撤':>10}")
+    for (hold, exit_rule, slip, gate), runs in books.items():
         agg = {}
         for key in ("net_per_trade", "ann_return", "cagr", "sharpe", "max_drawdown",
                     "day_win_rate", "flat_day_rate"):
             values = [r[key] for r in runs]
             agg[key] = (float(np.mean(values)),
                         float(np.std(values, ddof=1)) if len(values) > 1 else 0.0)
-        report["summary"][f"{exit_rule}|{slip}|{gate}"] = {
+        report["summary"][f"h{hold}|{exit_rule}|{slip}|{gate}"] = {
             k: {"mean": round(m, 6), "std": round(s, 6)} for k, (m, s) in agg.items()}
         rule = "触及即成交" if exit_rule == "target" else "全部按 D+2 收盘"
-        print(f"{rule:<16}{slip:4.0f}bp{'—' if gate is None else f'{gate:.2f}':>7}"
+        print(f"{rule:<16}{hold:>5}{slip:4.0f}bp{'—' if gate is None else f'{gate:.2f}':>7}"
               f"{100 * agg['flat_day_rate'][0]:>7.1f}%"
               f"{100 * agg['net_per_trade'][0]:>11.3f}% ±{100 * agg['net_per_trade'][1]:.3f}"
               f"{100 * agg['cagr'][0]:>11.1f}% ±{100 * agg['cagr'][1]:.1f}"
@@ -412,8 +422,8 @@ def main() -> None:
         json.dump(report, fh, indent=2, ensure_ascii=False)
     print(f"\nwrote {args.report}")
 
-    # Long format keyed by (seed, exit, slippage, gate): one file feeds every window
-    # without re-running the model, which is the expensive half.
+    # Long format keyed by (seed, hold, exit, slippage, gate): one file feeds every window
+    # comparison without re-running the model, which is the expensive half.
     pd.concat(series, ignore_index=True).to_csv(args.daily_out, index=False)
     print(f"wrote {args.daily_out}")
 

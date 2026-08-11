@@ -55,7 +55,7 @@ def window_metrics(returns: np.ndarray, window: int) -> pd.DataFrame:
 
 
 def select_curve(df: pd.DataFrame, exit_rule: str, slippage: float,
-                 min_score: str) -> pd.DataFrame:
+                 min_score: str, hold: int | None = None) -> pd.DataFrame:
     """Narrow the long CSV down to exactly one equity curve per seed.
 
     The file holds every (exit, slippage, gate) variant the backtest swept, so a partial
@@ -67,10 +67,15 @@ def select_curve(df: pd.DataFrame, exit_rule: str, slippage: float,
     # unequal to everything -- including itself -- so it needs isna() rather than ==.
     gate = (df["min_score"].isna() if not min_score.strip()
             else df["min_score"] == float(min_score))
-    sel = df[(df["exit"] == exit_rule) & (df["slippage_bps"] == slippage) & gate]
+    keep = (df["exit"] == exit_rule) & (df["slippage_bps"] == slippage) & gate
+    if hold is not None:
+        if "hold_k" not in df.columns:
+            raise SystemExit("这个 CSV 没有 hold_k 列，是加持仓网格之前跑出来的")
+        keep &= df["hold_k"] == hold
+    sel = df[keep]
     if sel.empty:
         raise SystemExit(f"没有 exit={exit_rule} slippage={slippage} "
-                         f"门槛={min_score or '无'} 的行")
+                         f"门槛={min_score or '无'} 持仓={hold or '全部'} 的行")
     if sel.duplicated(subset=["seed", "date"]).any():
         raise SystemExit("同一个种子的同一天出现多行，筛选没有唯一确定一条曲线")
     return sel
@@ -95,6 +100,8 @@ def main() -> None:
                     help="Which conviction gate to slice, blank for the ungated book. The "
                          "daily CSV holds every gate in one file, so without this the "
                          "variants would be concatenated into one impossibly long series.")
+    ap.add_argument("--hold", type=int, default=None,
+                    help="Which book size to slice, when the CSV holds a hold-size sweep.")
     # Defaults are the reference track's headline: +25.00% cumulative, 20/28 positive days,
     # -7.61% max drawdown.
     ap.add_argument("--ref-return", type=float, default=0.25)
@@ -105,7 +112,7 @@ def main() -> None:
     # Trade dates are YYYYMMDD digits; left to itself pandas reads them as floats and the
     # window's end date prints as 20250103.0.
     df = pd.read_csv(args.input, dtype={"date": str})
-    sel = select_curve(df, args.exit, args.slippage, args.min_score)
+    sel = select_curve(df, args.exit, args.slippage, args.min_score, args.hold)
 
     per_seed = {}
     for seed, g in sel.groupby("seed", sort=True):
@@ -119,7 +126,7 @@ def main() -> None:
         raise SystemExit(f"序列不足 {args.window} 个交易日，切不出窗口")
 
     n_days = len(sel) // len(per_seed)
-    print(f"=== exit={args.exit} 滑点={args.slippage:.0f}bp "
+    print(f"=== exit={args.exit} 持仓={args.hold or '全部'} 滑点={args.slippage:.0f}bp "
           f"门槛={args.min_score or '无'} 窗口={args.window} 交易日 ===")
     print(f"原始序列 {n_days} 天 × {len(per_seed)} 个种子 → {len(windows):,} 个重叠窗口")
     print("（窗口高度重叠，下面是分布描述，不是独立样本，不做显著性检验）\n")

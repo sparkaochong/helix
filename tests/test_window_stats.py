@@ -55,15 +55,16 @@ def test_drawdown_only_deepens_as_the_window_grows():
 
 
 def _long_csv() -> pd.DataFrame:
-    """Two gates × two seeds × two days, the shape backtest_argus.py actually writes.
-    The ungated rows carry an empty min_score, which pandas reads back as NaN."""
+    """Two gates × two book sizes × two seeds × two days, the shape backtest_argus.py
+    writes. The ungated rows carry an empty min_score, which pandas reads back as NaN."""
     rows = []
     for gate in (np.nan, 0.6):
-        for seed in (7, 13):
-            for date in ("20250101", "20250102"):
-                rows.append({"date": date, "portfolio_return": 0.01, "equity": 1.0,
-                             "seed": seed, "exit": "close", "slippage_bps": 10.0,
-                             "min_score": gate})
+        for hold in (2, 5):
+            for seed in (7, 13):
+                for date in ("20250101", "20250102"):
+                    rows.append({"date": date, "portfolio_return": 0.01, "equity": 1.0,
+                                 "seed": seed, "hold_k": hold, "exit": "close",
+                                 "slippage_bps": 10.0, "min_score": gate})
     return pd.DataFrame(rows)
 
 
@@ -71,28 +72,41 @@ def test_selecting_the_ungated_book_does_not_also_pull_in_the_gated_one():
     """The bug: min_score == None never matches, so an unfiltered gate column would
     concatenate every variant into one series -- a 431-day track read as 3,017 days, with a
     fabricated jump wherever one variant ends and the next begins."""
-    sel = select_curve(_long_csv(), "close", 10.0, "")
+    sel = select_curve(_long_csv(), "close", 10.0, "", hold=2)
     assert len(sel) == 4                              # 2 seeds × 2 days, ungated only
     assert sel["min_score"].isna().all()
 
 
 def test_a_named_gate_selects_only_that_gate():
-    sel = select_curve(_long_csv(), "close", 10.0, "0.6")
+    sel = select_curve(_long_csv(), "close", 10.0, "0.6", hold=2)
     assert len(sel) == 4
     assert (sel["min_score"] == 0.6).all()
 
 
+def test_selecting_a_book_size_does_not_also_pull_in_the_other_ones():
+    """Book size is the axis being compared, so mixing two of them into one series would
+    average away the exact difference the run exists to measure."""
+    sel = select_curve(_long_csv(), "close", 10.0, "", hold=5)
+    assert len(sel) == 4
+    assert (sel["hold_k"] == 5).all()
+
+
 def test_a_filter_that_leaves_two_rows_on_one_day_is_refused():
-    """Better to stop than to silently cut windows out of two interleaved curves."""
-    df = _long_csv()
-    df.loc[df["min_score"] == 0.6, "min_score"] = np.nan   # both variants now look ungated
+    """Better to stop than to silently cut windows out of two interleaved curves. Leaving
+    the book size unpinned is the easy way to trip this."""
     with pytest.raises(SystemExit):
-        select_curve(df, "close", 10.0, "")
+        select_curve(_long_csv(), "close", 10.0, "")
+
+
+def test_an_older_csv_without_the_column_says_so_instead_of_filtering_nothing():
+    df = _long_csv().drop(columns=["hold_k"])
+    with pytest.raises(SystemExit):
+        select_curve(df, "close", 10.0, "", hold=2)
 
 
 def test_an_empty_selection_is_refused_rather_than_silently_producing_no_windows():
     with pytest.raises(SystemExit):
-        select_curve(_long_csv(), "target", 10.0, "")
+        select_curve(_long_csv(), "target", 10.0, "", hold=2)
 
 
 def test_positive_day_rate_counts_strictly_positive_days():
