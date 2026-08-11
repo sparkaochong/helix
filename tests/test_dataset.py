@@ -23,6 +23,30 @@ def test_normalization_is_per_date_and_per_factor():
     assert np.isnan(out[:, :, 1]).all()
 
 
+def test_normalization_statistics_must_not_depend_on_a_future_dependent_mask():
+    """Regression guard: normalise against the D0 universe, never against label validity.
+
+    ``labels.valid`` encodes whether D+1 opened limit-up and whether D+1/D+2 traded.
+    Using it as the normalisation population lets those future facts move the mean and
+    std applied to D0 features -- and leaves the newest rows undefined, which is exactly
+    where live scoring needs numbers.
+    """
+    values = np.zeros((3, 4, 1))
+    values[:, :, 0] = [1.0, 2.0, 3.0, 4.0]
+
+    universe = np.ones((3, 4), dtype=bool)
+    label_valid = universe.copy()
+    label_valid[-1] = False          # last row unresolvable: no D+2 yet
+    label_valid[0, 3] = False        # this name's D+1 opened at the limit
+
+    against_universe = normalize_factors(values, universe, n_sigma=4.0)
+    against_labels = normalize_factors(values, label_valid, n_sigma=4.0)
+
+    assert np.isfinite(against_universe[-1]).all()
+    assert np.isnan(against_labels[-1]).all(), "future-dependent mask blanks the newest row"
+    assert not np.allclose(against_universe[0, :, 0], against_labels[0, :, 0])
+
+
 def test_normalization_ignores_names_outside_the_mask():
     values = np.zeros((1, 4, 1))
     values[0, :, 0] = [1.0, 2.0, 3.0, 1000.0]

@@ -52,6 +52,7 @@ def cache_dir(cfg: Config) -> Path:
     return path
 
 
+
 def prepare(cfg: Config, rebuild: bool = False) -> Prepared:
     """Build (or reload) the panel, universe mask, base fields and labels."""
     store = ParquetStore(cfg.data.root)
@@ -127,14 +128,26 @@ def evaluate_factors(cfg: Config, prepared: Prepared, library: FactorLibrary) ->
     return report
 
 
+def _normalized_factors(cfg: Config, prepared: Prepared, library: FactorLibrary):
+    """Cross-sectionally normalise the factor panel against the D0 tradable universe.
+
+    The universe -- not ``labels.valid`` -- is the right population here. ``labels.valid``
+    additionally depends on whether D+1 opened limit-up and whether D+1/D+2 traded, so
+    normalising against it would let future information shape the statistics applied to
+    D0 features. It also leaves the most recent rows entirely undefined, which is exactly
+    where live scoring needs values.
+    """
+    names, values = compute_factors(library, prepared.fields)
+    normalized = normalize_factors(values, prepared.universe, cfg.dl.clip_sigma)
+    traded = (prepared.panel["is_trading"] > 0).astype(np.float32)
+    return names, normalized, traded
+
+
 def train(cfg: Config, prepared: Prepared, library: FactorLibrary) -> tuple[np.ndarray, list]:
     """Walk-forward train the combiner and return the stitched out-of-sample scores."""
-    names, values = compute_factors(library, prepared.fields)
+    names, normalized, traded = _normalized_factors(cfg, prepared, library)
     log.info("combining %d factors: %s", len(names), ", ".join(names))
-
     labels = prepared.labels
-    normalized = normalize_factors(values, labels.valid, cfg.dl.clip_sigma)
-    traded = (prepared.panel["is_trading"] > 0).astype(np.float32)
 
     folds = walk_forward(len(prepared.panel.dates), cfg.split)
     for fold in folds:
