@@ -28,6 +28,8 @@ from helix.features.operators import cs_rank
 from helix.gp.engine import run_search
 from helix.gp.event_primitives import build_event_pset
 from helix.gp.feature_select import _max_abs_corr
+from helix.gp.library import FactorLibrary, compute_factors
+from helix.gp.neutralize import build_basis
 from helix.logging_setup import get_logger, setup_logging
 from helix.pipeline_events import (
     BINARY_TARGET,
@@ -50,6 +52,11 @@ def main() -> None:
     ap.add_argument("--n-features", type=int, default=80)
     ap.add_argument("--feature-corr", type=float, default=0.85)
     ap.add_argument("--min-samples", type=int, default=30)
+    ap.add_argument("--rounds", type=int, default=1,
+                    help="Mining rounds; each neutralises against all factors found so far.")
+    ap.add_argument("--neutralize-base", type=int, default=0,
+                    help="Neutralise against this many of the top-IC source columns. "
+                         "0 disables neutralisation entirely (raw-IC mining).")
     args = ap.parse_args()
 
     setup_logging()
@@ -105,17 +112,43 @@ def main() -> None:
     )
 
     # ---------------------------------------------------------------- pass 3 --
-    result = run_search(
-        fields={k: panel.fields[k][rows].astype(np.float64) for k in kept},
-        field_names=kept,
-        y=panel.f64(BINARY_TARGET)[rows],
-        mask=mask,
-        cfg=cfg.gp,
-        embargo_days=cfg.split.embargo_days,
-        pset=build_event_pset(kept),
-        kind="event",
-    )
-    run = EventRun(panel=panel, library=result.library, selected_features=kept,
+    # Rounds. Each one neutralises against the strongest existing columns plus every
+    # factor already found, so a later factor can only score by explaining something
+    # none of them can. Without this the search just keeps rediscovering the same
+    # linear blend of the same few volatility columns.
+    search_fields = {k: panel.fields[k][rows].astype(np.float64) for k in kept}
+    y = panel.f64(BINARY_TARGET)[rows]
+    pset = build_event_pset(kept)
+
+    base_grids = [search_fields[n] for n in kept[: args.neutralize_base]]
+    log.info("neutralising against %d base columns", len(base_grids))
+
+    all_specs: list = []
+    for round_index in range(args.rounds):
+        basis = build_basis(base_grids, mask) if base_grids else None
+        log.info("=== round %d/%d | basis rank %d ===",
+                 round_index + 1, args.rounds, 0 if basis is None else basis.shape[2])
+        cfg.gp.seed = cfg.gp.seed + round_index
+        result = run_search(
+            fields=search_fields, field_names=kept, y=y, mask=mask,
+            cfg=cfg.gp, embargo_days=cfg.split.embargo_days,
+            pset=pset, kind="event", basis=basis,
+        )
+        if not result.library.factors:
+            log.warning("round %d found nothing that survived selection; stopping",
+                        round_index + 1)
+            break
+        for spec in result.library.factors:
+            spec.name = f"gp_{len(all_specs):03d}"
+            all_specs.append(spec)
+        # Feed this round's factors into the next round's basis.
+        found = FactorLibrary(factors=result.library.factors, field_names=kept,
+                              windows=[], kind="event")
+        _, values = compute_factors(found, search_fields)
+        base_grids.extend(values[:, :, k].astype(np.float64) for k in range(values.shape[2]))
+
+    library = FactorLibrary(factors=all_specs, field_names=kept, windows=[], kind="event")
+    run = EventRun(panel=panel, library=library, selected_features=kept,
                    search_rows=rows, report={})
     evaluate_ic(run, min_samples=args.min_samples)
     paths = save(run, Path(args.out))

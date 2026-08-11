@@ -152,3 +152,45 @@ def test_unknown_base_column_is_a_clear_error(mask, base):
 
     with pytest.raises(KeyError, match="unknown columns"):
         basis_from_fields({"a": base}, ["a", "missing"], mask)
+
+
+def test_neutralised_rounds_find_a_second_independent_driver():
+    """The point of multi-round mining: round 2 must not rediscover round 1's idea.
+
+    ``y`` depends on two independent drivers, ``alpha`` more strongly than ``beta``.
+    Unneutralised, the search locks onto ``alpha``. Neutralised against ``alpha``, it
+    has to reach for ``beta`` -- which is exactly the behaviour that produces a set of
+    factors worth adding to a model rather than one idea restated five times.
+    """
+    from helix.config import GPConfig
+    from helix.gp.engine import run_search
+    from helix.gp.event_primitives import build_event_pset
+
+    rng = np.random.default_rng(17)
+    shape = (300, 120)
+    alpha = rng.normal(size=shape)
+    beta = rng.normal(size=shape)
+    noise = rng.normal(size=shape)
+    logit = 1.6 * alpha + 0.9 * beta
+    y = (rng.uniform(size=shape) < 1 / (1 + np.exp(-logit))).astype(float)
+    mask = np.ones(shape, dtype=bool)
+
+    fields = {"alpha": alpha, "beta": beta, "noise": noise}
+    names = ["alpha", "beta", "noise"]
+    cfg = GPConfig(
+        population=60, generations=4, hall_of_fame=20, n_keep=3,
+        windows=[], max_nodes=8, max_depth=3, min_daily_samples=20, seed=5,
+    )
+    pset = build_event_pset(names)
+
+    plain = run_search(fields, names, y, mask, cfg, embargo_days=5, pset=pset, kind="event")
+    assert plain.library.factors
+    assert "alpha" in plain.library.factors[0].expression
+
+    basis = build_basis([alpha], mask)
+    neutralised = run_search(
+        fields, names, y, mask, cfg, embargo_days=5, pset=pset, kind="event", basis=basis
+    )
+    assert neutralised.library.factors, "nothing survived once alpha was projected out"
+    top = neutralised.library.factors[0].expression
+    assert "beta" in top, f"expected the second driver, got {top}"
