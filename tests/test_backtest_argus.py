@@ -27,9 +27,8 @@ from backtest_argus import (  # noqa: E402
     gross_returns,
     net_return,
     run_book,
+    target_hit,
 )
-
-LABEL = "label_d2_hit_8pct"
 
 
 def test_stamp_duty_is_charged_on_the_sell_side_only():
@@ -61,24 +60,45 @@ def test_costs_scale_with_notional_so_this_is_not_a_subtraction():
     assert drag(0.20) < drag(0.0) < drag(-0.20)
 
 
-def _picks(hit: tuple[int, ...], to_close: tuple[float, ...]) -> pd.DataFrame:
+def _picks(hit: tuple[int, ...], to_close: tuple[float, ...],
+           peak: tuple[float, ...] | None = None) -> pd.DataFrame:
+    """`hit` is shorthand for a D+2 high that clears 8%; `peak` sets it explicitly.
+
+    The high is floored at the close because a bar whose high is below its close does not
+    exist, and a fixture that is impossible would let a ratio bug pass.
+    """
     open_d1 = 10.0
+    peaks = peak if peak is not None else tuple(
+        max(t, 0.08 if h else 0.0) for h, t in zip(hit, to_close, strict=True))
     return pd.DataFrame({
-        LABEL: [float(h) for h in hit],
-        "label_px_d1_open": [open_d1] * len(hit),
+        "label_px_d1_open": [open_d1] * len(to_close),
+        "label_px_d2_high": [open_d1 * (1 + p) for p in peaks],
         "label_px_d2_close": [open_d1 * (1 + r) for r in to_close],
     })
 
 
-def test_close_exit_ignores_the_label_entirely():
+def test_close_exit_ignores_the_take_profit_entirely():
     frame = _picks(hit=(1, 0), to_close=(0.10, -0.05))
-    assert gross_returns(frame, LABEL, 1.08, "close") == pytest.approx([0.10, -0.05])
+    assert gross_returns(frame, 1.08, "close") == pytest.approx([0.10, -0.05])
 
 
 def test_target_exit_caps_the_winner_and_lets_the_loser_run():
     """The whole finding in one assertion: +10% becomes +8%, -5% stays -5%."""
     frame = _picks(hit=(1, 0), to_close=(0.10, -0.05))
-    assert gross_returns(frame, LABEL, 1.08, "target") == pytest.approx([0.08, -0.05])
+    assert gross_returns(frame, 1.08, "target") == pytest.approx([0.08, -0.05])
+
+
+def test_the_take_profit_level_decides_which_trades_it_applies_to():
+    """The bug this guards: reading the hit off the 8% label while paying out 10% would
+    hand every 8%-toucher a 10% exit, i.e. a strategy that cannot be traded.
+
+    Peak +15% clears both levels; peak +9% clears 8% and not 10%, so raising the target
+    must move it from a capped +8% winner to an uncapped -2% close.
+    """
+    frame = _picks(hit=(), to_close=(0.04, -0.02), peak=(0.15, 0.09))
+    assert gross_returns(frame, 1.08, "target") == pytest.approx([0.08, 0.08])
+    assert gross_returns(frame, 1.10, "target") == pytest.approx([0.10, -0.02])
+    assert target_hit(frame, 1.10) == pytest.approx([True, False])
 
 
 def _book(scores, unfillable, hit, to_close) -> pd.DataFrame:
@@ -90,12 +110,12 @@ def _book(scores, unfillable, hit, to_close) -> pd.DataFrame:
 
 
 def _run(book: pd.DataFrame, hold_k: int, signal_k: int, exit_rule: str = "close") -> dict:
-    return run_book(book, LABEL, hold_k=hold_k, signal_k=signal_k, target_ratio=1.08,
+    return run_book(book, hold_k=hold_k, signal_k=signal_k, target_ratio=1.08,
                     exit_rule=exit_rule, slippage_bps=0.0)[0]
 
 
 def _daily(book: pd.DataFrame, hold_k: int, signal_k: int) -> pd.DataFrame:
-    return run_book(book, LABEL, hold_k=hold_k, signal_k=signal_k, target_ratio=1.08,
+    return run_book(book, hold_k=hold_k, signal_k=signal_k, target_ratio=1.08,
                     exit_rule="close", slippage_bps=0.0)[1]
 
 
@@ -154,7 +174,7 @@ def test_the_daily_series_is_the_curve_the_scalars_were_computed_from():
     book = _book(scores=[3.0, 2.0], unfillable=[False, False],
                  hit=(1, 0), to_close=(0.10, -0.05))
     book.loc[1, "trade_date"] = "20250102"        # one position on each of two days
-    res, daily = run_book(book, LABEL, hold_k=1, signal_k=1, target_ratio=1.08,
+    res, daily = run_book(book, hold_k=1, signal_k=1, target_ratio=1.08,
                           exit_rule="close", slippage_bps=0.0)
 
     assert list(daily["date"]) == ["20250101", "20250102"]

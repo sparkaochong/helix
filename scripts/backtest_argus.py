@@ -79,15 +79,26 @@ def net_return(gross: np.ndarray, slippage_bps: float) -> np.ndarray:
     return (1.0 + gross) * (1.0 - sell) / (1.0 + buy) - 1.0
 
 
-def gross_returns(frame: pd.DataFrame, label: str, target_ratio: float,
-                  exit_rule: str) -> np.ndarray:
+def target_hit(frame: pd.DataFrame, target_ratio: float) -> np.ndarray:
+    """Did the D+2 high reach `open[D+1] * target_ratio`?
+
+    Recomputed from prices rather than read off `label_d2_hit_8pct`, so the take-profit
+    level is a free parameter instead of being welded to the label. Reading the label
+    would make `--target-ratio 1.10` pay out 10% on the set of trades that touched 8% --
+    a strictly better strategy than any that exists. `main` checks this reproduces the
+    published label at 1.08 before trusting it anywhere else.
+    """
+    return ((frame["label_px_d2_high"].to_numpy(dtype=float)
+             / frame["label_px_d1_open"].to_numpy(dtype=float)) >= target_ratio)
+
+
+def gross_returns(frame: pd.DataFrame, target_ratio: float, exit_rule: str) -> np.ndarray:
     """Per-trade gross return under the chosen exit assumption."""
     to_close = (frame["label_px_d2_close"].to_numpy(dtype=float)
                 / frame["label_px_d1_open"].to_numpy(dtype=float)) - 1.0
     if exit_rule == "close":
         return to_close
-    hit = frame[label].to_numpy(dtype=float) == 1.0
-    return np.where(hit, target_ratio - 1.0, to_close)
+    return np.where(target_hit(frame, target_ratio), target_ratio - 1.0, to_close)
 
 
 def max_drawdown(equity: np.ndarray) -> float:
@@ -126,7 +137,7 @@ def fit_and_score(rank_by: str, seed: int, train: pd.DataFrame, test: pd.DataFra
     return model.predict(x_test)
 
 
-def run_book(scored: pd.DataFrame, label: str, hold_k: int, signal_k: int,
+def run_book(scored: pd.DataFrame, hold_k: int, signal_k: int,
              target_ratio: float, exit_rule: str,
              slippage_bps: float) -> tuple[dict, pd.DataFrame]:
     """Submit the ranked shortlist, fill down it until `hold_k` positions, then compound.
@@ -161,11 +172,13 @@ def run_book(scored: pd.DataFrame, label: str, hold_k: int, signal_k: int,
         # How deep the shortlist had to go, and whether it ran out before filling hold_k.
         depth = int(usable[-1]) + 1
         short = len(picked) < hold_k
-        gross = gross_returns(picked, label, target_ratio, exit_rule)
+        gross = gross_returns(picked, target_ratio, exit_rule)
         if not np.isfinite(gross).all():
             continue
         net = net_return(gross, slippage_bps)
-        hit = picked[label].to_numpy(dtype=float) == 1.0
+        # Hit rate follows `target_ratio` too, so lift describes the level being traded
+        # rather than the 8% the table happens to label.
+        hit = target_hit(picked, target_ratio)
         to_close = (picked["label_px_d2_close"].to_numpy(dtype=float)
                     / picked["label_px_d1_open"].to_numpy(dtype=float)) - 1.0
         rows.append({
@@ -174,7 +187,7 @@ def run_book(scored: pd.DataFrame, label: str, hold_k: int, signal_k: int,
             "fill_depth": depth,
             "short": float(short),
             "hit_rate": float(hit.mean()),
-            "base_rate": float(g[~g["unfillable"]][label].mean()),
+            "base_rate": float(target_hit(g[~g["unfillable"]], target_ratio).mean()),
             "gross_return": float(gross.mean()),
             "net_return": float(net.mean()),
             # The decomposition that explains the result: selection lifts the winners a
@@ -256,7 +269,7 @@ def main() -> None:
         raise SystemExit(f"--signal-k {signal_k} 小于持仓数 {args.top_k}，候选不够建仓")
 
     features = feature_columns(args.input)
-    price_cols = ["label_px_d1_open", "label_px_d2_close"]
+    price_cols = ["label_px_d1_open", "label_px_d2_high", "label_px_d2_close"]
     needed = sorted({"trade_date", args.label, args.ic_target, args.return_col,
                      *price_cols, *REQUIRED_COLUMNS, *features})
     df = pd.read_parquet(args.input, columns=needed)
@@ -271,6 +284,15 @@ def main() -> None:
                / df["label_px_d1_open"].to_numpy(dtype=float)) - 1.0
     if not np.allclose(implied, df[args.return_col].to_numpy(dtype=float), atol=1e-6):
         raise SystemExit(f"{args.return_col} 不等于 close[D+2]/open[D+1]-1，不能当回归目标")
+
+    # The take-profit level is now recomputed from prices instead of read off the label, so
+    # tie the recomputation back to the published label at the one ratio where both exist.
+    # A float tie on `high == open * 1.08` may disagree; a systematic difference may not.
+    disagree = float((target_hit(df, 1.08) != (df[args.label].to_numpy(dtype=float) == 1.0)).mean())
+    if disagree > 1e-4:
+        raise SystemExit(f"按价格重算 1.08 触及与 {args.label} 有 {disagree:.4%} 不一致，"
+                         f"止盈判定不可信")
+    print(f"1.08 触及重算 vs {args.label}：不一致 {disagree:.6%}")
 
     dates = np.array(sorted(df["trade_date"].unique()))
     cut = int(np.searchsorted(dates, args.split_date, "right"))
@@ -305,7 +327,7 @@ def main() -> None:
 
         for exit_rule in ("target", "close"):
             for slip in slippages:
-                book, daily = run_book(scored, args.label, args.top_k, signal_k,
+                book, daily = run_book(scored, args.top_k, signal_k,
                                        args.target_ratio, exit_rule, slip)
                 book |= {"seed": seed, "exit": exit_rule, "slippage_bps": slip,
                          "ic_mean": round(ic, 6), "ic_vs_return": round(ic_ret, 6)}
