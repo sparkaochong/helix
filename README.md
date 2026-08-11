@@ -32,6 +32,54 @@ D0 收盘          D+1 开盘          D+2 盘中
 
 ---
 
+## 两条数据通路
+
+Helix 有两个后端，共用同一套算子、指标、切分纪律和 GP 引擎。
+
+### A. 面板通路（Tushare 全市场）
+
+从 Tushare 自建 `(交易日 × 股票)` 面板，自己造基础字段。时序算子可用。适合从零开始做全市场研究。
+
+### B. 事件表通路（长表，如 argus_quant）
+
+输入是「每天若干只入选股票 + 数百个已算好的特征」的长表。每天的行压进 `0..n_t-1` 槽位，得到 `(T, N_max)` 网格——截面算子照常有效。
+
+**槽位 j 在不同日子是不同公司**，所以时序算子在这个布局下毫无意义（`ts_mean(x,20)` 会把二十家不相干的公司平均起来）。`build_event_pset` 用硬断言拒绝任何时序算子进入，不是靠注释提醒。
+
+这条通路的产出是**因子列**：`helix/gp/export.py` 生成一个只依赖 numpy/pandas/pyarrow 的独立脚本，直接在训练机上给数据集追加列并输出 IC/ICIR 报告。
+
+```bash
+python scripts/mine_argus.py --input train.parquet --out artifacts \
+       --n-features 70 --rounds 5 --neutralize-base 8
+# 然后把 artifacts/apply_factors.py 拷到训练机
+python apply_factors.py --input train.parquet --output train_with_factors.parquet
+```
+
+---
+
+## 挖出来的因子必须"有增量"，而不只是"有 IC"
+
+这是本项目最重要的一条经验，来自一个真实的负面结果。
+
+第一轮在 argus_quant 上挖出的因子 `gp_000`：
+
+```
+原始                        IC +0.0873   ICIR +0.709   正 IC 77.4%
+对自身最强输入正交化后        IC +0.0453   ICIR +0.436
+对自身全部三个输入正交化后    IC -0.0063   ICIR -0.112   ← 归零
+```
+
+它只是三个已有列的线性混合，而那三列**本来就在训练集里**。挂上这一列，下游模型什么也得不到——它自己就能学出这个组合。
+
+所以默认的适应度是**残差 IC**：`helix/gp/neutralize.py` 把因子对基列按日投影，只有解释了基列解释不了的部分才得分。`--neutralize-base N` 指定用 IC 最强的 N 个源列做基，`--rounds K` 让每一轮再把已找到的因子加进基，逼出互不相关的因子。
+
+两个实现细节值得知道：
+
+- **幅度守卫不可省略。** 下游指标基于秩、尺度无关。一个被完全解释的因子残差只剩 `1e-16` 的浮点噪声，但那噪声**仍然保留原始排序**，会被当成信号打出分来。残差占比过小的交易日直接判为已解释，返回 NaN。
+- **投影在秩空间是线性的**，移除不了基列的单调非线性变换。存活的因子是待验证的候选，不是独立性的证明——上线前要对真实特征集复核增量。
+
+---
+
 ## 架构
 
 ```
@@ -55,13 +103,13 @@ Tushare ──► ParquetStore ──► Panel (T×N)  ──► base fields (~2
 
 | 路径 | 职责 |
 |------|------|
-| `helix/data/` | Tushare 增量下载、parquet 存储、面板构建、时点股票池 |
+| `helix/data/` | Tushare 增量下载、parquet 存储、面板构建、时点股票池、事件表槽位面板 |
 | `helix/labels/` | 触及标签，含可成交性过滤 |
 | `helix/features/operators.py` | 面板算子（`ts_*` 严格后视，`lead` 仅供标签使用） |
 | `helix/features/base_fields.py` | GP 的原料字段 |
-| `helix/gp/` | 类型化算子集、适应度、进化循环、因子库持久化 |
+| `helix/gp/` | 类型化算子集、适应度、中性化、特征预筛选、进化循环、因子库与导出 |
 | `helix/dl/` | 序列构造、GRU 合成模型、walk-forward 训练 |
-| `helix/eval/` | 日频 AUC/gini、precision@k、交易级回测 |
+| `helix/eval/` | 日频 AUC/gini、IC/ICIR、precision@k、交易级回测 |
 | `helix/splits.py` | 带 embargo 的 walk-forward 切分 |
 
 ---
