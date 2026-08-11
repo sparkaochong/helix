@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -24,6 +25,7 @@ from ..config import DLConfig
 from ..eval.metrics import daily_gini, summarize_daily
 from ..logging_setup import get_logger
 from ..splits import Fold
+from .checkpoint import CHECKPOINT_SUFFIX, Checkpoint, save_checkpoint
 from .dataset import SequenceDataset, positive_weight, sample_index
 from .models import GRUCombiner, pick_device
 
@@ -48,7 +50,7 @@ def _loader(dataset: SequenceDataset, batch_size: int, shuffle: bool) -> DataLoa
 
 
 @torch.no_grad()
-def _predict(model: nn.Module, dataset: SequenceDataset, device, batch_size: int) -> np.ndarray:
+def predict_scores(model: nn.Module, dataset: SequenceDataset, device, batch_size: int) -> np.ndarray:
     model.eval()
     out: list[np.ndarray] = []
     for x, _ in _loader(dataset, batch_size, shuffle=False):
@@ -76,6 +78,9 @@ def train_fold(
     y: np.ndarray,
     mask: np.ndarray,
     cfg: DLConfig,
+    checkpoint_dir: Path | None = None,
+    factor_names: list[str] | None = None,
+    dates: np.ndarray | None = None,
 ) -> tuple[np.ndarray, FoldResult]:
     torch.manual_seed(cfg.seed + fold.index)
     np.random.seed(cfg.seed + fold.index)
@@ -121,7 +126,7 @@ def train_fold(
             total += float(loss.detach()) * len(target)
             seen += len(target)
 
-        valid_grid = _scatter(_predict(model, ds_valid, device, cfg.batch_size), idx_valid, y.shape)
+        valid_grid = _scatter(predict_scores(model, ds_valid, device, cfg.batch_size), idx_valid, y.shape)
         valid_gini = _grid_gini(valid_grid, y, mask, fold.valid)
         log.info(
             "  fold %d epoch %02d | loss %.4f | valid gini %.4f",
@@ -140,7 +145,25 @@ def train_fold(
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    test_grid = _scatter(_predict(model, ds_test, device, cfg.batch_size), idx_test, y.shape)
+    if checkpoint_dir is not None:
+        save_checkpoint(
+            Path(checkpoint_dir) / f"fold_{fold.index:03d}{CHECKPOINT_SUFFIX}",
+            Checkpoint(
+                state_dict={k: v.cpu() for k, v in model.state_dict().items()},
+                n_features=ds_train.n_features,
+                seq_len=cfg.seq_len,
+                hidden_size=cfg.hidden_size,
+                num_layers=cfg.num_layers,
+                dropout=cfg.dropout,
+                fold=fold.index,
+                factor_names=list(factor_names or []),
+                train_end=str(dates[fold.train][-1]) if dates is not None else "",
+                test_start=str(dates[fold.test][0]) if dates is not None else "",
+                test_end=str(dates[fold.test][-1]) if dates is not None else "",
+            ),
+        )
+
+    test_grid = _scatter(predict_scores(model, ds_test, device, cfg.batch_size), idx_test, y.shape)
     result = FoldResult(
         fold=fold.index,
         n_train=len(idx_train),
@@ -164,12 +187,18 @@ def train_walk_forward(
     y: np.ndarray,
     mask: np.ndarray,
     cfg: DLConfig,
+    checkpoint_dir: Path | None = None,
+    factor_names: list[str] | None = None,
+    dates: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[FoldResult]]:
     """Returns the stitched out-of-sample prediction grid and per-fold diagnostics."""
     predictions = np.full(y.shape, np.nan, dtype=np.float32)
     results: list[FoldResult] = []
     for fold in folds:
-        grid, result = train_fold(fold, values, traded, y, mask, cfg)
+        grid, result = train_fold(
+            fold, values, traded, y, mask, cfg,
+            checkpoint_dir=checkpoint_dir, factor_names=factor_names, dates=dates,
+        )
         rows = fold.test
         predictions[rows] = grid[rows]
         results.append(result)

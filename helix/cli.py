@@ -103,6 +103,22 @@ def backtest(config: Path | None = ConfigOpt) -> None:
 
 
 @app.command()
+def score(
+    config: Path | None = ConfigOpt,
+    date: str = typer.Option("", "--date", help="Trade date YYYYMMDD to score (default: latest)."),
+    top: int = typer.Option(20, "--top", help="How many candidates to print."),
+) -> None:
+    """Rank today's tradable universe with the most recently trained fold."""
+    from .gp.library import load_factors
+
+    cfg = _load(config)
+    prepared = pipeline.prepare(cfg)
+    library = load_factors(pipeline.artifacts_dir(cfg) / "factors.json")
+    frame = pipeline.score(cfg, prepared, library, date=date)
+    typer.echo(frame.head(top).to_string(index=False))
+
+
+@app.command()
 def run(config: Path | None = ConfigOpt, rebuild: bool = RebuildOpt) -> None:
     """prepare -> mine -> train -> backtest."""
     cfg = _load(config)

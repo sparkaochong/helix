@@ -10,7 +10,16 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from helix.config import BacktestConfig, DLConfig, GPConfig, LabelConfig, SplitConfig
+from helix import pipeline
+from helix.config import (
+    BacktestConfig,
+    Config,
+    DataConfig,
+    DLConfig,
+    GPConfig,
+    LabelConfig,
+    SplitConfig,
+)
 from helix.data.panel import Panel
 from helix.dl.dataset import normalize_factors
 from helix.dl.train import train_walk_forward
@@ -154,3 +163,56 @@ def test_walk_forward_training_and_backtest_complete(library, prepared, market, 
     assert summary["n_days"] > 0
     assert 0.0 <= summary["hit_rate"] <= 1.0
     assert np.isfinite(summary["mean_trade_return_net"])
+
+
+def test_live_scoring_ranks_the_latest_date_which_has_no_label(
+    tmp_path, library, prepared, market, split
+):
+    """The newest bar is unlabelled by construction, and must still be scorable."""
+    fields, names, labels = prepared
+    cfg = Config(
+        data=DataConfig(root=tmp_path),
+        split=split,
+        dl=DLConfig(seq_len=5, hidden_size=16, num_layers=1, epochs=2,
+                    batch_size=512, early_stopping_patience=2, seed=1),
+    )
+    prep = pipeline.Prepared(
+        panel=market,
+        universe=np.ones(market.shape, dtype=bool),
+        fields=fields,
+        names=names,
+        labels=labels,
+    )
+    pipeline.train(cfg, prep, library)
+
+    latest = market.dates[-1]
+    assert not labels.valid[-1].any(), "the final bar cannot have a resolved label"
+
+    frame = pipeline.score(cfg, prep, library)
+    assert len(frame) > 0
+    assert (frame["date"] == latest).all()
+    assert frame["probability"].between(0.0, 1.0).all()
+    assert frame["rank"].tolist() == sorted(frame["rank"].tolist())
+    assert frame["probability"].is_monotonic_decreasing
+    assert (pipeline.artifacts_dir(cfg) / f"scores_{latest}.csv").exists()
+
+
+def test_scoring_rejects_a_date_outside_the_panel(tmp_path, library, prepared, market, split):
+    fields, names, labels = prepared
+    cfg = Config(
+        data=DataConfig(root=tmp_path),
+        split=split,
+        dl=DLConfig(seq_len=5, hidden_size=16, num_layers=1, epochs=1,
+                    batch_size=512, early_stopping_patience=1, seed=1),
+    )
+    prep = pipeline.Prepared(
+        panel=market,
+        universe=np.ones(market.shape, dtype=bool),
+        fields=fields,
+        names=names,
+        labels=labels,
+    )
+    pipeline.train(cfg, prep, library)
+
+    with pytest.raises(ValueError, match="not a trade date"):
+        pipeline.score(cfg, prep, library, date="19000101")

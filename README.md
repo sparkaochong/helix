@@ -80,8 +80,9 @@ cp .env.example .env        # 填入 Tushare Pro token
 .venv/bin/helix prepare     # 建面板 + 基础字段 + 标签，打印正样本率
 .venv/bin/helix mine        # GP 挖因子 → data/artifacts/factors.json
 .venv/bin/helix evaluate    # 每个因子的样本内 vs 搜索窗口外表现
-.venv/bin/helix train       # walk-forward 训练合成模型 → predictions.npz
+.venv/bin/helix train       # walk-forward 训练合成模型 → predictions.npz + models/
 .venv/bin/helix backtest    # top-k 回测 → backtest_summary.json
+.venv/bin/helix score       # 用最近一折模型给最新交易日打分 → scores_YYYYMMDD.csv
 ```
 
 或者一条龙：`helix run`。
@@ -105,6 +106,20 @@ cp .env.example .env        # 填入 Tushare Pro token
 ### 去相关
 
 GP 会收敛到一堆近乎同义的表达式。名人堂按 sel 段表现排序后，贪心地按截面秩相关（阈值 `max_abs_corr`）去重再交给网络。喂 24 个同一个想法的副本，效果不如喂 8 个真正不同的。
+
+### 截面标准化的 population 必须是股票池，不是标签有效性
+
+标准化用 `universe`（D0 收盘即可确定）而**不是** `labels.valid`。后者额外依赖 D+1 是否一字涨停、D+1/D+2 是否停牌 —— 用它当 population，未来信息就会影响 D0 特征的均值和标准差。而且它会让最后两行全是 NaN，正好是实盘打分需要数值的地方。
+
+### 实盘打分
+
+```bash
+.venv/bin/helix score --date 20260810 --top 30
+```
+
+打分的候选集是 **D0 当天的股票池**，不是 `labels.valid` —— 最新一根 K 线的特征在 D0 收盘时已经完整，但标签必然未定义（D+2 还没发生），这正是要预测的东西。
+
+checkpoint 里记录了训练时的因子列表，重新挖过因子之后再拿旧模型打分会直接报错，而不是给你一串看起来合理的概率。
 
 ### 为什么用 GRU 不用 Transformer
 
@@ -135,7 +150,7 @@ GP 会收敛到一堆近乎同义的表达式。名人堂按 sel 段表现排序
 
 ## 尚未包含
 
-- **实盘打分链路**：`train` 目前不保存模型权重，所以没有"用最新一天数据打分"的命令。要上实盘需要先在 `train_fold` 里落盘 `state_dict`，再加一个加载最后一折模型、对最新交易日推理的入口。
+- **模型定期重训**：`score` 用的是最后一折的模型，随着时间推移会越来越旧。没有自动判断"该重训了"的机制。
 - **成本模型**：只有固定的双边 bps。没有冲击成本、没有按成交量约束仓位。
 - **指数/行业中性化**：因子未做行业中性，选出来的票可能高度集中在少数行业。
 

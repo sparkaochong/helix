@@ -12,13 +12,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from .config import Config
 from .data.panel import Panel, build_panel
 from .data.store import ParquetStore
 from .data.universe import build_universe
-from .dl.dataset import normalize_factors
-from .dl.train import train_walk_forward
+from .dl.checkpoint import latest_checkpoint, load_checkpoint, require_matching_factors
+from .dl.dataset import SequenceDataset, normalize_factors
+from .dl.models import pick_device
+from .dl.train import predict_scores, train_walk_forward
 from .eval.backtest import run_backtest
 from .eval.metrics import daily_gini, lift_at_k, summarize_daily
 from .features.base_fields import compute_base_fields, field_names
@@ -51,6 +54,11 @@ def cache_dir(cfg: Config) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
 
+
+def models_dir(cfg: Config) -> Path:
+    path = artifacts_dir(cfg) / "models"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def prepare(cfg: Config, rebuild: bool = False) -> Prepared:
@@ -160,6 +168,9 @@ def train(cfg: Config, prepared: Prepared, library: FactorLibrary) -> tuple[np.n
         y=labels.y,
         mask=labels.valid,
         cfg=cfg.dl,
+        checkpoint_dir=models_dir(cfg),
+        factor_names=names,
+        dates=prepared.panel.dates,
     )
     np.savez_compressed(
         artifacts_dir(cfg) / "predictions.npz",
@@ -168,6 +179,72 @@ def train(cfg: Config, prepared: Prepared, library: FactorLibrary) -> tuple[np.n
         codes=prepared.panel.codes,
     )
     return predictions, results
+
+
+def score(
+    cfg: Config,
+    prepared: Prepared,
+    library: FactorLibrary,
+    date: str = "",
+    checkpoint_path: Path | None = None,
+) -> pd.DataFrame:
+    """Rank the tradable universe for one D0, using the most recently trained fold.
+
+    Scoring the *latest* date is the whole point: its features are complete at the D0
+    close while its label is necessarily undefined (D+2 has not happened). That is why
+    the candidate mask here is the D0 universe rather than ``labels.valid``, which
+    encodes outcomes that do not exist yet.
+    """
+    names, normalized, traded = _normalized_factors(cfg, prepared, library)
+    panel = prepared.panel
+    dates = panel.dates
+
+    if date:
+        pos = int(np.searchsorted(dates, date, "left"))
+        if pos >= len(dates) or dates[pos] != date:
+            raise ValueError(f"{date} is not a trade date in the panel")
+        t = pos
+    else:
+        t = len(dates) - 1
+
+    path = Path(checkpoint_path) if checkpoint_path else latest_checkpoint(models_dir(cfg))
+    ckpt = load_checkpoint(path)
+    require_matching_factors(ckpt, names)
+    if t < ckpt.seq_len - 1:
+        raise ValueError(f"need {ckpt.seq_len} dates of history to score {dates[t]}")
+    log.info(
+        "scoring %s with fold %d (trained through %s)", dates[t], ckpt.fold, ckpt.train_end or "?"
+    )
+
+    # A name needs most of its factors defined; the dataset zero-fills the rest.
+    defined = np.isfinite(normalized[t]).mean(axis=-1) >= 0.5
+    candidates = np.flatnonzero(prepared.universe[t] & defined)
+    if candidates.size == 0:
+        raise RuntimeError(f"no tradable candidates on {dates[t]}")
+
+    index = np.column_stack([np.full(candidates.size, t), candidates]).astype(np.int64)
+    dataset = SequenceDataset(normalized, traded, np.zeros(panel.shape), index, ckpt.seq_len)
+    device = pick_device()
+    probabilities = predict_scores(ckpt.build(device), dataset, device, cfg.dl.batch_size)
+
+    frame = pd.DataFrame(
+        {
+            "date": dates[t],
+            "ts_code": panel.codes[candidates],
+            "probability": probabilities,
+            "close": panel.f64("close")[t, candidates],
+            "amount_kcny": panel.f64("amount")[t, candidates],
+            "to_up_limit": (
+                panel.f64("up_limit")[t, candidates] / panel.f64("close")[t, candidates] - 1.0
+            ),
+        }
+    ).sort_values("probability", ascending=False, ignore_index=True)
+    frame.insert(0, "rank", frame.index + 1)
+
+    out = artifacts_dir(cfg) / f"scores_{dates[t]}.csv"
+    frame.to_csv(out, index=False)
+    log.info("scored %d candidates on %s -> %s", len(frame), dates[t], out.name)
+    return frame
 
 
 def backtest(cfg: Config, prepared: Prepared, predictions: np.ndarray) -> dict:
