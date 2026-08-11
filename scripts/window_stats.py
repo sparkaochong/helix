@@ -54,6 +54,28 @@ def window_metrics(returns: np.ndarray, window: int) -> pd.DataFrame:
     })
 
 
+def select_curve(df: pd.DataFrame, exit_rule: str, slippage: float,
+                 min_score: str) -> pd.DataFrame:
+    """Narrow the long CSV down to exactly one equity curve per seed.
+
+    The file holds every (exit, slippage, gate) variant the backtest swept, so a partial
+    filter silently concatenates several curves into one series -- three gates would look
+    like a track three times as long, with a fabricated jump wherever one variant ends and
+    the next begins. Whatever survives here is checked to have one row per (seed, date).
+    """
+    # The ungated book writes an empty min_score, which reads back as NaN and compares
+    # unequal to everything -- including itself -- so it needs isna() rather than ==.
+    gate = (df["min_score"].isna() if not min_score.strip()
+            else df["min_score"] == float(min_score))
+    sel = df[(df["exit"] == exit_rule) & (df["slippage_bps"] == slippage) & gate]
+    if sel.empty:
+        raise SystemExit(f"没有 exit={exit_rule} slippage={slippage} "
+                         f"门槛={min_score or '无'} 的行")
+    if sel.duplicated(subset=["seed", "date"]).any():
+        raise SystemExit("同一个种子的同一天出现多行，筛选没有唯一确定一条曲线")
+    return sel
+
+
 def describe(values: np.ndarray, quantiles=(0.05, 0.25, 0.5, 0.75, 0.95)) -> dict:
     return {f"p{int(100 * q)}": float(np.quantile(values, q)) for q in quantiles} | {
         "min": float(values.min()), "max": float(values.max()),
@@ -69,6 +91,10 @@ def main() -> None:
                          "of positive-day rates back-solves to (20/28 and 17/28).")
     ap.add_argument("--exit", default="close", choices=("close", "target"))
     ap.add_argument("--slippage", type=float, default=10.0)
+    ap.add_argument("--min-score", default="",
+                    help="Which conviction gate to slice, blank for the ungated book. The "
+                         "daily CSV holds every gate in one file, so without this the "
+                         "variants would be concatenated into one impossibly long series.")
     # Defaults are the reference track's headline: +25.00% cumulative, 20/28 positive days,
     # -7.61% max drawdown.
     ap.add_argument("--ref-return", type=float, default=0.25)
@@ -79,9 +105,7 @@ def main() -> None:
     # Trade dates are YYYYMMDD digits; left to itself pandas reads them as floats and the
     # window's end date prints as 20250103.0.
     df = pd.read_csv(args.input, dtype={"date": str})
-    sel = df[(df["exit"] == args.exit) & (df["slippage_bps"] == args.slippage)]
-    if sel.empty:
-        raise SystemExit(f"{args.input} 里没有 exit={args.exit} slippage={args.slippage} 的行")
+    sel = select_curve(df, args.exit, args.slippage, args.min_score)
 
     per_seed = {}
     for seed, g in sel.groupby("seed", sort=True):
@@ -95,7 +119,8 @@ def main() -> None:
         raise SystemExit(f"序列不足 {args.window} 个交易日，切不出窗口")
 
     n_days = len(sel) // len(per_seed)
-    print(f"=== exit={args.exit} 滑点={args.slippage:.0f}bp 窗口={args.window} 交易日 ===")
+    print(f"=== exit={args.exit} 滑点={args.slippage:.0f}bp "
+          f"门槛={args.min_score or '无'} 窗口={args.window} 交易日 ===")
     print(f"原始序列 {n_days} 天 × {len(per_seed)} 个种子 → {len(windows):,} 个重叠窗口")
     print("（窗口高度重叠，下面是分布描述，不是独立样本，不做显著性检验）\n")
 
