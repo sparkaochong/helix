@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..eval.metrics import daily_gini, summarize_daily
+from .neutralize import residualize
 
 INVALID = -1e9
 
@@ -33,6 +34,10 @@ class EvalContext:
     min_coverage: float = 0.4
     min_defined_fraction: float = 0.2
     complexity_penalty: float = 0.0015
+    #: Optional ``(T, N, K)`` orthonormal basis. When set, fitness scores the factor's
+    #: residual after projecting it out, so a good linear blend of columns the model
+    #: already has scores zero instead of scoring well.
+    basis: np.ndarray | None = None
     _cache: dict[str, FactorScore] = field(default_factory=dict, repr=False)
 
 
@@ -70,6 +75,9 @@ def score_values(values: np.ndarray, ctx: EvalContext, n_nodes: int) -> FactorSc
     defined = np.isfinite(values) & ctx.mask
     if defined.sum() < ctx.min_defined_fraction * max(ctx.mask.sum(), 1):
         return _invalid(n_nodes)
+
+    if ctx.basis is not None:
+        values = residualize(values, ctx.basis, ctx.mask)
 
     fit = daily_gini(
         values[ctx.fit_rows], ctx.y[ctx.fit_rows], ctx.mask[ctx.fit_rows], ctx.min_daily_samples

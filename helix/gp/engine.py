@@ -29,6 +29,7 @@ from ..logging_setup import get_logger
 from .fitness import INVALID, EvalContext, evaluate
 from .generate import gen_grow, gen_half_and_half
 from .library import FactorLibrary, FactorSpec
+from .neutralize import residualize
 from .primitives import build_pset
 
 log = get_logger(__name__)
@@ -73,6 +74,7 @@ def make_context(
     cfg: GPConfig,
     embargo_days: int,
     fit_fraction: float = 0.8,
+    basis: np.ndarray | None = None,
 ) -> EvalContext:
     """Split the search block into fit rows and embargoed selection rows."""
     n_rows = y.shape[0]
@@ -96,6 +98,7 @@ def make_context(
         min_daily_samples=cfg.min_daily_samples,
         min_coverage=cfg.min_coverage,
         complexity_penalty=cfg.complexity_penalty,
+        basis=basis,
     )
 
 
@@ -130,6 +133,7 @@ def run_search(
     embargo_days: int,
     pset: gp.PrimitiveSetTyped | None = None,
     kind: str = "panel",
+    basis: np.ndarray | None = None,
 ) -> SearchResult:
     """Evolve factors. Pass ``pset``/``kind="event"`` for slot panels, where the default
     windowed operators would silently mix unrelated stocks."""
@@ -138,7 +142,7 @@ def run_search(
 
     pset = pset if pset is not None else build_pset(field_names, cfg.windows)
     toolbox = build_toolbox(pset, cfg)
-    ctx = make_context(fields, field_names, y, mask, cfg, embargo_days)
+    ctx = make_context(fields, field_names, y, mask, cfg, embargo_days, basis=basis)
 
     population = toolbox.population(n=cfg.population)
     hof = tools.HallOfFame(cfg.hall_of_fame)
@@ -195,7 +199,10 @@ def _select_factors(
             values = func(*ctx.field_arrays)
         if not isinstance(values, np.ndarray) or values.shape != ctx.y.shape:
             continue
-        ranks = cs_rank(np.where(ctx.mask, values * score.sign, np.nan))
+        oriented = np.where(ctx.mask, values * score.sign, np.nan)
+        if ctx.basis is not None:
+            oriented = residualize(oriented, ctx.basis, ctx.mask)
+        ranks = cs_rank(oriented)
         if pairwise_max_abs_corr(ranks, kept_ranks) > cfg.max_abs_corr:
             continue
         kept_specs.append(
