@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from fillability import (  # noqa: E402
     MAIN_BOARD_RATE,
     board_rate,
+    limit_base_d1,
     st_suspect_count,
     unfillable_mask,
     up_limit_d1,
@@ -49,12 +50,32 @@ def test_unknown_prefix_falls_back_to_the_main_board_rate():
     assert board_rate(pd.Series(["123456.XX"]))[0] == pytest.approx(MAIN_BOARD_RATE)
 
 
-def _frame(code: str, close_d0: float, gap: float) -> pd.DataFrame:
+def _frame(code: str, base: float, gap: float) -> pd.DataFrame:
+    """One row whose D+1 opens `gap` above `base`, the price limits are quoted against."""
     return pd.DataFrame({
         "stock_code": [code],
-        "label_px_d1_open": [round(close_d0 * (1 + gap), 2)],
+        "label_px_d1_open": [round(base * (1 + gap), 2)],
         "label_open_gap": [gap],
     })
+
+
+def test_the_limit_base_is_pre_close_not_the_raw_prior_close():
+    """The ex-dividend case, which is the only one where the two readings differ.
+
+    A 10.00 close that goes ex a 1.00 dividend has `pre_close = 9.00`, so its limit is
+    9.90 and a 9.90 open is at the limit. Reading the base as the raw 10.00 close would
+    put the limit at 11.00 and quietly let an unfillable entry through as a win. The gap
+    is measured against pre_close, so backing it out recovers pre_close directly.
+    """
+    frame = _frame("600000.SH", base=9.00, gap=0.10)
+    assert frame["label_px_d1_open"][0] == pytest.approx(9.90)
+    assert limit_base_d1(frame)[0] == pytest.approx(9.00)
+    assert up_limit_d1(frame)[0] == pytest.approx(9.90)
+    assert unfillable_mask(frame)[0]
+
+
+def test_the_limit_base_equals_the_close_when_nothing_goes_ex():
+    assert limit_base_d1(_frame("600000.SH", base=10.00, gap=0.0))[0] == pytest.approx(10.00)
 
 
 def test_limit_price_is_rounded_to_the_fen():

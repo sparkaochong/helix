@@ -8,8 +8,9 @@ not wins, and counting them as wins inflates every hit rate downstream.
 The reconstruction lives in `fillability.py`; this script measures it and, critically,
 validates it two independent ways before believing any of the numbers:
 
-1. `close[D0]` backed out of the gap must agree with `close[D0]` backed out of
-   `label_px_d1_close / (1 + label_d1_pct_chg/100)`;
+1. the limit base backed out of the gap must agree with the one backed out of
+   `label_px_d1_close / (1 + label_d1_pct_chg/100)`. Both recover `pre_close[D+1]` rather
+   than the raw D0 close, which is what the exchange quotes limits against;
 2. a row that opens at its limit cannot trade higher that day, so `open[D+1] ==
    high[D+1]` must hold for essentially every flagged row. If it does not, the assumed
    board rate is wrong and every count below is wrong with it.
@@ -66,7 +67,7 @@ def main() -> None:
     from_pct = close_d1 / (1.0 + pct / 100.0)
     both = np.isfinite(from_gap) & np.isfinite(from_pct) & (from_pct > 0)
     rel = np.abs(from_gap[both] - from_pct[both]) / from_pct[both]
-    print(f"\nclose[D0] 两条推导路径一致性: median {np.median(rel):.2e}  "
+    print(f"\npre_close[D+1] 两条推导路径一致性: median {np.median(rel):.2e}  "
           f"p99 {np.quantile(rel, 0.99):.2e}  >1e-3 的比例 {(rel > 1e-3).mean():.4%}")
 
     # --------------------------------------------- 校验二：开盘涨停则 open==high --
@@ -91,7 +92,7 @@ def main() -> None:
     report: dict = {
         "rows": int(n_all),
         "label_nan": label_null,
-        "close_d0_disagree_rate": round(float((rel > 1e-3).mean()), 6),
+        "limit_base_disagree_rate": round(float((rel > 1e-3).mean()), 6),
         "open_equals_high_among_flagged": round(float(open_is_high.mean()), 6),
         "flat_limit_rows": int(flat.sum()),
         "st_suspects": st_suspects,

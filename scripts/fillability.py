@@ -9,8 +9,16 @@ precomputed label instead, so the same property has to be reconstructed and chec
 
 The table carries no D0 close column, so the limit price is derived:
 
-    close[D0] = open[D+1] / (1 + label_open_gap)
-    up_limit  = round(close[D0] * (1 + board_rate), 2)
+    base[D+1] = open[D+1] / (1 + label_open_gap)
+    up_limit  = round(base[D+1] * (1 + board_rate), 2)
+
+`base[D+1]` is `pre_close[D+1]`, not the raw D0 close, and that is the base the exchange
+actually quotes the limit against. The two differ by the whole dividend on an ex-div day
+-- median 24% across a sample of 4,626 such pairs -- so this is not a distinction without
+a difference. `scripts/check_suspension.py` established which one the gap is measured
+against: `close / (1 + pct_chg)` recovers `pre_close` on 100.0000% of 394,123 adjacent
+trading-day pairs and the prior close on only 98.6083% (0.4323% on ex-div days), and
+`check_fillability.py` shows the gap-derived and pct_chg-derived values agree to 2.8e-7.
 
 This lives in its own module because two scripts need the identical definition. Joining
 a precomputed flag back on (stock_code, trade_date) is not an option: 514 rows share
@@ -51,15 +59,20 @@ def board_rate(codes: pd.Series) -> np.ndarray:
     return rates
 
 
-def close_d0(frame: pd.DataFrame) -> np.ndarray:
-    """D0 close, backed out of the D+1 open and its gap."""
+def limit_base_d1(frame: pd.DataFrame) -> np.ndarray:
+    """`pre_close[D+1]` -- the price D+1's limits are quoted against.
+
+    Equal to the D0 close on an ordinary day and deliberately *not* equal to it after a
+    dividend or split, which is the case that matters: using the raw prior close there
+    would put the limit a full dividend too high and stop flagging genuine limit-up opens.
+    """
     open_d1 = frame["label_px_d1_open"].to_numpy(dtype=float)
     gap = frame["label_open_gap"].to_numpy(dtype=float)
     return open_d1 / (1.0 + gap)
 
 
 def up_limit_d1(frame: pd.DataFrame) -> np.ndarray:
-    return np.round(close_d0(frame) * (1.0 + board_rate(frame["stock_code"])), 2)
+    return np.round(limit_base_d1(frame) * (1.0 + board_rate(frame["stock_code"])), 2)
 
 
 def unfillable_mask(frame: pd.DataFrame) -> np.ndarray:
