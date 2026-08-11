@@ -12,6 +12,15 @@ Scoring is deliberately imported from `fill_impact.py` rather than reimplemented
 features, same split, same seeds, same model. Only the accounting is new, so any
 difference from the published hit rate is accounting and nothing else.
 
+`--rank-by` then asks the follow-up question. The published ranker is trained on
+`P(touch 8%)`, which matches the label but not the exit that actually makes money:
+
+* **classify**   -- P(touch 8%), the published ranker.
+* **regress**    -- squared error on `close[D+2]/open[D+1] - 1` directly.
+* **regress-cs** -- the same return, z-scored within each trading day. The book picks k
+  names *inside* a day, so the market's shared daily move is variance the ranker should
+  not be spending capacity on.
+
 Two assumptions get their own sensitivity axis, because both are optimistic and neither
 is verifiable from this table:
 
@@ -35,7 +44,7 @@ import json
 
 import numpy as np
 import pandas as pd
-from fill_impact import build_model, daily_ic, feature_columns
+from fill_impact import build_model, build_regressor, daily_ic, feature_columns
 from fillability import REQUIRED_COLUMNS, unfillable_mask
 
 #: Statutory A-share round-trip costs, in basis points of notional.
@@ -83,6 +92,38 @@ def gross_returns(frame: pd.DataFrame, label: str, target_ratio: float,
 
 def max_drawdown(equity: np.ndarray) -> float:
     return float(np.min(equity / np.maximum.accumulate(equity) - 1.0))
+
+
+def cross_sectional_z(frame: pd.DataFrame, column: str) -> np.ndarray:
+    """Per-day z-score of `column`, so the target carries no market-direction component.
+
+    Ranking happens *within* a trading day: knowing that tomorrow is broadly up helps pick
+    nothing. A raw-return regression spends capacity on that shared component anyway,
+    because it is the largest single term in the variance. Demeaning by day removes it and
+    leaves the only part the book can act on. Uses that day's own cross-section, so it is
+    applied to the training target only -- never to build a feature.
+    """
+    g = frame.groupby("trade_date", sort=False)[column]
+    std = g.transform("std").to_numpy(dtype=float)
+    centred = frame[column].to_numpy(dtype=float) - g.transform("mean").to_numpy(dtype=float)
+    return np.where(std > 0, centred / np.where(std > 0, std, 1.0), 0.0)
+
+
+def fit_and_score(rank_by: str, seed: int, train: pd.DataFrame, test: pd.DataFrame,
+                  features: list[str], label: str, return_col: str) -> np.ndarray:
+    """Train one ranker and return its out-of-sample score, higher = buy first."""
+    x_train = train[features].to_numpy(dtype=np.float32)
+    x_test = test[features].to_numpy(dtype=np.float32)
+    if rank_by == "classify":
+        model = build_model(seed)
+        model.fit(x_train, train[label].to_numpy())
+        return model.predict_proba(x_test)[:, 1]
+
+    target = (cross_sectional_z(train, return_col) if rank_by == "regress-cs"
+              else train[return_col].to_numpy(dtype=float))
+    model = build_regressor(seed)
+    model.fit(x_train, target)
+    return model.predict(x_test)
 
 
 def run_book(scored: pd.DataFrame, label: str, k: int, target_ratio: float,
@@ -157,6 +198,12 @@ def main() -> None:
     ap.add_argument("--input", required=True)
     ap.add_argument("--label", default="label_d2_hit_8pct")
     ap.add_argument("--ic-target", default="label_d2_peak_return")
+    ap.add_argument("--return-col", default="label_d2_return",
+                    help="close[D+2]/open[D+1] - 1, i.e. what the close exit earns.")
+    ap.add_argument("--rank-by", default="classify",
+                    choices=("classify", "regress", "regress-cs"),
+                    help="What to rank on: P(touch 8%%), the raw D+2 return, or its "
+                         "per-day cross-sectional z-score.")
     ap.add_argument("--target-ratio", type=float, default=1.08)
     ap.add_argument("--split-date", default="2024-09-04")
     ap.add_argument("--embargo-days", type=int, default=3)
@@ -171,13 +218,20 @@ def main() -> None:
 
     features = feature_columns(args.input)
     price_cols = ["label_px_d1_open", "label_px_d2_close"]
-    needed = sorted({"trade_date", args.label, args.ic_target,
+    needed = sorted({"trade_date", args.label, args.ic_target, args.return_col,
                      *price_cols, *REQUIRED_COLUMNS, *features})
     df = pd.read_parquet(args.input, columns=needed)
     df["trade_date"] = df["trade_date"].astype(str)
     df["unfillable"] = unfillable_mask(df)
-    df = df.dropna(subset=[args.label, args.ic_target, *price_cols])
-    print(f"features {len(features)}  rows {len(df):,}")
+    df = df.dropna(subset=[args.label, args.ic_target, args.return_col, *price_cols])
+    print(f"features {len(features)}  rows {len(df):,}  rank-by {args.rank_by}")
+
+    # The return column has to be the quantity the close exit actually earns, or ranking
+    # on it optimises something else. Cheap to check, so check rather than trust the name.
+    implied = (df["label_px_d2_close"].to_numpy(dtype=float)
+               / df["label_px_d1_open"].to_numpy(dtype=float)) - 1.0
+    if not np.allclose(implied, df[args.return_col].to_numpy(dtype=float), atol=1e-6):
+        raise SystemExit(f"{args.return_col} 不等于 close[D+2]/open[D+1]-1，不能当回归目标")
 
     dates = np.array(sorted(df["trade_date"].unique()))
     cut = int(np.searchsorted(dates, args.split_date, "right"))
@@ -192,33 +246,36 @@ def main() -> None:
 
     report = {"features": len(features), "train_end": train_end, "test_start": test_start,
               "seeds": seeds, "top_k": args.top_k, "target_ratio": args.target_ratio,
+              "rank_by": args.rank_by, "return_col": args.return_col,
               "cost_bps": {"commission": COMMISSION_BPS, "transfer": TRANSFER_BPS,
                            "stamp_sell": STAMP_SELL_BPS},
               "runs": [], "summary": {}}
 
     books: dict[tuple[str, float], list[dict]] = {}
     for seed in seeds:
-        model = build_model(seed)
-        model.fit(train[features].to_numpy(dtype=np.float32), train[args.label].to_numpy())
-        scored = test[["trade_date", args.label, args.ic_target, "unfillable",
-                       *price_cols]].copy()
-        scored["score"] = model.predict_proba(
-            test[features].to_numpy(dtype=np.float32))[:, 1]
+        scored = test[["trade_date", args.label, args.ic_target, args.return_col,
+                       "unfillable", *price_cols]].copy()
+        scored["score"] = fit_and_score(args.rank_by, seed, train, test, features,
+                                        args.label, args.return_col)
         ic = daily_ic(scored, "score", args.ic_target)
+        # Against the return too: a ranker trained on returns should not be judged only on
+        # its correlation with the peak, which is the classifier's home turf.
+        ic_ret = daily_ic(scored, "score", args.return_col)
 
         for exit_rule in ("target", "close"):
             for slip in slippages:
                 book = run_book(scored, args.label, args.top_k, args.target_ratio,
                                 exit_rule, slip)
                 book |= {"seed": seed, "exit": exit_rule, "slippage_bps": slip,
-                         "ic_mean": round(ic, 6)}
+                         "ic_mean": round(ic, 6), "ic_vs_return": round(ic_ret, 6)}
                 report["runs"].append(book)
                 books.setdefault((exit_rule, slip), []).append(book)
-        base = books[("target", slippages[0])][-1]
-        print(f"  seed {seed}  IC {ic:+.5f}  命中 {100 * base['hit_rate']:.2f}%  "
-              f"毛 {100 * base['gross_per_trade']:+.3f}%/笔")
+        base = books[("close", slippages[0])][-1]
+        print(f"  seed {seed}  IC(peak) {ic:+.5f}  IC(ret) {ic_ret:+.5f}  "
+              f"命中 {100 * base['hit_rate']:.2f}%  "
+              f"收盘口径毛 {100 * base['gross_per_trade']:+.3f}%/笔")
 
-    sample = books[("target", slippages[0])]
+    sample = books[("close", slippages[0])]
     print(f"\ntop{args.top_k} 收益分解（{len(seeds)} 个种子均值）：命中组持到 D+2 收盘 "
           f"{100 * float(np.mean([r['win_to_close'] for r in sample])):+.2f}%  |  "
           f"未命中组 {100 * float(np.mean([r['loss_to_close'] for r in sample])):+.2f}%  |  "

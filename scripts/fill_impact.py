@@ -59,14 +59,28 @@ def feature_columns(path: str) -> list[str]:
     return names
 
 
+#: Shared by the classifier and the regressor so that swapping the objective is the only
+#: difference between them. Duplicating these would make "same model, different target"
+#: an assertion instead of something you can read off the file.
+MODEL_PARAMS = dict(
+    n_estimators=400, max_depth=5, learning_rate=0.05,
+    subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
+    n_jobs=-1, tree_method="hist",
+)
+
+
 def build_model(seed: int):
     from xgboost import XGBClassifier
 
-    return XGBClassifier(
-        n_estimators=400, max_depth=5, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
-        eval_metric="logloss", random_state=seed, n_jobs=-1, tree_method="hist",
-    )
+    return XGBClassifier(**MODEL_PARAMS, eval_metric="logloss", random_state=seed)
+
+
+def build_regressor(seed: int):
+    """Same trees, squared-error objective -- for ranking on a return instead of a hit."""
+    from xgboost import XGBRegressor
+
+    return XGBRegressor(**MODEL_PARAMS, objective="reg:squarederror",
+                        eval_metric="rmse", random_state=seed)
 
 
 def daily_ic(frame: pd.DataFrame, score: str, target: str, min_n: int = 30) -> float:
