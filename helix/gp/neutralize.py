@@ -40,26 +40,36 @@ def _ranked(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return np.where(mask & np.isfinite(ranks), ranks, 0.0)
 
 
-def build_basis(base_grids: list[np.ndarray], mask: np.ndarray) -> np.ndarray:
+def build_basis(
+    base_grids: list[np.ndarray], mask: np.ndarray, dtype=np.float32
+) -> np.ndarray:
     """``(T, N, K+1)`` per-date orthonormal basis: an intercept plus each base column.
 
     Modified Gram-Schmidt, run across all dates at once. Degenerate directions (a
     constant column on some date, or a date with too few names) collapse to zero, which
     makes the projection a no-op there rather than producing garbage.
+
+    Orthonormalisation runs in float64 for stability; the result is stored in ``dtype``
+    (float32 by default) because :func:`residualize` runs once per candidate inside the
+    GP loop and halving the bandwidth roughly halves that cost. Only ranks of the
+    residual are ever used, so float32 is ample.
     """
-    n_dates, n_slots = mask.shape
     columns = [mask.astype(np.float64)]  # intercept, restricted to occupied slots
     columns.extend(_ranked(np.asarray(g, dtype=np.float64), mask) for g in base_grids)
+    stacked = np.stack(columns, axis=-1)  # (T, N, K)
 
-    basis = np.zeros((n_dates, n_slots, len(columns)), dtype=np.float64)
-    for k, column in enumerate(columns):
-        v = column.copy()
-        for j in range(k):
-            projection = np.einsum("tn,tn->t", basis[:, :, j], v)
-            v -= basis[:, :, j] * projection[:, None]
-        norm = np.sqrt(np.einsum("tn,tn->t", v, v))
-        basis[:, :, k] = np.where(norm[:, None] > EPS, v / np.maximum(norm, EPS)[:, None], 0.0)
-    return basis
+    # Batched QR rather than a Gram-Schmidt loop: one LAPACK call instead of K^2/2
+    # passes over the panel. With 70 base columns that is seconds instead of minutes.
+    # Rows outside the mask are zero in every column, so they stay zero in Q.
+    q, r = np.linalg.qr(stacked)
+
+    # Rank-deficient directions (a column constant on some date, or a date with fewer
+    # names than columns) leave a negligible diagonal in R and an arbitrary direction in
+    # Q. Zero those out so the projection is a no-op there rather than removing noise.
+    diagonal = np.abs(np.diagonal(r, axis1=1, axis2=2))          # (T, K)
+    tolerance = EPS * np.maximum(diagonal.max(axis=1, keepdims=True), EPS)
+    q = np.where((diagonal > tolerance)[:, None, :], q, 0.0)
+    return np.ascontiguousarray(q, dtype=dtype)
 
 
 def residualize(
@@ -79,14 +89,19 @@ def residualize(
     Returns NaN outside the mask so downstream metrics skip those cells exactly as they
     would for a raw factor.
     """
-    ranks = _ranked(np.asarray(values, dtype=np.float64), mask)
-    coefficients = np.einsum("tnk,tn->tk", basis, ranks)
-    residual = ranks - np.einsum("tnk,tk->tn", basis, coefficients)
+    ranks = _ranked(np.asarray(values, dtype=np.float64), mask).astype(basis.dtype, copy=False)
 
-    scale = np.sqrt(np.einsum("tn,tn->t", ranks, ranks))
-    magnitude = np.sqrt(np.einsum("tn,tn->t", residual, residual))
-    explained = magnitude <= min_residual_fraction * np.maximum(scale, EPS)
-    return np.where(mask & ~explained[:, None], residual, np.nan)
+    # Two batched matmuls rather than einsum: both keep the contiguous basis as an
+    # operand so they dispatch to BLAS. With a 70-column base this is the difference
+    # between minutes and seconds per generation.
+    coefficients = np.matmul(ranks[:, None, :], basis)                 # (T, 1, K)
+    projection = np.matmul(basis, coefficients.transpose(0, 2, 1))     # (T, N, 1)
+    residual = ranks - projection[:, :, 0]
+
+    scale = np.einsum("tn,tn->t", ranks, ranks)
+    magnitude = np.einsum("tn,tn->t", residual, residual)
+    explained = magnitude <= (min_residual_fraction**2) * np.maximum(scale, EPS)
+    return np.where(mask & ~explained[:, None], residual.astype(np.float64), np.nan)
 
 
 def basis_from_fields(

@@ -88,13 +88,22 @@ def test_residual_is_nan_outside_the_mask(mask, base):
 
 
 def test_basis_is_orthonormal_per_date(mask, base):
+    """Gram-Schmidt runs in float64; the basis is stored float32, so tolerance is 1e-6."""
     rng = np.random.default_rng(3)
     basis = build_basis([base, rng.normal(size=mask.shape)], mask)
-    gram = np.einsum("tnj,tnk->tjk", basis, basis)
+    assert basis.dtype == np.float32
+
+    gram = np.einsum("tnj,tnk->tjk", basis.astype(np.float64), basis.astype(np.float64))
     for t in range(mask.shape[0]):
         active = np.diag(gram[t]) > 0.5
         block = gram[t][np.ix_(active, active)]
-        np.testing.assert_allclose(block, np.eye(active.sum()), atol=1e-9)
+        np.testing.assert_allclose(block, np.eye(active.sum()), atol=1e-6)
+
+
+def test_float64_basis_is_still_available_for_precision_sensitive_use(mask, base):
+    basis = build_basis([base], mask, dtype=np.float64)
+    assert basis.dtype == np.float64
+    assert np.isnan(residualize(base, basis, mask)).all()
 
 
 def test_a_constant_column_neither_explodes_nor_corrupts_the_basis(mask):
