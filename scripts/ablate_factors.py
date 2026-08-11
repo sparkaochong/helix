@@ -106,9 +106,13 @@ def main() -> None:
     ap.add_argument("--embargo-days", type=int, default=3,
                     help="Trade dates dropped either side of the split; a D0 row resolves on D+2.")
     ap.add_argument("--top-k", type=int, default=20)
-    ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--seeds", default="7",
+                    help="Comma-separated seeds. Several are worth the time: a single "
+                         "run cannot tell a real gain from seed-to-seed variance, and the "
+                         "deltas at stake here are smaller than that variance.")
     ap.add_argument("--report", default="ablation_report.json")
     args = ap.parse_args()
+    seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
 
     with open(args.factors) as fh:
         factors = json.load(fh)
@@ -133,41 +137,57 @@ def main() -> None:
     print(f"train positive rate {train[args.label].mean():.4f} | "
           f"test positive rate {test[args.label].mean():.4f}")
 
-    name, _ = build_model(args.seed)
-    print(f"model: {name}")
+    name, _ = build_model(seeds[0])
+    print(f"model: {name} | seeds: {seeds}")
 
     report = {"model": name, "train_end": train_end, "test_start": test_start,
-              "n_features": len(features), "n_factors": len(factors), "arms": {}}
+              "n_features": len(features), "n_factors": len(factors),
+              "seeds": seeds, "runs": [], "arms": {}}
 
-    for arm, columns in (("base", features), ("base+factors", features + factors)):
-        _, model = build_model(args.seed)
-        model.fit(train[columns].to_numpy(dtype=np.float32), train[args.label].to_numpy())
-        scored = test[["trade_date", args.label, args.ic_target]].copy()
-        scored["score"] = model.predict_proba(test[columns].to_numpy(dtype=np.float32))[:, 1]
-
-        entry = {
-            "n_columns": len(columns),
-            "ic": summarize(daily_ic(scored, "score", args.ic_target)),
-            "hit": top_k_hit_rate(scored, "score", args.label, args.top_k),
-        }
-        report["arms"][arm] = entry
-        print(f"\n{arm}: {len(columns)} columns")
-        print(f"  IC   {entry['ic'].get('ic_mean'):+.5f}  ICIR {entry['ic'].get('icir'):+.3f}  "
-              f"pos {100 * entry['ic'].get('positive_rate', 0):.1f}%")
-        print(f"  top{args.top_k} 命中率 {100 * entry['hit'].get('hit_rate', 0):.2f}%  "
-              f"base {100 * entry['hit'].get('base_rate', 0):.2f}%  "
-              f"lift {entry['hit'].get('lift'):.3f}")
-
-    a, b = report["arms"]["base"], report["arms"]["base+factors"]
-    report["delta"] = {
-        "ic_mean": round(b["ic"]["ic_mean"] - a["ic"]["ic_mean"], 6),
-        "icir": round(b["ic"]["icir"] - a["ic"]["icir"], 4),
-        "hit_rate": round(b["hit"]["hit_rate"] - a["hit"]["hit_rate"], 5),
-        "lift": round(b["hit"]["lift"] - a["hit"]["lift"], 4),
+    collected: dict[str, dict[str, list[float]]] = {
+        "base": {"ic_mean": [], "icir": [], "hit_rate": [], "lift": []},
+        "base+factors": {"ic_mean": [], "icir": [], "hit_rate": [], "lift": []},
     }
+
+    for seed in seeds:
+        for arm, columns in (("base", features), ("base+factors", features + factors)):
+            _, model = build_model(seed)
+            model.fit(train[columns].to_numpy(dtype=np.float32), train[args.label].to_numpy())
+            scored = test[["trade_date", args.label, args.ic_target]].copy()
+            scored["score"] = model.predict_proba(test[columns].to_numpy(dtype=np.float32))[:, 1]
+
+            ic = summarize(daily_ic(scored, "score", args.ic_target))
+            hit = top_k_hit_rate(scored, "score", args.label, args.top_k)
+            report["runs"].append({"seed": seed, "arm": arm, "ic": ic, "hit": hit})
+            for key, value in (("ic_mean", ic["ic_mean"]), ("icir", ic["icir"]),
+                               ("hit_rate", hit["hit_rate"]), ("lift", hit["lift"])):
+                collected[arm][key].append(value)
+            print(f"  seed {seed} {arm:13s} IC {ic['ic_mean']:+.5f}  "
+                  f"ICIR {ic['icir']:+.3f}  top{args.top_k} {100 * hit['hit_rate']:.2f}%  "
+                  f"lift {hit['lift']:.3f}")
+
+    print(f"\n=== 均值 ± 标准差（{len(seeds)} 个种子）===")
+    for arm in ("base", "base+factors"):
+        stats_ = {k: (float(np.mean(v)), float(np.std(v, ddof=1)) if len(v) > 1 else 0.0)
+                  for k, v in collected[arm].items()}
+        report["arms"][arm] = {k: {"mean": round(m, 6), "std": round(s, 6)}
+                               for k, (m, s) in stats_.items()}
+        print(f"  {arm:13s} IC {stats_['ic_mean'][0]:+.5f}±{stats_['ic_mean'][1]:.5f}  "
+              f"top{args.top_k} {100 * stats_['hit_rate'][0]:.2f}%±{100 * stats_['hit_rate'][1]:.2f}  "
+              f"lift {stats_['lift'][0]:.3f}±{stats_['lift'][1]:.3f}")
+
     print("\n=== 增量 (base+factors - base) ===")
-    for k, v in report["delta"].items():
-        print(f"  {k:10s} {v:+.5f}")
+    report["delta"] = {}
+    for key in ("ic_mean", "icir", "hit_rate", "lift"):
+        a = np.array(collected["base"][key])
+        b = np.array(collected["base+factors"][key])
+        diff = b - a
+        noise = float(np.std(a, ddof=1)) if len(a) > 1 else float("nan")
+        report["delta"][key] = {"mean": round(float(diff.mean()), 6),
+                                "base_seed_std": round(noise, 6)}
+        verdict = "" if not np.isfinite(noise) else (
+            "  <- 在噪声内" if abs(diff.mean()) <= noise else "  <- 超出种子噪声")
+        print(f"  {key:10s} {diff.mean():+.5f}   (基线种子间标准差 {noise:.5f}){verdict}")
 
     with open(args.report, "w") as fh:
         json.dump(report, fh, indent=2, ensure_ascii=False)
