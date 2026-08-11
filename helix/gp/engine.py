@@ -128,11 +128,15 @@ def run_search(
     mask: np.ndarray,
     cfg: GPConfig,
     embargo_days: int,
+    pset: gp.PrimitiveSetTyped | None = None,
+    kind: str = "panel",
 ) -> SearchResult:
+    """Evolve factors. Pass ``pset``/``kind="event"`` for slot panels, where the default
+    windowed operators would silently mix unrelated stocks."""
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
 
-    pset = build_pset(field_names, cfg.windows)
+    pset = pset if pset is not None else build_pset(field_names, cfg.windows)
     toolbox = build_toolbox(pset, cfg)
     ctx = make_context(fields, field_names, y, mask, cfg, embargo_days)
 
@@ -162,11 +166,11 @@ def run_search(
         offspring = algorithms.varAnd(offspring, toolbox, cfg.crossover_prob, cfg.mutation_prob)
         population = [toolbox.clone(hof[0]), *offspring]  # elitism
 
-    return _select_factors(hof, toolbox, ctx, cfg, field_names)
+    return _select_factors(hof, toolbox, ctx, cfg, field_names, kind)
 
 
 def _select_factors(
-    hof, toolbox, ctx: EvalContext, cfg: GPConfig, field_names: list[str]
+    hof, toolbox, ctx: EvalContext, cfg: GPConfig, field_names: list[str], kind: str = "panel"
 ) -> SearchResult:
     """Rank the hall of fame by held-out performance, then greedily deduplicate."""
     ranked = []
@@ -213,6 +217,8 @@ def _select_factors(
         )
 
     return SearchResult(
-        library=FactorLibrary(factors=kept_specs, field_names=field_names, windows=cfg.windows),
+        library=FactorLibrary(
+            factors=kept_specs, field_names=field_names, windows=cfg.windows, kind=kind
+        ),
         hall_of_fame=[(e, s.fit_gini, s.sel_gini) for e, s in ranked],
     )

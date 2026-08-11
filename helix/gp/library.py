@@ -34,17 +34,28 @@ class FactorLibrary:
     factors: list[FactorSpec]
     field_names: list[str]
     windows: list[int]
+    #: ``"panel"`` = true (dates x stocks) panel, windowed operators allowed.
+    #: ``"event"`` = slot panel from a long event table, cross-sectional operators only.
+    kind: str = "panel"
+
+    def build_pset(self):
+        if self.kind == "event":
+            from .event_primitives import build_event_pset
+
+            return build_event_pset(self.field_names)
+        return build_pset(self.field_names, self.windows)
 
 
 def save_factors(path: Path, library: FactorLibrary) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "kind": library.kind,
         "field_names": library.field_names,
         "windows": library.windows,
         "factors": [asdict(f) for f in library.factors],
     }
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    log.info("saved %d factors to %s", len(library.factors), path)
+    log.info("saved %d %s factors to %s", len(library.factors), library.kind, path)
 
 
 def load_factors(path: Path) -> FactorLibrary:
@@ -53,6 +64,7 @@ def load_factors(path: Path) -> FactorLibrary:
         factors=[FactorSpec(**f) for f in payload["factors"]],
         field_names=list(payload["field_names"]),
         windows=list(payload["windows"]),
+        kind=payload.get("kind", "panel"),
     )
 
 
@@ -69,7 +81,7 @@ def compute_factors(
     if missing:
         raise ValueError(f"panel is missing fields required by the library: {missing}")
 
-    pset = build_pset(library.field_names, library.windows)
+    pset = library.build_pset()
     args = [np.asarray(fields[n], dtype=np.float64) for n in library.field_names]
     shape = args[0].shape
 
