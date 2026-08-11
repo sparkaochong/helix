@@ -109,14 +109,10 @@ def _book(scores, unfillable, hit, to_close) -> pd.DataFrame:
     return frame
 
 
-def _run(book: pd.DataFrame, hold_k: int, signal_k: int, exit_rule: str = "close") -> dict:
+def _run(book: pd.DataFrame, hold_k: int, signal_k: int, exit_rule: str = "close",
+         min_score: float | None = None) -> dict:
     return run_book(book, hold_k=hold_k, signal_k=signal_k, target_ratio=1.08,
-                    exit_rule=exit_rule, slippage_bps=0.0)[0]
-
-
-def _daily(book: pd.DataFrame, hold_k: int, signal_k: int) -> pd.DataFrame:
-    return run_book(book, hold_k=hold_k, signal_k=signal_k, target_ratio=1.08,
-                    exit_rule="close", slippage_bps=0.0)[1]
+                    exit_rule=exit_rule, slippage_bps=0.0, min_score=min_score)[0]
 
 
 def test_without_a_deeper_shortlist_an_unfillable_pick_is_not_replaced():
@@ -165,6 +161,56 @@ def test_base_rate_is_measured_over_fillable_rows_only():
                  hit=(1, 1, 0), to_close=(0.09, 0.09, -0.04))
     res = _run(book, hold_k=2, signal_k=2)
     assert res["base_rate"] == pytest.approx(0.5)   # 1 of the 2 fillable, not 2 of 3
+
+
+def test_the_conviction_gate_keeps_a_prefix_of_the_ranking():
+    """Not a filter over the whole shortlist: the list is score-descending, so the gate
+    truncates it and cannot reorder which names get bought."""
+    book = _book(scores=[0.7, 0.5, 0.3], unfillable=[False, False, False],
+                 hit=(1, 0, 1), to_close=(0.09, -0.04, 0.20))
+    res = _run(book, hold_k=3, signal_k=3, min_score=0.6)
+    assert res["avg_positions"] == 1.0                      # only the 0.7 clears it
+    assert res["gross_per_trade"] == pytest.approx(0.09)    # not the +20% scoring 0.3
+
+
+def test_a_day_where_nothing_clears_the_gate_is_flat_not_absent():
+    """The distinction the parameter exists for. Dropping the day would shorten the track
+    and score the strategy only on days it chose to trade -- so a threshold would always
+    look like it cut drawdown, whether or not it sat out the bad days."""
+    book = _book(scores=[0.4, 0.3], unfillable=[False, False],
+                 hit=(0, 0), to_close=(-0.05, -0.06))
+    res, daily = run_book(book, hold_k=2, signal_k=2, target_ratio=1.08,
+                          exit_rule="close", slippage_bps=0.0, min_score=0.9)
+    assert res["n_days"] == 1 and res["n_traded_days"] == 0   # the day is still on the books
+    assert res["flat_day_rate"] == 1.0
+    assert float(daily["portfolio_return"].iloc[0]) == 0.0
+    assert float(daily["equity"].iloc[0]) == 1.0             # flat, and it costs nothing
+
+
+def test_an_all_unfillable_day_is_flat_rather_than_skipped():
+    """Every order sitting unfilled at the limit is a real day out of the market, and the
+    equity curve has to show it. Without a gate this is rare; it is not impossible."""
+    book = _book(scores=[3.0, 2.0], unfillable=[True, True],
+                 hit=(1, 1), to_close=(0.09, 0.09))
+    res = _run(book, hold_k=2, signal_k=2)
+    assert res["n_days"] == 1 and res["n_traded_days"] == 0
+    assert res["flat_day_rate"] == 1.0
+
+
+def test_per_trade_stats_exclude_flat_days_but_the_curve_does_not():
+    """A flat day is a zero in the curve and a non-event in the per-trade average. Folding
+    it into the latter would dilute the loss and make the gate look like alpha."""
+    book = _book(scores=[0.9, 0.2], unfillable=[False, False],
+                 hit=(0, 0), to_close=(-0.10, -0.10))
+    book.loc[1, "trade_date"] = "20250102"     # day 2 has only the 0.2 name: gated out
+    res, daily = run_book(book, hold_k=1, signal_k=1, target_ratio=1.08,
+                          exit_rule="close", slippage_bps=0.0, min_score=0.5)
+    assert res["n_days"] == 2 and res["n_traded_days"] == 1
+    # -0.1009, i.e. the one trade. Folding the flat day in would halve it to -0.0505.
+    assert res["net_per_trade"] == pytest.approx(
+        float(net_return(np.array([-0.10]), 0.0)[0]), abs=1e-6)
+    assert list(daily["portfolio_return"]) == pytest.approx(
+        [float(net_return(np.array([-0.10]), 0.0)[0]) / 2, 0.0])
 
 
 def test_the_daily_series_is_the_curve_the_scalars_were_computed_from():

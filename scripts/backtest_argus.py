@@ -138,9 +138,15 @@ def fit_and_score(rank_by: str, seed: int, train: pd.DataFrame, test: pd.DataFra
 
 
 def run_book(scored: pd.DataFrame, hold_k: int, signal_k: int,
-             target_ratio: float, exit_rule: str,
-             slippage_bps: float) -> tuple[dict, pd.DataFrame]:
+             target_ratio: float, exit_rule: str, slippage_bps: float,
+             min_score: float | None = None) -> tuple[dict, pd.DataFrame]:
     """Submit the ranked shortlist, fill down it until `hold_k` positions, then compound.
+
+    `min_score` is the conviction gate: a candidate below it is not bought, and a day where
+    nothing clears the bar is held flat rather than dropped. That distinction is the whole
+    point of the parameter. Skipping the day would quietly shorten the track and measure
+    the strategy only on days it chose to trade; a flat day is a real day with a zero
+    return, and it is what lets a threshold reduce drawdown instead of just reducing `n`.
 
     Returns the summary *and* the per-day series behind it. The scalars alone cannot answer
     the question a short live track record raises -- a headline drawdown is the minimum
@@ -164,10 +170,24 @@ def run_book(scored: pd.DataFrame, hold_k: int, signal_k: int,
     for date, g in scored.groupby("trade_date", sort=True):
         if len(g) < signal_k:
             continue
+        fillable = g[~g["unfillable"]]
+        base_rate = (float(target_hit(fillable, target_ratio).mean())
+                     if len(fillable) else np.nan)
+        flat = {"date": date, "positions": 0, "fill_depth": 0, "short": 0.0,
+                "hit_rate": np.nan, "base_rate": base_rate,
+                "gross_return": np.nan, "net_return": 0.0,
+                "win_to_close": np.nan, "loss_to_close": np.nan}
+
         shortlist = g.nlargest(signal_k, "score").reset_index(drop=True)
         usable = shortlist.index[~shortlist["unfillable"].to_numpy()][:hold_k]
         picked = shortlist.loc[usable]
+        if min_score is not None:
+            # The shortlist is score-descending, so the gate keeps a prefix of it and the
+            # substitution order above is untouched.
+            keep = picked["score"].to_numpy(dtype=float) >= min_score
+            usable, picked = usable[keep], picked[keep]
         if picked.empty:
+            rows.append(flat)
             continue
         # How deep the shortlist had to go, and whether it ran out before filling hold_k.
         depth = int(usable[-1]) + 1
@@ -187,7 +207,7 @@ def run_book(scored: pd.DataFrame, hold_k: int, signal_k: int,
             "fill_depth": depth,
             "short": float(short),
             "hit_rate": float(hit.mean()),
-            "base_rate": float(target_hit(g[~g["unfillable"]], target_ratio).mean()),
+            "base_rate": base_rate,
             "gross_return": float(gross.mean()),
             "net_return": float(net.mean()),
             # The decomposition that explains the result: selection lifts the winners a
@@ -204,23 +224,29 @@ def run_book(scored: pd.DataFrame, hold_k: int, signal_k: int,
     daily["equity"] = (1.0 + daily["portfolio_return"]).cumprod()
     portfolio = daily["portfolio_return"].to_numpy()
     vol = float(portfolio.std(ddof=1)) if len(portfolio) > 1 else float("nan")
-    hit, base = float(daily["hit_rate"].mean()), float(daily["base_rate"].mean())
+    # Per-trade statistics average over days that traded; the curve averages over all of
+    # them. Mixing the two would let a threshold flatter its own per-trade number by
+    # sitting out the days it expected to lose, while the equity curve says otherwise.
+    traded = daily[daily["positions"] > 0]
+    hit, base = float(traded["hit_rate"].mean()), float(daily["base_rate"].mean())
     years = len(daily) / TRADING_DAYS
     final = float(daily["equity"].iloc[-1])
     summary = {
         "n_days": int(len(daily)),
-        "avg_positions": round(float(daily["positions"].mean()), 3),
+        "n_traded_days": int(len(traded)),
+        "flat_day_rate": round(float((daily["positions"] == 0).mean()), 6),
+        "avg_positions": round(float(traded["positions"].mean()), 3),
         # Both are noise at hold_k=20 and decisive at hold_k=1: if the top name is often
         # unfillable, the shortlist is doing the work and its depth is a real assumption.
-        "avg_fill_depth": round(float(daily["fill_depth"].mean()), 3),
-        "short_day_rate": round(float(daily["short"].mean()), 6),
+        "avg_fill_depth": round(float(traded["fill_depth"].mean()), 3),
+        "short_day_rate": round(float(traded["short"].mean()), 6),
         "hit_rate": round(hit, 6),
         "base_rate": round(base, 6),
         "lift": round(hit / max(base, 1e-12), 4),
-        "win_to_close": round(float(daily["win_to_close"].mean()), 6),
-        "loss_to_close": round(float(daily["loss_to_close"].mean()), 6),
-        "gross_per_trade": round(float(daily["gross_return"].mean()), 6),
-        "net_per_trade": round(float(daily["net_return"].mean()), 6),
+        "win_to_close": round(float(traded["win_to_close"].mean()), 6),
+        "loss_to_close": round(float(traded["loss_to_close"].mean()), 6),
+        "gross_per_trade": round(float(traded["gross_return"].mean()), 6),
+        "net_per_trade": round(float(traded["net_return"].mean()), 6),
         # Arithmetic annualisation flatters a losing curve; report the compounded one too.
         "cagr": round(final ** (1.0 / years) - 1.0, 6) if final > 0 else -1.0,
         "day_win_rate": round(float((daily["net_return"] > 0).mean()), 6),
@@ -254,6 +280,10 @@ def main() -> None:
                     help="Length of the ranked shortlist submitted. Defaults to --top-k "
                          "(no substitution). Set larger to allow filling down the list "
                          "when a higher-ranked name opens at its limit.")
+    ap.add_argument("--min-score", type=float, default=None,
+                    help="Conviction gate: skip a candidate scoring below this, and hold "
+                         "the day flat if none clear it. Only comparable across runs for "
+                         "--rank-by classify, where the score is a probability.")
     ap.add_argument("--seeds", default="7,13,42")
     ap.add_argument("--slippage-grid", default="0,5,10,20",
                     help="Per-side slippage in bps, on top of statutory costs.")
@@ -307,7 +337,7 @@ def main() -> None:
 
     report = {"features": len(features), "train_end": train_end, "test_start": test_start,
               "seeds": seeds, "top_k": args.top_k, "signal_k": signal_k,
-              "target_ratio": args.target_ratio,
+              "target_ratio": args.target_ratio, "min_score": args.min_score,
               "rank_by": args.rank_by, "return_col": args.return_col,
               "cost_bps": {"commission": COMMISSION_BPS, "transfer": TRANSFER_BPS,
                            "stamp_sell": STAMP_SELL_BPS},
@@ -327,8 +357,8 @@ def main() -> None:
 
         for exit_rule in ("target", "close"):
             for slip in slippages:
-                book, daily = run_book(scored, args.top_k, signal_k,
-                                       args.target_ratio, exit_rule, slip)
+                book, daily = run_book(scored, args.top_k, signal_k, args.target_ratio,
+                                       exit_rule, slip, args.min_score)
                 book |= {"seed": seed, "exit": exit_rule, "slippage_bps": slip,
                          "ic_mean": round(ic, 6), "ic_vs_return": round(ic_ret, 6)}
                 report["runs"].append(book)
@@ -347,6 +377,9 @@ def main() -> None:
           f"  |  平均用到候选第 {float(np.mean([r['avg_fill_depth'] for r in sample])):.2f} 名"
           f"  |  候选不够建满的交易日 "
           f"{100 * float(np.mean([r['short_day_rate'] for r in sample])):.2f}%")
+    print(f"交易日 {float(np.mean([r['n_days'] for r in sample])):.0f}"
+          f"  |  空仓日 {100 * float(np.mean([r['flat_day_rate'] for r in sample])):.2f}%"
+          f"  |  门槛 {args.min_score}")
 
     print(f"\n=== {len(seeds)} 个种子 均值 ± 标准差 ===")
     print(f"{'退出假设':<16}{'滑点':>6}{'净收益/笔':>17}{'CAGR':>17}"
