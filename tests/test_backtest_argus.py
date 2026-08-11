@@ -89,25 +89,56 @@ def _book(scores, unfillable, hit, to_close) -> pd.DataFrame:
     return frame
 
 
-def test_an_unfillable_pick_is_dropped_not_replaced_by_the_next_name():
-    """Fill-aware, not queue-deeper.
+def _run(book: pd.DataFrame, hold_k: int, signal_k: int, exit_rule: str = "close") -> dict:
+    return run_book(book, LABEL, hold_k=hold_k, signal_k=signal_k, target_ratio=1.08,
+                    exit_rule=exit_rule, slippage_bps=0.0)
 
-    You submit k orders at D0 close. Substituting the next name down assumes you knew
-    which of them would gap to the limit, which is the one thing D0 cannot tell you.
-    """
+
+def test_without_a_deeper_shortlist_an_unfillable_pick_is_not_replaced():
+    """signal_k == hold_k is the no-substitution convention: submit k, keep what fills."""
     book = _book(scores=[3.0, 2.0, 1.0], unfillable=[True, False, False],
                  hit=(1, 0, 1), to_close=(0.09, -0.04, 0.09))
-    res = run_book(book, LABEL, k=2, target_ratio=1.08, exit_rule="close", slippage_bps=0.0)
+    res = _run(book, hold_k=2, signal_k=2)
     assert res["avg_positions"] == 1.0                      # not 2: the third is not pulled in
     assert res["gross_per_trade"] == pytest.approx(-0.04)   # only the score-2.0 row
     assert res["hit_rate"] == 0.0
+
+
+def test_a_deeper_shortlist_substitutes_down_the_ranking_in_order():
+    """The concentrated-book case: hold 1, shortlist 3, top two names unfillable.
+
+    Substitution must follow the ranking, not pick the best outcome among survivors.
+    """
+    book = _book(scores=[3.0, 2.0, 1.0], unfillable=[True, True, False],
+                 hit=(1, 1, 0), to_close=(0.09, 0.20, -0.04))
+    res = _run(book, hold_k=1, signal_k=3)
+    assert res["avg_positions"] == 1.0
+    assert res["gross_per_trade"] == pytest.approx(-0.04)   # the rank-3 name, not the +20%
+    assert res["avg_fill_depth"] == 3.0
+    assert res["short_day_rate"] == 0.0
+
+
+def test_a_shortlist_that_runs_out_leaves_the_day_short_and_says_so():
+    book = _book(scores=[3.0, 2.0, 1.0], unfillable=[True, True, False],
+                 hit=(1, 1, 0), to_close=(0.09, 0.09, -0.04))
+    res = _run(book, hold_k=2, signal_k=3)
+    assert res["avg_positions"] == 1.0
+    assert res["short_day_rate"] == 1.0
+
+
+def test_substitution_never_reaches_past_the_shortlist():
+    """A name ranked below signal_k is not a candidate, however good it turned out."""
+    book = _book(scores=[3.0, 2.0, 1.0], unfillable=[True, False, False],
+                 hit=(1, 0, 1), to_close=(0.09, -0.04, 0.30))
+    res = _run(book, hold_k=1, signal_k=2)
+    assert res["gross_per_trade"] == pytest.approx(-0.04)   # not the +30% at rank 3
 
 
 def test_base_rate_is_measured_over_fillable_rows_only():
     """Otherwise lift compares a fill-aware numerator to an as-is denominator."""
     book = _book(scores=[3.0, 2.0, 1.0], unfillable=[True, False, False],
                  hit=(1, 1, 0), to_close=(0.09, 0.09, -0.04))
-    res = run_book(book, LABEL, k=2, target_ratio=1.08, exit_rule="close", slippage_bps=0.0)
+    res = _run(book, hold_k=2, signal_k=2)
     assert res["base_rate"] == pytest.approx(0.5)   # 1 of the 2 fillable, not 2 of 3
 
 

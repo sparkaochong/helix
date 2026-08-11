@@ -126,20 +126,34 @@ def fit_and_score(rank_by: str, seed: int, train: pd.DataFrame, test: pd.DataFra
     return model.predict(x_test)
 
 
-def run_book(scored: pd.DataFrame, label: str, k: int, target_ratio: float,
-             exit_rule: str, slippage_bps: float) -> dict:
-    """Daily fill-aware top-k book, then the tranche-split equity curve."""
+def run_book(scored: pd.DataFrame, label: str, hold_k: int, signal_k: int,
+             target_ratio: float, exit_rule: str, slippage_bps: float) -> dict:
+    """Submit the ranked shortlist, fill down it until `hold_k` positions, then compound.
+
+    `signal_k == hold_k` is the plain fill-aware convention: submit k orders, keep
+    whatever fills, do not substitute. `signal_k > hold_k` is what a concentrated book
+    needs -- a shortlist deep enough that a limit-up open on the top name does not leave
+    the day flat.
+
+    Walking down a *predefined* shortlist is not the foreknowledge that made the
+    `queue-deeper` view of `fill_impact.py` an upper bound. The D+1 opening call auction
+    prints at 09:25, so which candidates gapped to their limit is known before continuous
+    trading starts and the substitution is executable. What it does cost is precision on
+    the entry price: the backup is bought after the open, not at it. That is what the
+    slippage grid is for.
+    """
     rows = []
     for date, g in scored.groupby("trade_date", sort=True):
-        if len(g) < k:
+        if len(g) < signal_k:
             continue
-        # Fill-aware, not queue-deeper: submit k orders and keep what fills. Ranking among
-        # fillable rows instead would assume you knew at D0 close which names gap to the
-        # limit, which is exactly what you cannot know.
-        submitted = g.nlargest(k, "score")
-        picked = submitted[~submitted["unfillable"]]
+        shortlist = g.nlargest(signal_k, "score").reset_index(drop=True)
+        usable = shortlist.index[~shortlist["unfillable"].to_numpy()][:hold_k]
+        picked = shortlist.loc[usable]
         if picked.empty:
             continue
+        # How deep the shortlist had to go, and whether it ran out before filling hold_k.
+        depth = int(usable[-1]) + 1
+        short = len(picked) < hold_k
         gross = gross_returns(picked, label, target_ratio, exit_rule)
         if not np.isfinite(gross).all():
             continue
@@ -150,6 +164,8 @@ def run_book(scored: pd.DataFrame, label: str, k: int, target_ratio: float,
         rows.append({
             "date": date,
             "positions": len(picked),
+            "fill_depth": depth,
+            "short": float(short),
             "hit_rate": float(hit.mean()),
             "base_rate": float(g[~g["unfillable"]][label].mean()),
             "gross_return": float(gross.mean()),
@@ -174,6 +190,10 @@ def run_book(scored: pd.DataFrame, label: str, k: int, target_ratio: float,
     return {
         "n_days": int(len(daily)),
         "avg_positions": round(float(daily["positions"].mean()), 3),
+        # Both are noise at hold_k=20 and decisive at hold_k=1: if the top name is often
+        # unfillable, the shortlist is doing the work and its depth is a real assumption.
+        "avg_fill_depth": round(float(daily["fill_depth"].mean()), 3),
+        "short_day_rate": round(float(daily["short"].mean()), 6),
         "hit_rate": round(hit, 6),
         "base_rate": round(base, 6),
         "lift": round(hit / max(base, 1e-12), 4),
@@ -207,7 +227,12 @@ def main() -> None:
     ap.add_argument("--target-ratio", type=float, default=1.08)
     ap.add_argument("--split-date", default="2024-09-04")
     ap.add_argument("--embargo-days", type=int, default=3)
-    ap.add_argument("--top-k", type=int, default=20)
+    ap.add_argument("--top-k", type=int, default=20,
+                    help="Positions actually held per day.")
+    ap.add_argument("--signal-k", type=int, default=None,
+                    help="Length of the ranked shortlist submitted. Defaults to --top-k "
+                         "(no substitution). Set larger to allow filling down the list "
+                         "when a higher-ranked name opens at its limit.")
     ap.add_argument("--seeds", default="7,13,42")
     ap.add_argument("--slippage-grid", default="0,5,10,20",
                     help="Per-side slippage in bps, on top of statutory costs.")
@@ -215,6 +240,9 @@ def main() -> None:
     args = ap.parse_args()
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     slippages = [float(s) for s in args.slippage_grid.split(",") if s.strip()]
+    signal_k = args.signal_k if args.signal_k is not None else args.top_k
+    if signal_k < args.top_k:
+        raise SystemExit(f"--signal-k {signal_k} 小于持仓数 {args.top_k}，候选不够建仓")
 
     features = feature_columns(args.input)
     price_cols = ["label_px_d1_open", "label_px_d2_close"]
@@ -245,7 +273,8 @@ def main() -> None:
                          f"{STAMP_SELL_BPS}bp 单一税率会低估这段时间的成本")
 
     report = {"features": len(features), "train_end": train_end, "test_start": test_start,
-              "seeds": seeds, "top_k": args.top_k, "target_ratio": args.target_ratio,
+              "seeds": seeds, "top_k": args.top_k, "signal_k": signal_k,
+              "target_ratio": args.target_ratio,
               "rank_by": args.rank_by, "return_col": args.return_col,
               "cost_bps": {"commission": COMMISSION_BPS, "transfer": TRANSFER_BPS,
                            "stamp_sell": STAMP_SELL_BPS},
@@ -264,8 +293,8 @@ def main() -> None:
 
         for exit_rule in ("target", "close"):
             for slip in slippages:
-                book = run_book(scored, args.label, args.top_k, args.target_ratio,
-                                exit_rule, slip)
+                book = run_book(scored, args.label, args.top_k, signal_k,
+                                args.target_ratio, exit_rule, slip)
                 book |= {"seed": seed, "exit": exit_rule, "slippage_bps": slip,
                          "ic_mean": round(ic, 6), "ic_vs_return": round(ic_ret, 6)}
                 report["runs"].append(book)
@@ -276,10 +305,13 @@ def main() -> None:
               f"收盘口径毛 {100 * base['gross_per_trade']:+.3f}%/笔")
 
     sample = books[("close", slippages[0])]
-    print(f"\ntop{args.top_k} 收益分解（{len(seeds)} 个种子均值）：命中组持到 D+2 收盘 "
-          f"{100 * float(np.mean([r['win_to_close'] for r in sample])):+.2f}%  |  "
-          f"未命中组 {100 * float(np.mean([r['loss_to_close'] for r in sample])):+.2f}%  |  "
-          f"实际建仓 {float(np.mean([r['avg_positions'] for r in sample])):.2f}/{args.top_k}")
+    print(f"\n持仓 {args.top_k} / 候选 {signal_k} 收益分解（{len(seeds)} 个种子均值）：命中组"
+          f"持到 D+2 收盘 {100 * float(np.mean([r['win_to_close'] for r in sample])):+.2f}%"
+          f"  |  未命中组 {100 * float(np.mean([r['loss_to_close'] for r in sample])):+.2f}%")
+    print(f"实际建仓 {float(np.mean([r['avg_positions'] for r in sample])):.2f}/{args.top_k}"
+          f"  |  平均用到候选第 {float(np.mean([r['avg_fill_depth'] for r in sample])):.2f} 名"
+          f"  |  候选不够建满的交易日 "
+          f"{100 * float(np.mean([r['short_day_rate'] for r in sample])):.2f}%")
 
     print(f"\n=== {len(seeds)} 个种子 均值 ± 标准差 ===")
     print(f"{'退出假设':<16}{'滑点':>6}{'净收益/笔':>17}{'CAGR':>17}"
