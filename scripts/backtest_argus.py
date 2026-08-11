@@ -127,8 +127,15 @@ def fit_and_score(rank_by: str, seed: int, train: pd.DataFrame, test: pd.DataFra
 
 
 def run_book(scored: pd.DataFrame, label: str, hold_k: int, signal_k: int,
-             target_ratio: float, exit_rule: str, slippage_bps: float) -> dict:
+             target_ratio: float, exit_rule: str,
+             slippage_bps: float) -> tuple[dict, pd.DataFrame]:
     """Submit the ranked shortlist, fill down it until `hold_k` positions, then compound.
+
+    Returns the summary *and* the per-day series behind it. The scalars alone cannot answer
+    the question a short live track record raises -- a headline drawdown is the minimum
+    over the observation window, so a 28-day number and a 431-day number are not the same
+    quantity. Keeping the series lets `window_stats.py` cut this one into windows of the
+    same length and compare like with like.
 
     `signal_k == hold_k` is the plain fill-aware convention: submit k orders, keep
     whatever fills, do not substitute. `signal_k > hold_k` is what a concentrated book
@@ -178,7 +185,7 @@ def run_book(scored: pd.DataFrame, label: str, hold_k: int, signal_k: int,
 
     daily = pd.DataFrame(rows)
     if daily.empty:
-        return {"n_days": 0}
+        return {"n_days": 0}, daily
 
     daily["portfolio_return"] = daily["net_return"] / OVERLAP
     daily["equity"] = (1.0 + daily["portfolio_return"]).cumprod()
@@ -187,7 +194,7 @@ def run_book(scored: pd.DataFrame, label: str, hold_k: int, signal_k: int,
     hit, base = float(daily["hit_rate"].mean()), float(daily["base_rate"].mean())
     years = len(daily) / TRADING_DAYS
     final = float(daily["equity"].iloc[-1])
-    return {
+    summary = {
         "n_days": int(len(daily)),
         "avg_positions": round(float(daily["positions"].mean()), 3),
         # Both are noise at hold_k=20 and decisive at hold_k=1: if the top name is often
@@ -211,6 +218,7 @@ def run_book(scored: pd.DataFrame, label: str, hold_k: int, signal_k: int,
         "max_drawdown": round(max_drawdown(daily["equity"].to_numpy()), 6),
         "final_equity": round(float(daily["equity"].iloc[-1]), 6),
     }
+    return summary, daily[["date", "positions", "portfolio_return", "equity"]]
 
 
 def main() -> None:
@@ -237,6 +245,9 @@ def main() -> None:
     ap.add_argument("--slippage-grid", default="0,5,10,20",
                     help="Per-side slippage in bps, on top of statutory costs.")
     ap.add_argument("--report", default="backtest_argus_report.json")
+    ap.add_argument("--daily-out", default="backtest_argus_daily.csv",
+                    help="Per-day portfolio return for every (seed, exit, slippage). "
+                         "Feeds window_stats.py.")
     args = ap.parse_args()
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     slippages = [float(s) for s in args.slippage_grid.split(",") if s.strip()]
@@ -281,6 +292,7 @@ def main() -> None:
               "runs": [], "summary": {}}
 
     books: dict[tuple[str, float], list[dict]] = {}
+    series: list[pd.DataFrame] = []
     for seed in seeds:
         scored = test[["trade_date", args.label, args.ic_target, args.return_col,
                        "unfillable", *price_cols]].copy()
@@ -293,12 +305,13 @@ def main() -> None:
 
         for exit_rule in ("target", "close"):
             for slip in slippages:
-                book = run_book(scored, args.label, args.top_k, signal_k,
-                                args.target_ratio, exit_rule, slip)
+                book, daily = run_book(scored, args.label, args.top_k, signal_k,
+                                       args.target_ratio, exit_rule, slip)
                 book |= {"seed": seed, "exit": exit_rule, "slippage_bps": slip,
                          "ic_mean": round(ic, 6), "ic_vs_return": round(ic_ret, 6)}
                 report["runs"].append(book)
                 books.setdefault((exit_rule, slip), []).append(book)
+                series.append(daily.assign(seed=seed, exit=exit_rule, slippage_bps=slip))
         base = books[("close", slippages[0])][-1]
         print(f"  seed {seed}  IC(peak) {ic:+.5f}  IC(ret) {ic_ret:+.5f}  "
               f"命中 {100 * base['hit_rate']:.2f}%  "
@@ -335,6 +348,11 @@ def main() -> None:
     with open(args.report, "w") as fh:
         json.dump(report, fh, indent=2, ensure_ascii=False)
     print(f"\nwrote {args.report}")
+
+    # Long format keyed by (seed, exit, slippage): one file feeds every window comparison
+    # without re-running the model, which is the expensive half.
+    pd.concat(series, ignore_index=True).to_csv(args.daily_out, index=False)
+    print(f"wrote {args.daily_out}")
 
 
 if __name__ == "__main__":

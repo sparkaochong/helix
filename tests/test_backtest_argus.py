@@ -91,7 +91,12 @@ def _book(scores, unfillable, hit, to_close) -> pd.DataFrame:
 
 def _run(book: pd.DataFrame, hold_k: int, signal_k: int, exit_rule: str = "close") -> dict:
     return run_book(book, LABEL, hold_k=hold_k, signal_k=signal_k, target_ratio=1.08,
-                    exit_rule=exit_rule, slippage_bps=0.0)
+                    exit_rule=exit_rule, slippage_bps=0.0)[0]
+
+
+def _daily(book: pd.DataFrame, hold_k: int, signal_k: int) -> pd.DataFrame:
+    return run_book(book, LABEL, hold_k=hold_k, signal_k=signal_k, target_ratio=1.08,
+                    exit_rule="close", slippage_bps=0.0)[1]
 
 
 def test_without_a_deeper_shortlist_an_unfillable_pick_is_not_replaced():
@@ -140,6 +145,27 @@ def test_base_rate_is_measured_over_fillable_rows_only():
                  hit=(1, 1, 0), to_close=(0.09, 0.09, -0.04))
     res = _run(book, hold_k=2, signal_k=2)
     assert res["base_rate"] == pytest.approx(0.5)   # 1 of the 2 fillable, not 2 of 3
+
+
+def test_the_daily_series_is_the_curve_the_scalars_were_computed_from():
+    """The summary alone cannot be re-cut into windows, and a drawdown is only meaningful
+    against the length it was observed over. So the series has to survive, and it has to be
+    the same series -- not a second, subtly different reconstruction."""
+    book = _book(scores=[3.0, 2.0], unfillable=[False, False],
+                 hit=(1, 0), to_close=(0.10, -0.05))
+    book.loc[1, "trade_date"] = "20250102"        # one position on each of two days
+    res, daily = run_book(book, LABEL, hold_k=1, signal_k=1, target_ratio=1.08,
+                          exit_rule="close", slippage_bps=0.0)
+
+    assert list(daily["date"]) == ["20250101", "20250102"]
+    assert res["n_days"] == len(daily) == 2
+    # Capital is split across OVERLAP concurrent tranches, so the daily line is halved.
+    assert daily["portfolio_return"].iloc[0] == pytest.approx(
+        float(net_return(np.array([0.10]), 0.0)[0]) / 2)
+    assert float(daily["equity"].iloc[-1]) == pytest.approx(res["final_equity"])
+    assert res["sharpe"] == pytest.approx(
+        daily["portfolio_return"].mean() / daily["portfolio_return"].std(ddof=1)
+        * np.sqrt(252.0), rel=1e-4)
 
 
 def _two_days() -> pd.DataFrame:
