@@ -67,6 +67,31 @@ def top_k_hit_rate(frame: pd.DataFrame, score: str, label: str, k: int) -> dict:
     }
 
 
+#: Above this many distinct values one-hot stops being an encoding and starts being noise.
+MAX_ONEHOT_LEVELS = 32
+
+
+def one_hot_columns(frame: pd.DataFrame, column: str,
+                    max_levels: int = MAX_ONEHOT_LEVELS) -> pd.DataFrame:
+    """Indicator columns for a categorical, encoded over train and test together.
+
+    Encoding the halves separately is the quiet way to break this: a level present on only
+    one side yields a column the other side lacks, and the arm is then trained and scored
+    on different feature spaces.
+
+    Deliberately not target encoding. The whole reason a categorical is worth testing here
+    is that its levels have different base rates, so any encoding derived from the label
+    hands the model the answer it is supposed to be predicting.
+    """
+    levels = frame[column].astype(str)
+    n = levels.nunique()
+    if n < 2:
+        raise SystemExit(f"{column} 只有 {n} 个取值，编码出来是常数列")
+    if n > max_levels:
+        raise SystemExit(f"{column} 有 {n} 个取值，超过 {max_levels}，one-hot 会炸开")
+    return pd.get_dummies(levels, prefix=column, prefix_sep="==").astype(np.float32)
+
+
 def build_model(seed: int):
     """Prefer the gradient-boosting library the host actually has installed."""
     try:
@@ -98,7 +123,12 @@ def build_model(seed: int):
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", required=True, help="Parquet already carrying the factor columns")
-    ap.add_argument("--factors", required=True, help="JSON list of factor column names")
+    ap.add_argument("--factors", default="", help="JSON list of factor column names")
+    ap.add_argument("--onehot", default="",
+                    help="A categorical column to one-hot encode into the added arm. A "
+                         "string column is invisible to a numeric feature list, so a "
+                         "categorical the model should have been using can sit unread in "
+                         "the table indefinitely without anything reporting it missing.")
     ap.add_argument("--features", required=True, help="JSON list of base feature column names")
     ap.add_argument("--label", default="label_d2_hit_8pct")
     ap.add_argument("--ic-target", default="label_d2_peak_return")
@@ -114,16 +144,36 @@ def main() -> None:
     args = ap.parse_args()
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
 
-    with open(args.factors) as fh:
-        factors = json.load(fh)
+    if not args.factors and not args.onehot:
+        raise SystemExit("--factors 和 --onehot 至少要给一个，否则两条臂完全相同")
+    factors = []
+    if args.factors:
+        with open(args.factors) as fh:
+            factors = json.load(fh)
     with open(args.features) as fh:
         features = json.load(fh)
     factors = [c for c in factors if c not in features]
 
     needed = ["trade_date", args.label, args.ic_target, *features, *factors]
+    if args.onehot:
+        needed.append(args.onehot)
     df = pd.read_parquet(args.input, columns=sorted(set(needed)))
     df["trade_date"] = df["trade_date"].astype(str)
     df = df.dropna(subset=[args.label, args.ic_target])
+
+    if args.onehot:
+        dummies = one_hot_columns(df, args.onehot)
+        clash = [c for c in dummies.columns if c in features]
+        if clash:
+            raise SystemExit(f"one-hot 列名和已有特征撞车：{clash}")
+        # Base rates per level are the reason to run this at all, so print them: if they
+        # are flat, the arm cannot help and the run is not worth the GPU time.
+        rates = df.groupby(args.onehot)[args.label].agg(["mean", "size"]).sort_values("mean")
+        print(f"{args.onehot} 各取值的基准命中率：")
+        for level, row in rates.iterrows():
+            print(f"  {100 * row['mean']:6.2f}%  ({int(row['size']):>7,} 行)  {level}")
+        df = pd.concat([df.drop(columns=[args.onehot]), dummies], axis=1)
+        factors = factors + list(dummies.columns)
 
     dates = np.array(sorted(df["trade_date"].unique()))
     cut = int(np.searchsorted(dates, args.split_date, "right"))
