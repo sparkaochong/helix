@@ -68,6 +68,14 @@ dl:
 
 backtest:
   top_k: 20
-  # Exit assumption: if the target is touched intraday on D+2 we fill at the target,
-  # otherwise we exit at the D+2 close. Costs are one-way.
-  cost_bps: 15.0
+  # Exit assumption. "close": every position exits at the D+2 close, hit or miss.
+  # "target": fill at entry * target_ratio when the D+2 high reaches it -- mirrors the
+  # label, caps the winners, lets the losers run, and turns this edge negative
+  # (README「成本回测」: -46.7% vs +51.6% CAGR on the same predictions).
+  exit_rule: close
+  # A 股法定费率，单位 bp。印花税仅卖出，2023-08-28 由 10bp 减半为 5bp（按交易日取值）。
+  commission_bps: 2.5
+  transfer_bps: 0.1
+  stamp_sell_bps: 5.0
+  stamp_sell_bps_before_cut: 10.0
+  slippage_bps: 10.0      # 单边，叠加在法定费率之上；盈亏平衡点约在单边 19bp

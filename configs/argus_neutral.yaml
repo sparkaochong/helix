@@ -68,4 +68,9 @@ dl:
   seed: 20240101
 backtest:
   top_k: 20
-  cost_bps: 15.0
+  exit_rule: close
+  commission_bps: 2.5
+  transfer_bps: 0.1
+  stamp_sell_bps: 5.0
+  stamp_sell_bps_before_cut: 10.0
+  slippage_bps: 10.0

@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "default.yaml"
@@ -99,8 +100,27 @@ class DLConfig(BaseModel):
 
 
 class BacktestConfig(BaseModel):
+    """Trade-level accounting. Every rate is in basis points of notional.
+
+    Costs are charged per side rather than as one round-trip number because stamp duty
+    is sell-side only, and because it halved on 2023-08-28 -- a panel starting in 2018
+    straddles that cut, so the two stamp rates are separate knobs (see
+    :mod:`helix.eval.backtest`).
+
+    ``extra="forbid"`` so that a stale key in a hand-written YAML fails loudly instead
+    of being silently ignored; a cost setting that does not apply is the kind of error
+    that only shows up as an unexplained number.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     top_k: int = Field(20, gt=0)
-    cost_bps: float = 15.0
+    exit_rule: Literal["close", "target"] = "close"
+    commission_bps: float = Field(2.5, ge=0)               # 佣金，双边
+    transfer_bps: float = Field(0.1, ge=0)                 # 过户费，双边
+    stamp_sell_bps: float = Field(5.0, ge=0)               # 印花税，仅卖出，2023-08-28 起
+    stamp_sell_bps_before_cut: float = Field(10.0, ge=0)   # 印花税，仅卖出，2023-08-28 前
+    slippage_bps: float = Field(10.0, ge=0)                # 单边，叠加在法定费率之上
 
 
 class Config(BaseModel):

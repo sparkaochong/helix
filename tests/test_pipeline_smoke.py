@@ -158,7 +158,7 @@ def test_walk_forward_training_and_backtest_complete(library, prepared, market, 
 
     summary = run_backtest(
         predictions, labels, market.dates, LabelConfig(target_ratio=1.08),
-        BacktestConfig(top_k=5, cost_bps=15.0),
+        BacktestConfig(top_k=5),
     ).summary
     assert summary["n_days"] > 0
     assert 0.0 <= summary["hit_rate"] <= 1.0
