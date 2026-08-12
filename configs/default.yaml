@@ -67,7 +67,12 @@ dl:
   seed: 20240101
 
 backtest:
-  top_k: 20
+  # 持仓只数。TOP4 是 README「持仓规模」那张网格里最稳的一档（Sharpe 1.39±0.02，
+  # 3 的 Sharpe 高 0.01 而种子标准差是它的 9 倍）。分散改的是方差不是胜率：回撤随
+  # 持仓数单调变浅，日胜率几乎不动。TOP1 是灾难——分类器最强的信念恰好是按 D+2
+  # 收益算最差的一只（IC -0.064）。
+  # 注意：峰值落在 3~4 是在测试集上挑出来的，不是样本外保证。
+  top_k: 4
   # Exit assumption. "close": every position exits at the D+2 close, hit or miss.
   # "target": fill at entry * target_ratio when the D+2 high reaches it -- mirrors the
   # label, caps the winners, lets the losers run, and turns this edge negative

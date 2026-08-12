@@ -114,7 +114,7 @@ class BacktestConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    top_k: int = Field(20, gt=0)
+    top_k: int = Field(4, gt=0)
     exit_rule: Literal["close", "target"] = "close"
     commission_bps: float = Field(2.5, ge=0)               # 佣金，双边
     transfer_bps: float = Field(0.1, ge=0)                 # 过户费，双边

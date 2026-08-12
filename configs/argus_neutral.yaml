@@ -67,7 +67,7 @@ dl:
   clip_sigma: 4.0
   seed: 20240101
 backtest:
-  top_k: 20
+  top_k: 4
   exit_rule: close
   commission_bps: 2.5
   transfer_bps: 0.1
