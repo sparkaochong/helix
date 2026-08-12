@@ -13,7 +13,14 @@ from helix.data.event_table import (
     numeric_feature_columns,
 )
 from helix.eval.ic import daily_ic, summarize_ic
-from helix.gp.event_primitives import FORBIDDEN, assert_no_time_series, build_event_pset
+from helix.gp.event_primitives import (
+    FORBIDDEN,
+    SEARCH_EXCLUDED,
+    assert_excluded_absent,
+    assert_no_time_series,
+    build_event_pset,
+)
+from helix.gp.library import FactorLibrary, FactorSpec, compute_factors
 from helix.gp.primitives import build_pset
 
 
@@ -87,6 +94,65 @@ def test_the_guard_catches_a_panel_pset():
 def test_event_pset_needs_at_least_one_feature():
     with pytest.raises(ValueError, match="at least one feature"):
         build_event_pset([])
+
+
+# ------------------------------------------------- sign withheld from the search ----
+def test_sign_is_withheld_from_the_search_but_the_rest_of_unary_survives():
+    """`sign` took 27 of the last 30 factors. It flattens a column onto three levels,
+    which is cheap rank-gini on a skewed column and two splits for a row-wise tree, so it
+    consumed the budget without reaching anything such a tree cannot already compute."""
+    present = {p.name for prims in build_event_pset(["feat_a"]).primitives.values()
+               for p in prims}
+    assert "sign" not in present
+    assert {"neg", "abs", "log", "sqrt", "cs_rank", "cs_zscore", "cs_demean"} <= present
+
+
+def test_the_exclusion_is_a_search_restriction_not_a_ban():
+    """Weaker than FORBIDDEN on purpose: `sign` is a poor use of the budget, not invalid
+    on a slot panel, so a pset asked for without the restriction must still offer it."""
+    present = {p.name for prims in build_event_pset(["feat_a"], exclude=frozenset())
+               .primitives.values() for p in prims}
+    assert "sign" in present
+
+
+def test_time_series_operators_stay_banned_even_with_the_restriction_lifted():
+    """The asymmetry, pinned: lifting the search restriction must not lift the guard that
+    exists because slot j is a different company on every date."""
+    present = {p.name for prims in build_event_pset(["feat_a"], exclude=frozenset())
+               .primitives.values() for p in prims}
+    assert not (present & FORBIDDEN)
+
+
+def test_a_saved_factor_using_sign_still_replays():
+    """The regression this guards: `compute_factors` rebuilds the pset to parse stored
+    expressions, so narrowing the search set would have made every previously mined
+    `sign(...)` factor fail to load -- 27 of the 30 currently on disk."""
+    library = FactorLibrary(
+        factors=[FactorSpec(name="gp_000", expression="sub(sign(feat_a), feat_b)", sign=1.0)],
+        field_names=["feat_a", "feat_b"], windows=[], kind="event",
+    )
+    fields = {"feat_a": np.array([[-2.0, 0.0, 3.0]]), "feat_b": np.array([[1.0, 1.0, 1.0]])}
+    names, values = compute_factors(library, fields)
+    assert names == ["gp_000"]
+    np.testing.assert_allclose(values[..., 0], [[-2.0, -1.0, 0.0]])
+
+
+def test_an_unknown_exclusion_name_is_refused_rather_than_silently_ignored():
+    """A typo would otherwise remove nothing and report nothing, leaving the operator in
+    the search while the caller believes it is gone."""
+    with pytest.raises(ValueError, match="nothing to exclude named"):
+        build_event_pset(["feat_a"], exclude=frozenset({"sgn"}))
+
+
+def test_the_exclusion_guard_is_an_assertion_not_a_convention():
+    assert_excluded_absent(build_event_pset(["feat_a"]))          # clean set passes
+    with pytest.raises(AssertionError, match="withheld from the event-table search"):
+        assert_excluded_absent(build_event_pset(["feat_a"], exclude=frozenset()))
+
+
+def test_the_default_exclusion_is_exactly_sign():
+    """If this set grows, the replay path above needs another look."""
+    assert set(SEARCH_EXCLUDED) == {"sign"}
 
 
 # ------------------------------------------------------- label leak guard ----

@@ -42,7 +42,12 @@ class FactorLibrary:
         if self.kind == "event":
             from .event_primitives import build_event_pset
 
-            return build_event_pset(self.field_names)
+            # Every operator, not the narrowed search set: a saved factor has to keep
+            # evaluating after the search space shrinks underneath it. `sign` was withheld
+            # from the search only because it was a poor use of the budget -- expressions
+            # already using it stay valid. Windowed operators are excluded either way,
+            # since those are meaningless on a slot panel rather than merely unprofitable.
+            return build_event_pset(self.field_names, exclude=frozenset())
         return build_pset(self.field_names, self.windows)
 
 
