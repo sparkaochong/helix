@@ -86,3 +86,13 @@ backtest:
   stamp_sell_bps: 5.0
   stamp_sell_bps_before_cut: 10.0
   slippage_bps: 10.0      # 单边，叠加在法定费率之上；盈亏平衡点约在单边 19bp
+# BEGIN PLACEBO CALIBRATION
+factor_admission:
+  placebo_threshold:
+    ic_mean: 0.02385873314708397
+    icir: 0.3268323682458659
+    gini: 0.010281975864080419
+    quantile: 0.99
+    train_start: "2022-01-04"
+    train_end: "2024-09-04"
+# END PLACEBO CALIBRATION
