@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -812,6 +814,96 @@ def test_report_documents_training_only_thresholds_and_separate_scopes():
     assert "Supplemental scopes never participated in threshold generation" in report
     assert "never eligible for formal admission" in report
     assert "Passing G1 does not override G3" in report
+
+
+def _render_minimal_report(input_path: str | Path, library_path: str | Path) -> str:
+    from scripts.calibrate_placebo import render_report
+
+    distribution = pd.DataFrame(
+        {
+            "permutation_id": [0],
+            "ic_mean": [0.01],
+            "icir": [0.10],
+            "gini": [0.04],
+        }
+    )
+    quantiles = pd.DataFrame(
+        {
+            "metric": ["ic_mean", "icir", "gini"],
+            "p95": [0.01, 0.10, 0.04],
+            "p99": [0.01, 0.10, 0.04],
+            "p999": [0.01, 0.10, 0.04],
+        }
+    )
+    screening = pd.DataFrame(
+        [
+            {
+                **_factor_metric_row("formal_a", 0.31),
+                "scope": "formal",
+                "library_path": str(library_path),
+                "ic_level": "超 p99.9",
+                "icir_level": "超 p99.9",
+                "gini_level": "超 p99.9",
+                "overall_level": "超 p99.9",
+                "candidate_eligible": True,
+                "suggest_evict": False,
+            }
+        ]
+    )
+    metadata = {
+        "input": str(input_path),
+        "target": "label_d2_hit_8pct",
+        "seed": 20260813,
+        "n_permutations": 1,
+        "min_samples": 1,
+        "train_start": "2022-01-04",
+        "train_end": "2024-09-04",
+        "n_train_dates": 649,
+        "formal_factor_count": 1,
+        "supplemental_factor_count": 0,
+    }
+    return render_report(distribution, quantiles, screening, metadata)
+
+
+def test_report_renders_repository_paths_relative_and_preserves_external_paths(
+    tmp_path,
+):
+    repository_root = Path(__file__).resolve().parents[1]
+    report = _render_minimal_report(
+        repository_root / "data/raw/argus_quant_working.parquet",
+        repository_root / "data/artifacts/argus/event_factors.json",
+    )
+
+    assert "`data/raw/argus_quant_working.parquet`" in report
+    assert "data/artifacts/argus/event_factors.json" in report
+    assert str(repository_root) not in report
+
+    external_input = tmp_path / "external.parquet"
+    external_library = tmp_path / "external.json"
+    external_report = _render_minimal_report(external_input, external_library)
+
+    assert str(external_input) in external_report
+    assert str(external_library) in external_report
+
+
+def test_report_documents_ordinal_binary_ic_calibration_scope():
+    report = _render_minimal_report(
+        "data/raw/argus_quant_working.parquet",
+        "data/artifacts/argus/event_factors.json",
+    )
+
+    for caveat in (
+        "canonical `daily_ic`",
+        "ordinal ranks",
+        "binary label",
+        "event-slot layout",
+        "missingness structure",
+        "formal factor family",
+        "G1 baseline",
+        "current event-table formal library",
+        "requires recalibration",
+    ):
+        assert caveat in report
 
 
 def test_threshold_config_appends_generated_block_and_round_trips_exact_values(tmp_path):

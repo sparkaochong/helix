@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from helix.config import Config, PlaceboThresholdConfig
+from helix.config import PROJECT_ROOT, Config, PlaceboThresholdConfig
 from helix.data.event_table import build_event_panel, is_label_column
 from helix.eval.placebo import (
     METRICS,
@@ -255,7 +255,20 @@ def _screening_details(screening: pd.DataFrame, scope: str) -> pd.DataFrame:
         "candidate_eligible",
         "suggest_evict",
     ]
-    return screening.loc[screening["scope"] == scope, columns]
+    details = screening.loc[screening["scope"] == scope, columns].copy()
+    details["library_path"] = details["library_path"].map(_report_path)
+    return details
+
+
+def _report_path(value: object) -> str:
+    """Render repository paths portably without rewriting external paths."""
+    original = str(value)
+    path = Path(original).expanduser()
+    resolved = path.resolve() if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+    try:
+        return resolved.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return original
 
 
 def _level_counts(details: pd.DataFrame) -> pd.DataFrame:
@@ -276,7 +289,7 @@ def render_report(
     metadata: Mapping[str, Any],
 ) -> str:
     """Render the auditable training-only calibration report."""
-    input_path = _metadata_value(metadata, "input", "input_path")
+    input_path = _report_path(_metadata_value(metadata, "input", "input_path"))
     target = _metadata_value(metadata, "target")
     seed = _metadata_value(metadata, "seed")
     n_permutations = _metadata_value(metadata, "n_permutations", "permutations")
@@ -359,6 +372,12 @@ never entered the panel, factor computation, permutation RNG, null statistics, o
 
 Supplemental scopes never participated in threshold generation and are never eligible for formal admission.
 Their levels are counterfactual comparisons against the formal thresholds only.
+
+The canonical `daily_ic` currently applies ordinal ranks to the binary label. Consequently,
+these IC placebo thresholds depend on the current event-slot layout, missingness structure,
+and formal factor family. They are only the G1 baseline for the current event-table formal library.
+A change to the dataset, event-slot layout, missingness structure, or formal factor family
+requires recalibration.
 
 Passing G1 does not override G3. A factor rejected by G3 remains rejected even when its G1
 statistics exceed the placebo thresholds.
