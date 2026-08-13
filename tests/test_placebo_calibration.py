@@ -1082,6 +1082,44 @@ def test_run_calibration_staging_failure_leaves_all_final_targets_unchanged(
     assert set(tmp_path.iterdir()) == before_names
 
 
+def test_run_calibration_publish_failure_rolls_back_every_final_target(
+    tmp_path, monkeypatch
+):
+    import os
+    from pathlib import Path
+
+    calibration, _, kwargs, outputs = _small_calibration_case(tmp_path, monkeypatch)
+    for index, path in enumerate(outputs[1:-1], start=1):
+        path.write_bytes(f"old-{index}".encode())
+    before_contents = {
+        path: path.read_bytes() if path.exists() else None for path in outputs
+    }
+    before_names = set(tmp_path.iterdir())
+    real_replace = os.replace
+    final_targets = set(outputs)
+    publish_calls = 0
+    injected = False
+
+    def fail_second_final_replace(source, destination):
+        nonlocal publish_calls, injected
+        if Path(destination) in final_targets and not injected:
+            publish_calls += 1
+            if publish_calls == 2:
+                injected = True
+                raise OSError("injected publish failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_second_final_replace)
+
+    with pytest.raises(OSError, match="injected publish failure"):
+        calibration.run_calibration(**kwargs)
+
+    assert {
+        path: path.read_bytes() if path.exists() else None for path in outputs
+    } == before_contents
+    assert set(tmp_path.iterdir()) == before_names
+
+
 def test_threshold_config_uses_same_directory_atomic_replace(tmp_path, monkeypatch):
     import os
     from pathlib import Path

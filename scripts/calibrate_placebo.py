@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import os
 import re
+import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
 from numbers import Integral
@@ -583,6 +584,8 @@ def _publish_calibration_outputs(
     config_candidate: tuple[Path, str] | None,
 ) -> None:
     staged: list[tuple[Path, Path]] = []
+    backups: list[tuple[Path, Path | None]] = []
+    retain_backups = False
     try:
         staged_distribution = _temporary_path(distribution_path)
         staged.append((staged_distribution, distribution_path))
@@ -604,11 +607,46 @@ def _publish_calibration_outputs(
 
         for staged_path, target_path in staged:
             _set_staged_mode(staged_path, target_path)
-        for staged_path, target_path in staged:
-            os.replace(staged_path, target_path)
+        for _, target_path in staged:
+            backup = None
+            if target_path.exists():
+                backup = _temporary_path(target_path)
+                backups.append((target_path, backup))
+                shutil.copy2(target_path, backup)
+            else:
+                backups.append((target_path, None))
+
+        try:
+            for staged_path, target_path in staged:
+                os.replace(staged_path, target_path)
+        except Exception as publish_error:
+            rollback_errors = []
+            for target_path, backup in backups:
+                try:
+                    if backup is None:
+                        target_path.unlink(missing_ok=True)
+                    else:
+                        os.replace(backup, target_path)
+                except Exception as rollback_error:
+                    rollback_errors.append((target_path, backup, rollback_error))
+            if rollback_errors:
+                retain_backups = True
+                recovery = ", ".join(
+                    f"{target} <- {backup}"
+                    for target, backup, _ in rollback_errors
+                )
+                raise RuntimeError(
+                    f"calibration publication failed and rollback was incomplete; "
+                    f"recovery files retained: {recovery}"
+                ) from publish_error
+            raise
     finally:
         for staged_path, _ in staged:
             staged_path.unlink(missing_ok=True)
+        if not retain_backups:
+            for _, backup in backups:
+                if backup is not None:
+                    backup.unlink(missing_ok=True)
 
 
 def run_calibration(
