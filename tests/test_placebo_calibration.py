@@ -520,9 +520,8 @@ def test_training_loader_rejects_a_missing_requested_column(tmp_path):
 
 
 def test_calibrate_scopes_isolates_formal_null_from_both_supplemental_scopes():
-    from scripts.calibrate_placebo import calibrate_scopes
-
     from helix.eval.placebo import metric_quantiles, placebo_distribution
+    from scripts.calibrate_placebo import calibrate_scopes
 
     formal_values, labels, mask = _two_date_factor_inputs()
     formal_names = ["formal_a", "formal_b"]
@@ -625,6 +624,291 @@ def test_calibrate_scopes_isolates_formal_null_from_both_supplemental_scopes():
         assert len(supplemental) == 2
         assert not supplemental["candidate_eligible"].astype(bool).any()
         assert supplemental["suggest_evict"].isna().all()
+
+
+def test_report_documents_training_only_thresholds_and_separate_scopes():
+    from scripts.calibrate_placebo import render_report
+
+    distribution = pd.DataFrame(
+        {
+            "permutation_id": [0, 1, 2],
+            "ic_mean": [0.01, 0.02, 0.03],
+            "icir": [0.10, 0.20, 0.30],
+            "gini": [0.04, 0.05, 0.06],
+        }
+    )
+    quantiles = pd.DataFrame(
+        {
+            "metric": ["ic_mean", "icir", "gini"],
+            "p95": [0.028, 0.28, 0.058],
+            "p99": [0.0296, 0.296, 0.0596],
+            "p999": [0.02996, 0.2996, 0.05996],
+        }
+    )
+    screening = pd.DataFrame(
+        [
+            {
+                **_factor_metric_row("formal_a", 0.31),
+                "scope": "formal",
+                "library_path": "data/artifacts/argus/event_factors.json",
+                "ic_level": "超 p99.9",
+                "icir_level": "超 p99.9",
+                "gini_level": "超 p99.9",
+                "overall_level": "超 p99.9",
+                "candidate_eligible": True,
+                "suggest_evict": False,
+            },
+            {
+                **_factor_metric_row("gp_000", 0.21),
+                "scope": "argus_n40",
+                "library_path": "data/artifacts/argus_n40/event_factors.json",
+                "ic_level": "超 p95",
+                "icir_level": "超 p95",
+                "gini_level": "超 p95",
+                "overall_level": "超 p95",
+                "candidate_eligible": False,
+                "suggest_evict": pd.NA,
+            },
+            {
+                **_factor_metric_row("gp_000", 0.10),
+                "scope": "argus_multi",
+                "library_path": "data/artifacts/argus_multi/event_factors.json",
+                "ic_level": "低于随机水平",
+                "icir_level": "低于随机水平",
+                "gini_level": "低于随机水平",
+                "overall_level": "低于随机水平",
+                "candidate_eligible": False,
+                "suggest_evict": pd.NA,
+            },
+        ]
+    )
+    metadata = {
+        "input": "data/raw/argus_quant_working.parquet",
+        "target": "label_d2_hit_8pct",
+        "seed": 20260813,
+        "n_permutations": 1000,
+        "min_samples": 50,
+        "train_start": "2022-01-04",
+        "train_end": "2024-09-04",
+        "n_train_dates": 649,
+        "formal_factor_count": 1,
+        "supplemental_factor_count": 2,
+    }
+
+    report = render_report(distribution, quantiles, screening, metadata)
+
+    for value in (
+        metadata["input"],
+        metadata["target"],
+        str(metadata["seed"]),
+        str(metadata["n_permutations"]),
+        str(metadata["min_samples"]),
+        metadata["train_start"],
+        metadata["train_end"],
+        str(metadata["n_train_dates"]),
+    ):
+        assert str(value) in report
+    assert "Null Distribution Summary" in report
+    assert all(statistic in report for statistic in ("mean", "std", "min", "median", "max"))
+    assert "Core Thresholds" in report
+    assert all(level in report for level in ("p95", "p99", "p99.9"))
+    assert "Formal Library" in report
+    assert "formal_a" in report
+    assert "data/artifacts/argus/event_factors.json" in report
+    assert "Formal level counts" in report
+    assert "Supplemental: argus_n40" in report
+    assert "Supplemental: argus_multi" in report
+    assert "data/artifacts/argus_n40/event_factors.json" in report
+    assert "data/artifacts/argus_multi/event_factors.json" in report
+    assert report.count("gp_000") == 2
+    assert "argus_n40 level counts" in report
+    assert "argus_multi level counts" in report
+    assert "Only the formal library and training dates generated these thresholds" in report
+    assert "Supplemental scopes never participated in threshold generation" in report
+    assert "never eligible for formal admission" in report
+    assert "Passing G1 does not override G3" in report
+
+
+def test_threshold_config_appends_generated_block_and_round_trips_exact_values(tmp_path):
+    from helix.config import Config
+    from scripts.calibrate_placebo import write_threshold_config
+
+    path = tmp_path / "config.yaml"
+    original = '# hand-written content\ngp:\n  population: 321\n'
+    path.write_text(original, encoding="utf-8")
+    quantiles = _screening_quantiles()
+    exact_p99 = {
+        "ic_mean": float.fromhex("0x1.23456789abcdep-5"),
+        "icir": float.fromhex("0x1.3456789abcdefp-2"),
+        "gini": float.fromhex("0x1.456789abcdef0p-4"),
+    }
+    for metric, value in exact_p99.items():
+        quantiles.loc[quantiles["metric"] == metric, "p99"] = value
+
+    write_threshold_config(
+        path,
+        quantiles,
+        train_start="2022-01-04",
+        train_end="2024-09-04",
+    )
+
+    rendered = path.read_text(encoding="utf-8")
+    assert rendered.startswith(original)
+    assert rendered.count("# BEGIN PLACEBO CALIBRATION") == 1
+    assert rendered.count("# END PLACEBO CALIBRATION") == 1
+    for metric, value in exact_p99.items():
+        assert f"    {metric}: {repr(value)}\n" in rendered
+    assert '    train_start: "2022-01-04"\n' in rendered
+    assert '    train_end: "2024-09-04"\n' in rendered
+
+    config = Config.load(path)
+    threshold = config.factor_admission.placebo_threshold
+    assert threshold is not None
+    assert threshold.ic_mean == exact_p99["ic_mean"]
+    assert threshold.icir == exact_p99["icir"]
+    assert threshold.gini == exact_p99["gini"]
+    assert threshold.quantile == 0.99
+    assert threshold.train_start == "2022-01-04"
+    assert threshold.train_end == "2024-09-04"
+
+
+def test_threshold_config_replaces_only_its_delimited_block(tmp_path):
+    from scripts.calibrate_placebo import write_threshold_config
+
+    path = tmp_path / "config.yaml"
+    prefix = '# keep this comment\ndata:\n  start_date: "20200101"\n'
+    old_block = """# BEGIN PLACEBO CALIBRATION
+factor_admission:
+  placebo_threshold:
+    ic_mean: 9.0
+# END PLACEBO CALIBRATION
+"""
+    suffix = "backtest:\n  top_k: 7\n# keep this footer\n"
+    path.write_text(prefix + old_block + suffix, encoding="utf-8")
+    quantiles = _screening_quantiles()
+
+    write_threshold_config(
+        path,
+        quantiles,
+        train_start="2022-01-04",
+        train_end="2024-09-04",
+    )
+
+    rendered = path.read_text(encoding="utf-8")
+    assert rendered.startswith(prefix)
+    assert rendered.endswith(suffix)
+    assert old_block not in rendered
+    assert rendered.count("# BEGIN PLACEBO CALIBRATION") == 1
+    assert rendered.count("# END PLACEBO CALIBRATION") == 1
+    assert "    ic_mean: 0.3\n" in rendered
+    assert "    icir: 0.3\n" in rendered
+    assert "    gini: 0.3\n" in rendered
+
+
+def test_cli_requires_an_explicit_train_end():
+    from scripts.calibrate_placebo import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([])
+
+
+def test_calibration_rejects_a_shortened_formal_training_window():
+    from scripts.calibrate_placebo import validate_training_dates
+
+    shortened = np.array(["2022-01-05", "2024-09-04"])
+
+    with pytest.raises(ValueError, match="formal training window"):
+        validate_training_dates(shortened, "2024-09-04")
+
+
+def test_calibration_rejects_labels_that_panel_packing_would_coerce_to_nan():
+    from scripts.calibrate_placebo import validate_training_labels
+
+    with pytest.raises(ValueError, match="binary"):
+        validate_training_labels(pd.Series([0.0, 1.0, np.nan, "bad"]))
+
+
+def test_calibration_rejects_library_fields_that_are_outcomes():
+    from scripts.calibrate_placebo import validate_library_fields
+
+    with pytest.raises(ValueError, match="label"):
+        validate_library_fields(["volume", "label_d2_hit_8pct"])
+
+
+def test_calibration_rejects_a_partially_replayed_library(monkeypatch):
+    import scripts.calibrate_placebo as calibration
+    from helix.gp.library import FactorLibrary, FactorSpec
+
+    library = FactorLibrary(
+        factors=[
+            FactorSpec(name="first", expression="signal", sign=1.0),
+            FactorSpec(name="skipped", expression="signal", sign=1.0),
+        ],
+        field_names=["signal"],
+        windows=[],
+        kind="event",
+    )
+    monkeypatch.setattr(
+        calibration,
+        "compute_factors",
+        lambda _library, _fields: (
+            ["first"],
+            np.ones((2, 3, 1), dtype=np.float32),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="replay every saved factor"):
+        calibration.compute_complete_library(
+            library,
+            {"signal": np.ones((2, 3))},
+            scope="formal",
+        )
+
+
+def test_threshold_config_rejects_an_undelimited_factor_admission_section(tmp_path):
+    from scripts.calibrate_placebo import write_threshold_config
+
+    path = tmp_path / "config.yaml"
+    original = "factor_admission:\n  placebo_threshold: null\n"
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="outside the delimited block"):
+        write_threshold_config(
+            path,
+            _screening_quantiles(),
+            train_start="2022-01-04",
+            train_end="2024-09-04",
+        )
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(
+    ("train_start", "train_end"),
+    [
+        ("2022-01-05", "2024-09-04"),
+        ("2022-01-04", "2024-09-03"),
+        ("2022-01-04", "2024-09-05"),
+    ],
+)
+def test_threshold_config_rejects_any_nonformal_training_window(
+    tmp_path, train_start, train_end
+):
+    from scripts.calibrate_placebo import write_threshold_config
+
+    path = tmp_path / "config.yaml"
+    original = "gp:\n  population: 321\n"
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        write_threshold_config(
+            path,
+            _screening_quantiles(),
+            train_start=train_start,
+            train_end=train_end,
+        )
+
+    assert path.read_text(encoding="utf-8") == original
 
 
 def test_formal_screening_uses_joint_admission_and_eviction_advice():
