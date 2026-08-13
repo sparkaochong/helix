@@ -41,6 +41,36 @@ def _factor_metric_row(factor_name: str, value: float) -> dict[str, object]:
     }
 
 
+def _two_date_factor_inputs() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    labels = np.array(
+        [
+            [1.0, 1.0, 0.0, 0.0, 0.0, np.nan],
+            [1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    factors = np.array(
+        [
+            [
+                [1.0, 2.0],
+                [2.0, 5.0],
+                [3.0, 1.0],
+                [4.0, 4.0],
+                [5.0, 3.0],
+                [np.nan, np.nan],
+            ],
+            [
+                [6.0, 1.0],
+                [1.0, 6.0],
+                [5.0, 2.0],
+                [2.0, 5.0],
+                [4.0, 3.0],
+                [3.0, 4.0],
+            ],
+        ]
+    )
+    return factors, labels, np.isfinite(labels)
+
+
 def test_cross_sectional_permutations_preserve_daily_class_counts():
     from helix.eval.placebo import permute_binary_labels
 
@@ -133,6 +163,122 @@ def test_vectorized_placebo_daily_metrics_match_existing_daily_metrics():
     np.testing.assert_allclose(actual_gini, expected_gini, rtol=0.0, atol=1e-12)
 
 
+def test_placebo_distribution_matches_full_cycle_metrics_and_formal_factor_maximum():
+    from helix.eval.placebo import (
+        iter_cross_sectional_permutations,
+        placebo_distribution,
+    )
+
+    from helix.eval.ic import daily_ic
+    from helix.eval.metrics import daily_gini
+
+    factors, labels, mask = _two_date_factor_inputs()
+    n_permutations = 6
+    seed = 1
+    distribution = placebo_distribution(
+        factors,
+        labels,
+        mask,
+        n_permutations=n_permutations,
+        seed=seed,
+        min_samples=1,
+    )
+
+    permuted = np.full((n_permutations, *labels.shape), np.nan)
+    for date_index, valid_positions, daily_permutations in (
+        iter_cross_sectional_permutations(
+            labels,
+            mask,
+            n_permutations=n_permutations,
+            rng=np.random.default_rng(seed),
+        )
+    ):
+        permuted[:, date_index, valid_positions] = daily_permutations
+
+    per_factor = np.empty((n_permutations, factors.shape[2], 3))
+    for permutation_index in range(n_permutations):
+        for factor_index in range(factors.shape[2]):
+            daily_ics = daily_ic(
+                factors[:, :, factor_index],
+                permuted[permutation_index],
+                mask,
+                min_samples=1,
+            )
+            daily_ginis = daily_gini(
+                factors[:, :, factor_index],
+                permuted[permutation_index],
+                mask,
+                min_samples=1,
+            )
+            ic_mean = daily_ics.mean()
+            per_factor[permutation_index, factor_index] = (
+                ic_mean,
+                ic_mean / daily_ics.std(ddof=1),
+                daily_ginis.mean(),
+            )
+
+    expected = np.max(np.abs(per_factor), axis=1)
+    assert set(np.argmax(np.abs(per_factor), axis=1).ravel()) == {0, 1}
+    metric_columns = ["ic_mean", "icir", "gini"]
+    np.testing.assert_array_equal(
+        distribution["permutation_id"], np.arange(n_permutations)
+    )
+    np.testing.assert_allclose(
+        distribution[metric_columns].to_numpy(), expected, rtol=0.0, atol=1e-12
+    )
+
+
+def test_factor_metrics_match_existing_signed_and_absolute_metric_summaries():
+    from helix.eval.placebo import factor_metrics
+
+    from helix.eval.ic import daily_ic, summarize_ic
+    from helix.eval.metrics import daily_gini, summarize_daily
+
+    factors, labels, mask = _two_date_factor_inputs()
+    factor_names = ["ascending", "mixed"]
+    actual = factor_metrics(
+        factor_names, factors, labels, mask, min_samples=1
+    ).set_index("factor_name")
+
+    expected = []
+    for factor_index in range(factors.shape[2]):
+        ic_summary = summarize_ic(
+            daily_ic(
+                factors[:, :, factor_index], labels, mask, min_samples=1
+            )
+        )
+        gini_summary = summarize_daily(
+            daily_gini(
+                factors[:, :, factor_index], labels, mask, min_samples=1
+            )
+        )
+        expected.append(
+            [
+                ic_summary["ic_mean"],
+                abs(ic_summary["ic_mean"]),
+                ic_summary["icir"],
+                abs(ic_summary["icir"]),
+                gini_summary["mean"],
+                abs(gini_summary["mean"]),
+            ]
+        )
+
+    metric_columns = [
+        "ic_mean_signed",
+        "ic_mean",
+        "icir_signed",
+        "icir",
+        "gini_signed",
+        "gini",
+    ]
+    np.testing.assert_allclose(
+        actual.loc[factor_names, metric_columns].to_numpy(),
+        expected,
+        rtol=0.0,
+        atol=1e-12,
+    )
+
+
 def test_quantiles_use_numpy_linear_method():
     from helix.eval.placebo import metric_quantiles
 
@@ -221,12 +367,12 @@ def test_training_loader_excludes_post_cutoff_extremes_from_frame_and_result(
     assert len(read_calls) == 2
     for call in read_calls:
         assert call["filters"] == [("trade_date", "<=", train_end)]
-        assert call["columns"] == [
+        assert set(call["columns"]) == {
             "trade_date",
             "stock_code",
             "label_d2_hit_8pct",
             "signal",
-        ]
+        }
         assert "unused" not in call["columns"]
 
 
@@ -244,63 +390,144 @@ def test_training_loader_accepts_only_the_formal_cutoff():
     assert validate_train_end("2024-09-04") == "2024-09-04"
 
 
-def test_supplemental_metrics_cannot_change_formal_calibration_outputs():
-    from helix.eval.placebo import assemble_calibration_outputs
+def test_training_loader_rejects_input_without_the_exact_formal_cutoff_date(tmp_path):
+    from scripts.calibrate_placebo import load_training_frame
 
-    formal_distribution = pd.DataFrame(
+    path = tmp_path / "cutoff_absent.parquet"
+    pd.DataFrame(
         {
-            "permutation_id": np.arange(5),
-            "ic_mean": np.arange(5, dtype=float) / 10,
-            "icir": np.arange(5, dtype=float) / 10,
-            "gini": np.arange(5, dtype=float) / 10,
+            "trade_date": ["2024-09-03", "2024-09-03"],
+            "stock_code": ["000001", "000002"],
+            "label_d2_hit_8pct": [0.0, 1.0],
+            "signal": [1.0, 2.0],
         }
-    )
-    formal_metrics = pd.DataFrame([_factor_metric_row("gp_000", 0.35)])
-    high_supplemental = pd.DataFrame([_factor_metric_row("gp_000", 0.50)])
-    low_supplemental = pd.DataFrame([_factor_metric_row("gp_000", 0.00)])
-    library_paths = {
-        "formal": "data/artifacts/argus/event_factors.json",
-        "argus_n40": "data/artifacts/argus_n40/event_factors.json",
+    ).to_parquet(path, index=False)
+
+    with pytest.raises(ValueError):
+        load_training_frame(path, ["signal"], "2024-09-04")
+
+
+def test_training_loader_rejects_a_missing_requested_column(tmp_path):
+    from scripts.calibrate_placebo import load_training_frame
+
+    path = tmp_path / "missing_feature.parquet"
+    pd.DataFrame(
+        {
+            "trade_date": ["2024-09-04", "2024-09-04"],
+            "stock_code": ["000001", "000002"],
+            "label_d2_hit_8pct": [0.0, 1.0],
+        }
+    ).to_parquet(path, index=False)
+
+    with pytest.raises((KeyError, ValueError), match="missing"):
+        load_training_frame(path, ["missing"], "2024-09-04")
+
+
+def test_calibrate_scopes_isolates_formal_null_from_both_supplemental_scopes():
+    from helix.eval.placebo import metric_quantiles, placebo_distribution
+    from scripts.calibrate_placebo import calibrate_scopes
+
+    formal_values, labels, mask = _two_date_factor_inputs()
+    formal_names = ["formal_a", "formal_b"]
+    first_supplemental = {
+        "argus_n40": (
+            ["n40_a"],
+            np.array(
+                [
+                    [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                ]
+            )[:, :, None],
+            "data/artifacts/argus_n40/event_factors.json",
+        ),
+        "argus_multi": (
+            ["multi_a"],
+            np.array(
+                [
+                    [2.0, 5.0, 1.0, 4.0, 3.0, 6.0],
+                    [1.0, 6.0, 2.0, 5.0, 3.0, 4.0],
+                ]
+            )[:, :, None],
+            "data/artifacts/argus_multi/event_factors.json",
+        ),
+    }
+    changed_supplemental = {
+        "argus_n40": (
+            ["n40_a"],
+            np.array(
+                [
+                    [5.0, 1.0, 4.0, 2.0, 3.0, 6.0],
+                    [6.0, 2.0, 5.0, 1.0, 4.0, 3.0],
+                ]
+            )[:, :, None],
+            "data/artifacts/argus_n40/event_factors.json",
+        ),
+        "argus_multi": (
+            ["multi_a"],
+            np.array(
+                [
+                    [3.0, 1.0, 5.0, 2.0, 4.0, 6.0],
+                    [4.0, 1.0, 6.0, 3.0, 2.0, 5.0],
+                ]
+            )[:, :, None],
+            "data/artifacts/argus_multi/event_factors.json",
+        ),
+    }
+    calibration_kwargs = {
+        "labels": labels,
+        "mask": mask,
+        "n_permutations": 6,
+        "seed": 1,
+        "min_samples": 1,
     }
 
-    high_distribution, high_quantiles, high_config, high_screen = (
-        assemble_calibration_outputs(
-            formal_distribution,
-            {"formal": formal_metrics, "argus_n40": high_supplemental},
-            library_paths,
-        )
+    first_distribution, first_quantiles, first_screening = calibrate_scopes(
+        formal_names,
+        formal_values,
+        first_supplemental,
+        **calibration_kwargs,
     )
-    low_distribution, low_quantiles, low_config, low_screen = (
-        assemble_calibration_outputs(
-            formal_distribution,
-            {"formal": formal_metrics, "argus_n40": low_supplemental},
-            library_paths,
-        )
+    changed_distribution, changed_quantiles, changed_screening = calibrate_scopes(
+        formal_names,
+        formal_values,
+        changed_supplemental,
+        **calibration_kwargs,
+    )
+    expected_distribution = placebo_distribution(
+        formal_values, **calibration_kwargs
+    )
+    expected_quantiles = metric_quantiles(expected_distribution)
+    contaminated_distribution = placebo_distribution(
+        np.concatenate(
+            (
+                formal_values,
+                first_supplemental["argus_n40"][1],
+                first_supplemental["argus_multi"][1],
+            ),
+            axis=2,
+        ),
+        **calibration_kwargs,
     )
 
-    pd.testing.assert_frame_equal(high_distribution, formal_distribution)
-    pd.testing.assert_frame_equal(low_distribution, formal_distribution)
-    pd.testing.assert_frame_equal(high_quantiles, low_quantiles)
-    assert high_config == low_config
-    assert high_config == pytest.approx(
-        {"ic_mean": 0.396, "icir": 0.396, "gini": 0.396}
+    pd.testing.assert_frame_equal(
+        first_distribution, changed_distribution, check_exact=True
     )
     pd.testing.assert_frame_equal(
-        high_screen.query("scope == 'formal'").reset_index(drop=True),
-        low_screen.query("scope == 'formal'").reset_index(drop=True),
+        first_quantiles, changed_quantiles, check_exact=True
     )
-
-    high_supplemental_screen = high_screen.query("scope == 'argus_n40'").iloc[0]
-    low_supplemental_screen = low_screen.query("scope == 'argus_n40'").iloc[0]
-    assert high_supplemental_screen["overall_level"] == "超 p99.9"
-    assert low_supplemental_screen["overall_level"] == "低于随机水平"
-    assert not bool(high_supplemental_screen["candidate_eligible"])
-    assert not bool(low_supplemental_screen["candidate_eligible"])
-    assert pd.isna(high_supplemental_screen["suggest_evict"])
-    assert pd.isna(low_supplemental_screen["suggest_evict"])
-    assert high_supplemental_screen["library_path"].endswith(
-        "argus_n40/event_factors.json"
+    pd.testing.assert_frame_equal(
+        first_distribution, expected_distribution, check_exact=True
     )
+    pd.testing.assert_frame_equal(first_quantiles, expected_quantiles, check_exact=True)
+    assert not contaminated_distribution.equals(expected_distribution)
+    for screening in (first_screening, changed_screening):
+        formal = screening.query("scope == 'formal'")
+        supplemental = screening.query("scope != 'formal'")
+        assert set(formal["factor_name"]) == set(formal_names)
+        assert set(supplemental["scope"]) == {"argus_n40", "argus_multi"}
+        assert len(supplemental) == 2
+        assert not supplemental["candidate_eligible"].astype(bool).any()
+        assert supplemental["suggest_evict"].isna().all()
 
 
 def test_formal_screening_uses_joint_admission_and_eviction_advice():
@@ -326,6 +553,38 @@ def test_formal_screening_uses_joint_admission_and_eviction_advice():
     assert bool(screened.loc["at_p99", "suggest_evict"])
 
 
+def test_screening_levels_each_metric_and_uses_the_weakest_overall_level():
+    from helix.eval.placebo import screen_factor_metrics
+
+    metrics = pd.DataFrame(
+        [
+            {
+                "factor_name": "mixed_levels",
+                "ic_mean_signed": -0.41,
+                "ic_mean": 0.41,
+                "icir_signed": 0.31,
+                "icir": 0.31,
+                "gini_signed": -0.21,
+                "gini": 0.21,
+            }
+        ]
+    )
+
+    screened = screen_factor_metrics(
+        metrics,
+        _screening_quantiles(),
+        scope="formal",
+        library_path="data/artifacts/argus/event_factors.json",
+    ).iloc[0]
+
+    assert screened["ic_level"] == "超 p99.9"
+    assert screened["icir_level"] == "超 p99"
+    assert screened["gini_level"] == "超 p95"
+    assert screened["overall_level"] == "超 p95"
+    assert not bool(screened["candidate_eligible"])
+    assert bool(screened["suggest_evict"])
+
+
 def test_placebo_threshold_config_accepts_valid_contract():
     from helix.config import PlaceboThresholdConfig
 
@@ -334,6 +593,42 @@ def test_placebo_threshold_config_accepts_valid_contract():
     assert config.quantile == pytest.approx(0.99)
     assert config.train_start == "2022-01-04"
     assert config.train_end == "2024-09-04"
+
+
+def test_root_config_retains_typed_factor_admission_thresholds():
+    from helix.config import (
+        Config,
+        FactorAdmissionConfig,
+        PlaceboThresholdConfig,
+    )
+
+    config = Config.model_validate(
+        {"factor_admission": {"placebo_threshold": _threshold_kwargs()}}
+    )
+
+    assert isinstance(config.factor_admission, FactorAdmissionConfig)
+    assert isinstance(
+        config.factor_admission.placebo_threshold, PlaceboThresholdConfig
+    )
+    assert config.factor_admission.placebo_threshold.ic_mean == pytest.approx(0.04)
+    assert config.factor_admission.placebo_threshold.train_end == "2024-09-04"
+
+
+def test_new_factor_admission_models_reject_unknown_fields_through_root_config():
+    from helix.config import Config, FactorAdmissionConfig
+
+    with pytest.raises(ValueError):
+        FactorAdmissionConfig.model_validate({"unexpected": True})
+
+    with pytest.raises(ValueError):
+        Config.model_validate({"factor_admission": {"unexpected": True}})
+
+    threshold = _threshold_kwargs()
+    threshold["unexpected"] = True
+    with pytest.raises(ValueError):
+        Config.model_validate(
+            {"factor_admission": {"placebo_threshold": threshold}}
+        )
 
 
 def test_placebo_threshold_config_accepts_zero_thresholds():
@@ -406,6 +701,18 @@ def test_permutation_rejects_nonbinary_labels():
     with pytest.raises(ValueError):
         permute_binary_labels(
             np.array([0.0, 0.5, 1.0]), 10, np.random.default_rng(1)
+        )
+
+
+@pytest.mark.parametrize("n_permutations", [0, -1])
+def test_permutation_rejects_nonpositive_permutation_counts(n_permutations):
+    from helix.eval.placebo import permute_binary_labels
+
+    with pytest.raises(ValueError):
+        permute_binary_labels(
+            np.array([0.0, 1.0]),
+            n_permutations,
+            np.random.default_rng(1),
         )
 
 
