@@ -1,0 +1,392 @@
+"""Behavioral contract for training-only placebo IC/Gini calibration."""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+
+def _threshold_kwargs() -> dict[str, object]:
+    return {
+        "ic_mean": 0.04,
+        "icir": 0.25,
+        "gini": 0.08,
+        "quantile": 0.99,
+        "train_start": "2022-01-04",
+        "train_end": "2024-09-04",
+    }
+
+
+def _screening_quantiles() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "metric": ["ic_mean", "icir", "gini"],
+            "p95": [0.20, 0.20, 0.20],
+            "p99": [0.30, 0.30, 0.30],
+            "p999": [0.40, 0.40, 0.40],
+        }
+    )
+
+
+def _factor_metric_row(factor_name: str, value: float) -> dict[str, object]:
+    return {
+        "factor_name": factor_name,
+        "ic_mean_signed": value,
+        "ic_mean": abs(value),
+        "icir_signed": value,
+        "icir": abs(value),
+        "gini_signed": value,
+        "gini": abs(value),
+    }
+
+
+def test_cross_sectional_permutations_preserve_daily_class_counts():
+    from helix.eval.placebo import permute_binary_labels
+
+    labels = np.array([1.0, 0.0, 1.0, 0.0, 0.0])
+
+    permutations = permute_binary_labels(labels, 1000, np.random.default_rng(7))
+
+    assert permutations.shape == (1000, 5)
+    np.testing.assert_array_equal(permutations.sum(axis=1), np.full(1000, 2))
+    np.testing.assert_array_equal(
+        (~permutations.astype(bool)).sum(axis=1), np.full(1000, 3)
+    )
+
+
+def test_placebo_generation_never_moves_labels_between_dates():
+    from helix.eval.placebo import iter_cross_sectional_permutations
+
+    labels = np.array(
+        [
+            [1.0, 0.0, 0.0, np.nan, np.nan],
+            [1.0, 1.0, 1.0, 0.0, np.nan],
+        ]
+    )
+    mask = np.isfinite(labels)
+
+    blocks = list(
+        iter_cross_sectional_permutations(
+            labels, mask, n_permutations=1000, rng=np.random.default_rng(8)
+        )
+    )
+
+    assert [date_index for date_index, _, _ in blocks] == [0, 1]
+    np.testing.assert_array_equal(blocks[0][1], np.array([0, 1, 2]))
+    np.testing.assert_array_equal(blocks[1][1], np.array([0, 1, 2, 3]))
+    np.testing.assert_array_equal(blocks[0][2].sum(axis=1), np.full(1000, 1))
+    np.testing.assert_array_equal(blocks[1][2].sum(axis=1), np.full(1000, 3))
+
+
+def test_permutations_are_reproducible_by_seed():
+    from helix.eval.placebo import permute_binary_labels
+
+    labels = np.array([1.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+    first = permute_binary_labels(labels, 50, np.random.default_rng(11))
+    repeated = permute_binary_labels(labels, 50, np.random.default_rng(11))
+    changed = permute_binary_labels(labels, 50, np.random.default_rng(12))
+
+    np.testing.assert_array_equal(first, repeated)
+    assert not np.array_equal(first, changed)
+
+
+def test_vectorized_placebo_daily_metrics_match_existing_daily_metrics():
+    from helix.eval.placebo import permute_binary_labels, placebo_daily_metrics
+
+    from helix.eval.ic import daily_ic
+    from helix.eval.metrics import daily_gini
+
+    factors = np.array(
+        [
+            [1.0, 9.0],
+            [1.0, 7.0],
+            [2.0, 7.0],
+            [3.0, 4.0],
+            [5.0, 2.0],
+            [8.0, 0.0],
+        ]
+    )
+    labels = np.array([1.0, 0.0, 1.0, 0.0, 1.0, 0.0])
+    permutations = permute_binary_labels(labels, 7, np.random.default_rng(19))
+
+    actual_ic, actual_gini = placebo_daily_metrics(
+        factors, permutations, min_samples=1
+    )
+    expected_ic = np.empty_like(actual_ic)
+    expected_gini = np.empty_like(actual_gini)
+    daily_mask = np.ones((1, labels.size), dtype=bool)
+    for permutation_index, permuted_labels in enumerate(permutations):
+        target = permuted_labels.astype(float)[None, :]
+        for factor_index in range(factors.shape[1]):
+            factor = factors[:, factor_index][None, :]
+            expected_ic[permutation_index, factor_index] = daily_ic(
+                factor, target, daily_mask, min_samples=1
+            )[0]
+            expected_gini[permutation_index, factor_index] = daily_gini(
+                factor, target, daily_mask, min_samples=1
+            )[0]
+
+    assert actual_ic.shape == (7, 2)
+    assert actual_gini.shape == (7, 2)
+    np.testing.assert_allclose(actual_ic, expected_ic, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(actual_gini, expected_gini, rtol=0.0, atol=1e-12)
+
+
+def test_quantiles_use_numpy_linear_method():
+    from helix.eval.placebo import metric_quantiles
+
+    distribution = pd.DataFrame(
+        {
+            "permutation_id": np.arange(5),
+            "ic_mean": np.arange(5, dtype=float),
+            "icir": np.arange(5, dtype=float) * 2,
+            "gini": np.arange(5, dtype=float) * 3,
+        }
+    )
+
+    quantiles = metric_quantiles(distribution).set_index("metric")
+
+    assert quantiles.loc["ic_mean", "p95"] == pytest.approx(3.8)
+    assert quantiles.loc["ic_mean", "p99"] == pytest.approx(3.96)
+    assert quantiles.loc["ic_mean", "p999"] == pytest.approx(3.996)
+
+
+def test_admission_requires_every_metric_to_strictly_exceed_p99():
+    from helix.eval.placebo import passes_placebo_threshold
+
+    thresholds = {"ic_mean": 0.04, "icir": 0.25, "gini": 0.08}
+    above = {name: value + 0.001 for name, value in thresholds.items()}
+    assert passes_placebo_threshold(above, thresholds)
+
+    for metric_name in thresholds:
+        metrics = above.copy()
+        metrics[metric_name] = thresholds[metric_name]
+        assert not passes_placebo_threshold(metrics, thresholds)
+
+
+def test_training_loader_excludes_post_cutoff_extremes_from_frame_and_result(tmp_path):
+    from scripts.calibrate_placebo import load_training_frame
+
+    train_end = "2024-09-04"
+    training_rows = pd.DataFrame(
+        {
+            "trade_date": ["2024-09-03", "2024-09-03", train_end, train_end],
+            "stock_code": ["000001", "000002", "000001", "000002"],
+            "label_d2_hit_8pct": [0.0, 1.0, 1.0, 0.0],
+            "signal": [1.0, 2.0, 3.0, 4.0],
+            "unused": [10.0, 20.0, 30.0, 40.0],
+        }
+    )
+    post_cutoff = pd.DataFrame(
+        {
+            "trade_date": ["2024-09-05", "2024-09-05"],
+            "stock_code": ["000001", "000002"],
+            "label_d2_hit_8pct": [1.0, 1.0],
+            "signal": [1e100, 1e100],
+            "unused": [1e100, 1e100],
+        }
+    )
+    training_path = tmp_path / "training_only.parquet"
+    contaminated_path = tmp_path / "with_post_cutoff.parquet"
+    training_rows.to_parquet(training_path, index=False)
+    pd.concat([training_rows, post_cutoff], ignore_index=True).to_parquet(
+        contaminated_path, index=False
+    )
+
+    expected = load_training_frame(training_path, ["signal"], train_end)
+    actual = load_training_frame(contaminated_path, ["signal"], train_end)
+
+    pd.testing.assert_frame_equal(actual.reset_index(drop=True), expected.reset_index(drop=True))
+    assert actual["trade_date"].max() == train_end
+    assert actual["signal"].mean() == pytest.approx(2.5)
+    assert "unused" not in actual.columns
+
+
+@pytest.mark.parametrize("train_end", [None, "", "2024-09-03", "2024-09-05"])
+def test_training_loader_rejects_every_nonformal_cutoff(train_end):
+    from scripts.calibrate_placebo import validate_train_end
+
+    with pytest.raises(ValueError):
+        validate_train_end(train_end)
+
+
+def test_training_loader_accepts_only_the_formal_cutoff():
+    from scripts.calibrate_placebo import validate_train_end
+
+    assert validate_train_end("2024-09-04") == "2024-09-04"
+
+
+def test_supplemental_metrics_cannot_change_formal_quantiles_or_become_eligible():
+    from helix.eval.placebo import metric_quantiles, screen_factor_metrics
+
+    formal_distribution = pd.DataFrame(
+        {
+            "permutation_id": np.arange(5),
+            "ic_mean": np.arange(5, dtype=float) / 10,
+            "icir": np.arange(5, dtype=float) / 10,
+            "gini": np.arange(5, dtype=float) / 10,
+        }
+    )
+    formal_quantiles = metric_quantiles(formal_distribution)
+    high_supplemental = pd.DataFrame([_factor_metric_row("gp_000", 0.50)])
+    low_supplemental = pd.DataFrame([_factor_metric_row("gp_000", 0.00)])
+
+    high_screen = screen_factor_metrics(
+        high_supplemental,
+        formal_quantiles,
+        scope="argus_n40",
+        library_path="data/artifacts/argus_n40/event_factors.json",
+    )
+    low_screen = screen_factor_metrics(
+        low_supplemental,
+        formal_quantiles,
+        scope="argus_n40",
+        library_path="data/artifacts/argus_n40/event_factors.json",
+    )
+
+    pd.testing.assert_frame_equal(metric_quantiles(formal_distribution), formal_quantiles)
+    assert high_screen.loc[0, "ic_level"] == "超 p99.9"
+    assert high_screen.loc[0, "icir_level"] == "超 p99.9"
+    assert high_screen.loc[0, "gini_level"] == "超 p99.9"
+    assert high_screen.loc[0, "overall_level"] == "超 p99.9"
+    assert low_screen.loc[0, "overall_level"] == "低于随机水平"
+    assert not bool(high_screen.loc[0, "candidate_eligible"])
+    assert not bool(low_screen.loc[0, "candidate_eligible"])
+    assert pd.isna(high_screen.loc[0, "suggest_evict"])
+    assert pd.isna(low_screen.loc[0, "suggest_evict"])
+    assert high_screen.loc[0, "scope"] == "argus_n40"
+    assert high_screen.loc[0, "library_path"].endswith("argus_n40/event_factors.json")
+
+
+def test_formal_screening_uses_joint_admission_and_eviction_advice():
+    from helix.eval.placebo import screen_factor_metrics
+
+    metrics = pd.DataFrame(
+        [
+            _factor_metric_row("eligible", 0.31),
+            _factor_metric_row("at_p99", 0.30),
+        ]
+    )
+
+    screened = screen_factor_metrics(
+        metrics,
+        _screening_quantiles(),
+        scope="formal",
+        library_path="data/artifacts/argus/event_factors.json",
+    ).set_index("factor_name")
+
+    assert bool(screened.loc["eligible", "candidate_eligible"])
+    assert not bool(screened.loc["eligible", "suggest_evict"])
+    assert not bool(screened.loc["at_p99", "candidate_eligible"])
+    assert bool(screened.loc["at_p99", "suggest_evict"])
+
+
+def test_placebo_threshold_config_accepts_valid_contract():
+    from helix.config import PlaceboThresholdConfig
+
+    config = PlaceboThresholdConfig(**_threshold_kwargs())
+
+    assert config.quantile == pytest.approx(0.99)
+    assert config.train_start == "2022-01-04"
+    assert config.train_end == "2024-09-04"
+
+
+@pytest.mark.parametrize("metric", ["ic_mean", "icir", "gini"])
+@pytest.mark.parametrize("invalid", [-0.001, np.nan, np.inf, -np.inf])
+def test_placebo_threshold_config_rejects_negative_or_nonfinite_metrics(metric, invalid):
+    from helix.config import PlaceboThresholdConfig
+
+    values = _threshold_kwargs()
+    values[metric] = invalid
+
+    with pytest.raises(ValueError):
+        PlaceboThresholdConfig(**values)
+
+
+@pytest.mark.parametrize("quantile", [0.0, 1.0, -0.01, 1.01, np.nan])
+def test_placebo_threshold_config_rejects_invalid_quantiles(quantile):
+    from helix.config import PlaceboThresholdConfig
+
+    values = _threshold_kwargs()
+    values["quantile"] = quantile
+
+    with pytest.raises(ValueError):
+        PlaceboThresholdConfig(**values)
+
+
+@pytest.mark.parametrize(
+    ("train_start", "train_end"),
+    [
+        ("2024-09-05", "2024-09-04"),
+        ("", "2024-09-04"),
+        ("2022-01-04", ""),
+    ],
+)
+def test_placebo_threshold_config_rejects_invalid_training_dates(train_start, train_end):
+    from helix.config import PlaceboThresholdConfig
+
+    values = _threshold_kwargs()
+    values.update(train_start=train_start, train_end=train_end)
+
+    with pytest.raises(ValueError):
+        PlaceboThresholdConfig(**values)
+
+
+def test_permutation_rejects_nonbinary_labels():
+    from helix.eval.placebo import permute_binary_labels
+
+    with pytest.raises(ValueError):
+        permute_binary_labels(
+            np.array([0.0, 0.5, 1.0]), 10, np.random.default_rng(1)
+        )
+
+
+def test_cross_sectional_permutations_reject_a_single_class_date():
+    from helix.eval.placebo import iter_cross_sectional_permutations
+
+    labels = np.array([[1.0, 1.0, 1.0], [0.0, 1.0, 0.0]])
+
+    with pytest.raises(ValueError):
+        list(
+            iter_cross_sectional_permutations(
+                labels,
+                np.ones_like(labels, dtype=bool),
+                n_permutations=10,
+                rng=np.random.default_rng(2),
+            )
+        )
+
+
+def test_placebo_distribution_rejects_an_empty_formal_factor_array():
+    from helix.eval.placebo import placebo_distribution
+
+    labels = np.array([[0.0, 1.0, 0.0, 1.0], [0.0, 1.0, 1.0, 0.0]])
+    factors = np.empty((*labels.shape, 0), dtype=float)
+
+    with pytest.raises(ValueError):
+        placebo_distribution(
+            factors,
+            labels,
+            np.ones_like(labels, dtype=bool),
+            n_permutations=10,
+            seed=3,
+            min_samples=1,
+        )
+
+
+def test_placebo_distribution_rejects_nonfinite_final_metrics():
+    from helix.eval.placebo import placebo_distribution
+
+    labels = np.array([[0.0, 1.0, 0.0, 1.0]])
+    factors = np.array([[[1.0], [2.0], [3.0], [4.0]]])
+
+    with pytest.raises(ValueError):
+        placebo_distribution(
+            factors,
+            labels,
+            np.ones_like(labels, dtype=bool),
+            n_permutations=10,
+            seed=4,
+            min_samples=1,
+        )
