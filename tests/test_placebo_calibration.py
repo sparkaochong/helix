@@ -71,6 +71,91 @@ def _two_date_factor_inputs() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return factors, labels, np.isfinite(labels)
 
 
+def _small_calibration_case(tmp_path, monkeypatch):
+    import hashlib
+
+    import scripts.calibrate_placebo as calibration
+    from helix.gp.library import FactorLibrary, FactorSpec, save_factors
+
+    dates = ["2024-09-01", "2024-09-02", "2024-09-03", "2024-09-04"]
+    signals = [
+        [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        [5.0, 1.0, 4.0, 2.0, 3.0, 0.0],
+        [2.0, 5.0, 0.0, 4.0, 1.0, 3.0],
+        [4.0, 0.0, 5.0, 1.0, 3.0, 2.0],
+    ]
+    labels = [
+        [0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+        [0.0, 1.0, 1.0, 0.0, 1.0, 0.0],
+    ]
+    rows = []
+    for trade_date, daily_signals, daily_labels in zip(dates, signals, labels, strict=True):
+        for index, (signal, label) in enumerate(
+            zip(daily_signals, daily_labels, strict=True)
+        ):
+            rows.append(
+                {
+                    "trade_date": trade_date,
+                    "stock_code": f"{index:06d}",
+                    "label_d2_hit_8pct": label,
+                    "signal": signal,
+                }
+            )
+    input_path = tmp_path / "events.parquet"
+    pd.DataFrame(rows).to_parquet(input_path, index=False)
+
+    library_paths = []
+    for scope in ("formal", "n40", "multi"):
+        library_path = tmp_path / f"{scope}.json"
+        save_factors(
+            library_path,
+            FactorLibrary(
+                factors=[FactorSpec(name="gp_000", expression="signal", sign=1.0)],
+                field_names=["signal"],
+                windows=[],
+                kind="event",
+            ),
+        )
+        library_paths.append(library_path)
+
+    monkeypatch.setattr(calibration, "FORMAL_TRAIN_START", dates[0])
+    monkeypatch.setattr(calibration, "FORMAL_TRAIN_END", dates[-1])
+    monkeypatch.setattr(calibration, "FORMAL_TRAIN_DATES", len(dates))
+    monkeypatch.setattr(
+        calibration,
+        "FORMAL_TRAIN_DATE_DIGEST",
+        hashlib.sha256("\n".join(dates).encode()).hexdigest(),
+    )
+
+    distribution_path = tmp_path / "distribution.parquet"
+    screening_path = tmp_path / "screening.parquet"
+    report_path = tmp_path / "report.md"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("gp:\n  population: 321\n", encoding="utf-8")
+    kwargs = {
+        "input_path": input_path,
+        "formal_library_path": library_paths[0],
+        "n40_library_path": library_paths[1],
+        "multi_library_path": library_paths[2],
+        "train_end": dates[-1],
+        "seed": 7,
+        "n_permutations": 5,
+        "min_samples": 1,
+        "distribution_path": distribution_path,
+        "screening_path": screening_path,
+        "report_path": report_path,
+        "write_config_path": config_path,
+    }
+    return calibration, dates, kwargs, [
+        distribution_path,
+        screening_path,
+        report_path,
+        config_path,
+    ]
+
+
 def test_cross_sectional_permutations_preserve_daily_class_counts():
     from helix.eval.placebo import permute_binary_labels
 
@@ -821,6 +906,27 @@ def test_calibration_rejects_a_shortened_formal_training_window():
         validate_training_dates(shortened, "2024-09-04")
 
 
+def test_calibration_rejects_a_changed_interior_training_date(monkeypatch):
+    import hashlib
+
+    import scripts.calibrate_placebo as calibration
+
+    formal_dates = ["2024-09-01", "2024-09-02", "2024-09-03", "2024-09-04"]
+    monkeypatch.setattr(calibration, "FORMAL_TRAIN_START", formal_dates[0])
+    monkeypatch.setattr(calibration, "FORMAL_TRAIN_END", formal_dates[-1])
+    monkeypatch.setattr(calibration, "FORMAL_TRAIN_DATES", len(formal_dates))
+    monkeypatch.setattr(
+        calibration,
+        "FORMAL_TRAIN_DATE_DIGEST",
+        hashlib.sha256("\n".join(formal_dates).encode()).hexdigest(),
+        raising=False,
+    )
+    changed_dates = [formal_dates[0], "2024-09-02x", formal_dates[2], formal_dates[-1]]
+
+    with pytest.raises(ValueError, match="formal training calendar"):
+        calibration.validate_training_dates(changed_dates, formal_dates[-1])
+
+
 def test_calibration_rejects_labels_that_panel_packing_would_coerce_to_nan():
     from scripts.calibrate_placebo import validate_training_labels
 
@@ -909,6 +1015,190 @@ def test_threshold_config_rejects_any_nonformal_training_window(
         )
 
     assert path.read_text(encoding="utf-8") == original
+
+
+def test_run_calibration_replays_small_event_libraries_and_writes_idempotent_outputs(
+    tmp_path, monkeypatch
+):
+    from helix.config import Config
+    from helix.eval.placebo import metric_quantiles
+    calibration, dates, kwargs, outputs = _small_calibration_case(tmp_path, monkeypatch)
+
+    calibration.run_calibration(**kwargs)
+
+    distribution_path, screening_path, _, config_path = outputs
+    assert all(path.exists() for path in outputs)
+    distribution = pd.read_parquet(distribution_path)
+    screening = pd.read_parquet(screening_path)
+    assert len(distribution) == 5
+    assert distribution["seed"].eq(7).all()
+    assert distribution["train_start"].eq(dates[0]).all()
+    assert distribution["train_end"].eq(dates[-1]).all()
+    assert distribution["n_train_dates"].eq(len(dates)).all()
+    assert distribution["formal_factor_count"].eq(1).all()
+    assert screening["scope"].value_counts().to_dict() == {
+        "formal": 1,
+        "argus_n40": 1,
+        "argus_multi": 1,
+    }
+    expected = metric_quantiles(distribution).set_index("metric")["p99"]
+    threshold = Config.load(config_path).factor_admission.placebo_threshold
+    assert threshold is not None
+    assert threshold.ic_mean == expected["ic_mean"]
+    assert threshold.icir == expected["icir"]
+    assert threshold.gini == expected["gini"]
+
+    first_contents = {path: path.read_bytes() for path in outputs}
+    calibration.run_calibration(**kwargs)
+    assert {path: path.read_bytes() for path in outputs} == first_contents
+
+
+def test_run_calibration_staging_failure_leaves_all_final_targets_unchanged(
+    tmp_path, monkeypatch
+):
+    calibration, _, kwargs, outputs = _small_calibration_case(tmp_path, monkeypatch)
+    before_contents = {
+        path: path.read_bytes() if path.exists() else None for path in outputs
+    }
+    before_names = set(tmp_path.iterdir())
+    real_to_parquet = pd.DataFrame.to_parquet
+    calls = 0
+
+    def fail_second_staging_write(self, path, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected staging failure")
+        return real_to_parquet(self, path, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", fail_second_staging_write)
+
+    with pytest.raises(RuntimeError, match="injected staging failure"):
+        calibration.run_calibration(**kwargs)
+
+    assert {
+        path: path.read_bytes() if path.exists() else None for path in outputs
+    } == before_contents
+    assert set(tmp_path.iterdir()) == before_names
+
+
+def test_threshold_config_uses_same_directory_atomic_replace(tmp_path, monkeypatch):
+    import os
+    from pathlib import Path
+
+    import scripts.calibrate_placebo as calibration
+
+    path = tmp_path / "config.yaml"
+    path.write_text("gp:\n  population: 321\n", encoding="utf-8")
+    replacements = []
+    real_replace = os.replace
+
+    def recording_replace(source, destination):
+        replacements.append((Path(source), Path(destination)))
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", recording_replace)
+
+    calibration.write_threshold_config(
+        path,
+        _screening_quantiles(),
+        train_start="2022-01-04",
+        train_end="2024-09-04",
+    )
+
+    assert len(replacements) == 1
+    staged, destination = replacements[0]
+    assert staged != destination
+    assert staged.parent == destination.parent == tmp_path
+    assert destination == path
+    assert not staged.exists()
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("distribution_path", "screening_path"),
+        ("distribution_path", "report_path"),
+        ("screening_path", "report_path"),
+        ("distribution_path", "input_path"),
+        ("screening_path", "formal_library_path"),
+        ("report_path", "multi_library_path"),
+        ("write_config_path", "input_path"),
+        ("write_config_path", "n40_library_path"),
+        ("write_config_path", "distribution_path"),
+        ("write_config_path", "report_path"),
+    ],
+)
+def test_run_calibration_rejects_path_collisions_before_loading_libraries(
+    tmp_path, monkeypatch, left, right
+):
+    import scripts.calibrate_placebo as calibration
+
+    paths = {
+        "input_path": tmp_path / "input.parquet",
+        "formal_library_path": tmp_path / "formal.json",
+        "n40_library_path": tmp_path / "n40.json",
+        "multi_library_path": tmp_path / "multi.json",
+        "distribution_path": tmp_path / "distribution.parquet",
+        "screening_path": tmp_path / "screening.parquet",
+        "report_path": tmp_path / "report.md",
+        "write_config_path": tmp_path / "config.yaml",
+    }
+    paths[left] = paths[right]
+    monkeypatch.setattr(
+        calibration,
+        "_load_library",
+        lambda *_args, **_kwargs: pytest.fail("library load happened before preflight"),
+    )
+
+    with pytest.raises(ValueError, match="path collision"):
+        calibration.run_calibration(
+            **paths,
+            train_end="2024-09-04",
+            n_permutations=2,
+            min_samples=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("argument", "invalid"),
+    [
+        ("n_permutations", 0),
+        ("n_permutations", -1),
+        ("n_permutations", True),
+        ("n_permutations", 1.5),
+        ("min_samples", 0),
+        ("min_samples", -1),
+        ("min_samples", True),
+        ("min_samples", 1.5),
+    ],
+)
+def test_run_calibration_rejects_invalid_counts_before_loading_libraries(
+    tmp_path, monkeypatch, argument, invalid
+):
+    import scripts.calibrate_placebo as calibration
+
+    monkeypatch.setattr(
+        calibration,
+        "_load_library",
+        lambda *_args, **_kwargs: pytest.fail("library load happened before validation"),
+    )
+    kwargs = {
+        "input_path": tmp_path / "input.parquet",
+        "formal_library_path": tmp_path / "formal.json",
+        "n40_library_path": tmp_path / "n40.json",
+        "multi_library_path": tmp_path / "multi.json",
+        "train_end": "2024-09-04",
+        "n_permutations": 2,
+        "min_samples": 1,
+        "distribution_path": tmp_path / "distribution.parquet",
+        "screening_path": tmp_path / "screening.parquet",
+        "report_path": tmp_path / "report.md",
+    }
+    kwargs[argument] = invalid
+
+    with pytest.raises(ValueError, match="positive integer"):
+        calibration.run_calibration(**kwargs)
 
 
 def test_formal_screening_uses_joint_admission_and_eviction_advice():

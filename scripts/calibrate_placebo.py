@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
 import re
+import tempfile
 from collections.abc import Mapping, Sequence
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +31,8 @@ from helix.gp.library import FactorLibrary, compute_factors, load_factors
 FORMAL_TRAIN_END = "2024-09-04"
 FORMAL_TRAIN_START = "2022-01-04"
 FORMAL_TRAIN_DATES = 649
+# SHA-256 of newline-joined sorted unique dates from the filtered formal input window.
+FORMAL_TRAIN_DATE_DIGEST = "df8186eafc50efa3e7ae9432e6e6327a333f7050b677f130838a17b03571e381"
 TARGET = "label_d2_hit_8pct"
 
 DEFAULT_INPUT = Path("data/raw/argus_quant_working.parquet")
@@ -91,6 +97,9 @@ def validate_training_dates(dates: Sequence[object], train_end: str) -> np.ndarr
             "formal training window must contain exactly "
             f"{FORMAL_TRAIN_DATES} dates from {FORMAL_TRAIN_START} through {cutoff}"
         )
+    digest = hashlib.sha256("\n".join(unique_dates).encode()).hexdigest()
+    if digest != FORMAL_TRAIN_DATE_DIGEST:
+        raise ValueError("formal training calendar does not match the approved date sequence")
     return unique_dates
 
 
@@ -393,10 +402,24 @@ def write_threshold_config(
     train_start: str,
     train_end: str,
 ) -> None:
-    """Append or replace only the delimited calibrated-threshold YAML block."""
+    """Atomically append or replace the delimited calibrated-threshold YAML block."""
     config_path = Path(path)
     if not config_path.exists():
         raise FileNotFoundError(f"config not found: {config_path}")
+    original = config_path.read_text(encoding="utf-8")
+    candidate = _threshold_config_candidate(
+        original, quantiles, train_start, train_end
+    )
+    _atomic_write_text(config_path, candidate)
+
+
+def _threshold_config_candidate(
+    original: str,
+    quantiles: pd.DataFrame,
+    train_start: str,
+    train_end: str,
+) -> str:
+    """Build and validate complete config text without mutating the filesystem."""
     if train_start != FORMAL_TRAIN_START:
         raise ValueError(f"train_start must equal formal start {FORMAL_TRAIN_START}")
     validate_train_end(train_end)
@@ -408,7 +431,6 @@ def write_threshold_config(
         train_end=train_end,
     )
     block = _threshold_block(values, train_start, train_end)
-    original = config_path.read_text(encoding="utf-8")
     begin_count = original.count(BEGIN_MARKER)
     end_count = original.count(END_MARKER)
     if begin_count != end_count or begin_count > 1:
@@ -437,7 +459,30 @@ def write_threshold_config(
     configured = Config.model_validate(raw).factor_admission.placebo_threshold
     if configured is None or configured.model_dump() != threshold.model_dump():
         raise ValueError("generated placebo threshold configuration failed validation")
-    config_path.write_text(candidate, encoding="utf-8")
+    return candidate
+
+
+def _temporary_path(target: Path) -> Path:
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+    )
+    os.close(descriptor)
+    return Path(name)
+
+
+def _set_staged_mode(staged: Path, target: Path) -> None:
+    mode = target.stat().st_mode & 0o7777 if target.exists() else 0o644
+    os.chmod(staged, mode)
+
+
+def _atomic_write_text(target: Path, text: str) -> None:
+    staged = _temporary_path(target)
+    try:
+        staged.write_text(text, encoding="utf-8")
+        _set_staged_mode(staged, target)
+        os.replace(staged, target)
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def _load_library(path: Path, scope: str, require_factors: bool = True) -> FactorLibrary:
@@ -447,6 +492,123 @@ def _load_library(path: Path, scope: str, require_factors: bool = True) -> Facto
     if require_factors and not library.factors:
         raise ValueError(f"{scope} factor library is empty")
     return library
+
+
+def _positive_integer(value: int, name: str) -> int:
+    if not isinstance(value, Integral) or isinstance(value, (bool, np.bool_)) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return int(value)
+
+
+def _preflight_paths(
+    *,
+    input_path: str | Path,
+    formal_library_path: str | Path,
+    n40_library_path: str | Path,
+    multi_library_path: str | Path,
+    distribution_path: str | Path,
+    screening_path: str | Path,
+    report_path: str | Path,
+    write_config_path: str | Path | None,
+) -> dict[str, Path | None]:
+    resolved: dict[str, Path | None] = {
+        "input_path": Path(input_path).expanduser().resolve(),
+        "formal_library_path": Path(formal_library_path).expanduser().resolve(),
+        "n40_library_path": Path(n40_library_path).expanduser().resolve(),
+        "multi_library_path": Path(multi_library_path).expanduser().resolve(),
+        "distribution_path": Path(distribution_path).expanduser().resolve(),
+        "screening_path": Path(screening_path).expanduser().resolve(),
+        "report_path": Path(report_path).expanduser().resolve(),
+        "write_config_path": (
+            None
+            if write_config_path is None
+            else Path(write_config_path).expanduser().resolve()
+        ),
+    }
+    inputs = {
+        name: resolved[name]
+        for name in (
+            "input_path",
+            "formal_library_path",
+            "n40_library_path",
+            "multi_library_path",
+        )
+    }
+    outputs = {
+        name: resolved[name]
+        for name in ("distribution_path", "screening_path", "report_path")
+    }
+    seen_outputs: dict[Path, str] = {}
+    for name, path in outputs.items():
+        assert path is not None
+        if path in seen_outputs:
+            raise ValueError(f"path collision: {name} equals {seen_outputs[path]}")
+        seen_outputs[path] = name
+        for input_name, input_value in inputs.items():
+            if path == input_value:
+                raise ValueError(f"path collision: {name} equals {input_name}")
+
+    config_path = resolved["write_config_path"]
+    if config_path is not None:
+        for name, path in {**inputs, **outputs}.items():
+            if config_path == path:
+                raise ValueError(f"path collision: write_config_path equals {name}")
+    return resolved
+
+
+def _preflight_publication(
+    distribution_path: Path,
+    screening_path: Path,
+    report_path: Path,
+    write_config_path: Path | None,
+) -> None:
+    for target in (distribution_path, screening_path, report_path):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and not target.is_file():
+            raise ValueError(f"output target is not a file: {target}")
+    if write_config_path is not None:
+        if not write_config_path.is_file():
+            raise FileNotFoundError(f"config not found: {write_config_path}")
+        if not write_config_path.parent.is_dir():
+            raise ValueError(f"config parent is not a directory: {write_config_path.parent}")
+
+
+def _publish_calibration_outputs(
+    distribution: pd.DataFrame,
+    screening: pd.DataFrame,
+    report: str,
+    distribution_path: Path,
+    screening_path: Path,
+    report_path: Path,
+    config_candidate: tuple[Path, str] | None,
+) -> None:
+    staged: list[tuple[Path, Path]] = []
+    try:
+        staged_distribution = _temporary_path(distribution_path)
+        staged.append((staged_distribution, distribution_path))
+        distribution.to_parquet(staged_distribution, index=False)
+
+        staged_screening = _temporary_path(screening_path)
+        staged.append((staged_screening, screening_path))
+        screening.to_parquet(staged_screening, index=False)
+
+        staged_report = _temporary_path(report_path)
+        staged.append((staged_report, report_path))
+        staged_report.write_text(report, encoding="utf-8")
+
+        if config_candidate is not None:
+            config_path, config_text = config_candidate
+            staged_config = _temporary_path(config_path)
+            staged.append((staged_config, config_path))
+            staged_config.write_text(config_text, encoding="utf-8")
+
+        for staged_path, target_path in staged:
+            _set_staged_mode(staged_path, target_path)
+        for staged_path, target_path in staged:
+            os.replace(staged_path, target_path)
+    finally:
+        for staged_path, _ in staged:
+            staged_path.unlink(missing_ok=True)
 
 
 def run_calibration(
@@ -466,10 +628,40 @@ def run_calibration(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Replay all libraries on filtered data and write calibration artifacts."""
     cutoff = validate_train_end(train_end)
-    input_path = Path(input_path)
-    formal_library_path = Path(formal_library_path)
-    n40_library_path = Path(n40_library_path)
-    multi_library_path = Path(multi_library_path)
+    n_permutations = _positive_integer(n_permutations, "n_permutations")
+    min_samples = _positive_integer(min_samples, "min_samples")
+    paths = _preflight_paths(
+        input_path=input_path,
+        formal_library_path=formal_library_path,
+        n40_library_path=n40_library_path,
+        multi_library_path=multi_library_path,
+        distribution_path=distribution_path,
+        screening_path=screening_path,
+        report_path=report_path,
+        write_config_path=write_config_path,
+    )
+    input_path = paths["input_path"]
+    formal_library_path = paths["formal_library_path"]
+    n40_library_path = paths["n40_library_path"]
+    multi_library_path = paths["multi_library_path"]
+    distribution_path = paths["distribution_path"]
+    screening_path = paths["screening_path"]
+    report_path = paths["report_path"]
+    write_config_path = paths["write_config_path"]
+    assert isinstance(input_path, Path)
+    assert isinstance(formal_library_path, Path)
+    assert isinstance(n40_library_path, Path)
+    assert isinstance(multi_library_path, Path)
+    assert isinstance(distribution_path, Path)
+    assert isinstance(screening_path, Path)
+    assert isinstance(report_path, Path)
+    assert write_config_path is None or isinstance(write_config_path, Path)
+    _preflight_publication(
+        distribution_path,
+        screening_path,
+        report_path,
+        write_config_path,
+    )
 
     formal_library = _load_library(formal_library_path, "formal")
     n40_library = _load_library(n40_library_path, "argus_n40")
@@ -520,7 +712,7 @@ def run_calibration(
     if formal_factor_count != len(formal_names):
         raise AssertionError("formal factor metadata does not match replayed formal values")
 
-    train_start = str(panel_dates.min())
+    train_start = str(panel_dates[0])
     n_train_dates = int(panel_dates.size)
     distribution = distribution.assign(
         seed=seed,
@@ -545,17 +737,24 @@ def run_calibration(
         "supplemental_factor_count": len(n40_names) + len(multi_names),
     }
     report = render_report(distribution, quantiles, screening, metadata)
-
-    distribution_path = Path(distribution_path)
-    screening_path = Path(screening_path)
-    report_path = Path(report_path)
-    for output_path in (distribution_path, screening_path, report_path):
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-    distribution.to_parquet(distribution_path, index=False)
-    screening.to_parquet(screening_path, index=False)
-    report_path.write_text(report, encoding="utf-8")
+    config_candidate = None
     if write_config_path is not None:
-        write_threshold_config(write_config_path, quantiles, train_start, cutoff)
+        config_text = _threshold_config_candidate(
+            write_config_path.read_text(encoding="utf-8"),
+            quantiles,
+            train_start,
+            cutoff,
+        )
+        config_candidate = (write_config_path, config_text)
+    _publish_calibration_outputs(
+        distribution,
+        screening,
+        report,
+        distribution_path,
+        screening_path,
+        report_path,
+        config_candidate,
+    )
     return distribution, quantiles, screening
 
 
