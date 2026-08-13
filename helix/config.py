@@ -10,8 +10,9 @@ import os
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "default.yaml"
@@ -124,6 +125,38 @@ class BacktestConfig(BaseModel):
     slippage_bps: float = Field(10.0, ge=0)                # 单边，叠加在法定费率之上
 
 
+class PlaceboThresholdConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ic_mean: float = Field(ge=0)
+    icir: float = Field(ge=0)
+    gini: float = Field(ge=0)
+    quantile: float = Field(0.99, gt=0, lt=1)
+    train_start: str
+    train_end: str
+
+    @field_validator("ic_mean", "icir", "gini")
+    @classmethod
+    def _finite_metric(cls, v: float) -> float:
+        if not np.isfinite(v):
+            raise ValueError("placebo threshold metrics must be finite")
+        return v
+
+    @model_validator(mode="after")
+    def _valid_training_range(self) -> PlaceboThresholdConfig:
+        if not self.train_start or not self.train_end:
+            raise ValueError("placebo threshold training dates must be non-empty")
+        if self.train_start > self.train_end:
+            raise ValueError("placebo threshold train_start must be <= train_end")
+        return self
+
+
+class FactorAdmissionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    placebo_threshold: PlaceboThresholdConfig | None = None
+
+
 class Config(BaseModel):
     data: DataConfig = DataConfig()
     universe: UniverseConfig = UniverseConfig()
@@ -132,6 +165,7 @@ class Config(BaseModel):
     gp: GPConfig = GPConfig()
     dl: DLConfig = DLConfig()
     backtest: BacktestConfig = BacktestConfig()
+    factor_admission: FactorAdmissionConfig = FactorAdmissionConfig()
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> Config:
