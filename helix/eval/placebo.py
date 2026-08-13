@@ -36,6 +36,16 @@ def _binary_array(values: np.ndarray, name: str) -> np.ndarray:
     return array
 
 
+def _binary_or_nan_array(values: np.ndarray, name: str) -> np.ndarray:
+    try:
+        array = np.asarray(values, dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must contain only binary values or NaN") from error
+    if not (np.isnan(array) | np.isin(array, (0.0, 1.0))).all():
+        raise ValueError(f"{name} must contain only binary values or NaN")
+    return array
+
+
 def permute_binary_labels(
     labels: np.ndarray,
     n_permutations: int,
@@ -67,7 +77,7 @@ def iter_cross_sectional_permutations(
     rng: np.random.Generator,
 ) -> Iterator[tuple[int, np.ndarray, np.ndarray]]:
     """Yield within-date permutations over observable binary labels."""
-    label_array = np.asarray(labels)
+    label_array = _binary_or_nan_array(labels, "labels")
     mask_array = np.asarray(mask, dtype=bool)
     if label_array.ndim != 2 or mask_array.ndim != 2:
         raise ValueError("labels and mask must be two-dimensional")

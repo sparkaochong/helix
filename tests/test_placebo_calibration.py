@@ -122,10 +122,9 @@ def test_permutations_are_reproducible_by_seed():
 
 
 def test_vectorized_placebo_daily_metrics_match_existing_daily_metrics():
-    from helix.eval.placebo import permute_binary_labels, placebo_daily_metrics
-
     from helix.eval.ic import daily_ic
     from helix.eval.metrics import daily_gini
+    from helix.eval.placebo import permute_binary_labels, placebo_daily_metrics
 
     factors = np.array(
         [
@@ -164,13 +163,12 @@ def test_vectorized_placebo_daily_metrics_match_existing_daily_metrics():
 
 
 def test_placebo_distribution_matches_full_cycle_metrics_and_formal_factor_maximum():
+    from helix.eval.ic import daily_ic
+    from helix.eval.metrics import daily_gini
     from helix.eval.placebo import (
         iter_cross_sectional_permutations,
         placebo_distribution,
     )
-
-    from helix.eval.ic import daily_ic
-    from helix.eval.metrics import daily_gini
 
     factors, labels, mask = _two_date_factor_inputs()
     n_permutations = 6
@@ -229,10 +227,9 @@ def test_placebo_distribution_matches_full_cycle_metrics_and_formal_factor_maxim
 
 
 def test_factor_metrics_match_existing_signed_and_absolute_metric_summaries():
-    from helix.eval.placebo import factor_metrics
-
     from helix.eval.ic import daily_ic, summarize_ic
     from helix.eval.metrics import daily_gini, summarize_daily
+    from helix.eval.placebo import factor_metrics
 
     factors, labels, mask = _two_date_factor_inputs()
     factor_names = ["ascending", "mixed"]
@@ -424,8 +421,9 @@ def test_training_loader_rejects_a_missing_requested_column(tmp_path):
 
 
 def test_calibrate_scopes_isolates_formal_null_from_both_supplemental_scopes():
-    from helix.eval.placebo import metric_quantiles, placebo_distribution
     from scripts.calibrate_placebo import calibrate_scopes
+
+    from helix.eval.placebo import metric_quantiles, placebo_distribution
 
     formal_values, labels, mask = _two_date_factor_inputs()
     formal_names = ["formal_a", "formal_b"]
@@ -726,6 +724,24 @@ def test_cross_sectional_permutations_reject_a_single_class_date():
             iter_cross_sectional_permutations(
                 labels,
                 np.ones_like(labels, dtype=bool),
+                n_permutations=10,
+                rng=np.random.default_rng(2),
+            )
+        )
+
+
+@pytest.mark.parametrize("invalid_label", [np.inf, -np.inf, 0.5])
+def test_cross_sectional_permutations_reject_invalid_masked_labels(invalid_label):
+    from helix.eval.placebo import iter_cross_sectional_permutations
+
+    labels = np.array([[0.0, 1.0, invalid_label]])
+    mask = np.array([[True, True, False]])
+
+    with pytest.raises(ValueError):
+        list(
+            iter_cross_sectional_permutations(
+                labels,
+                mask,
                 n_permutations=10,
                 rng=np.random.default_rng(2),
             )
