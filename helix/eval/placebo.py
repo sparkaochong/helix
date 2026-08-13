@@ -15,6 +15,8 @@ from .metrics import daily_gini, summarize_daily
 QUANTILES = {"p95": 0.95, "p99": 0.99, "p999": 0.999}
 METRICS = ("ic_mean", "icir", "gini")
 
+# Each float64 ranked-label input is capped near 16 MiB when P * N permits it.
+_MAX_RANKED_LABEL_ELEMENTS = 2_000_000
 _LEVEL_LABELS = np.array(
     ["低于随机水平", "超 p95", "超 p99", "超 p99.9"], dtype=object
 )
@@ -127,46 +129,66 @@ def placebo_daily_metrics(
     sample_counts = finite.sum(axis=1).astype(np.float64)
     positive_counts = labels_float @ finite.T
     negative_counts = sample_counts[None, :] - positive_counts
-    usable = (
+    gini_usable = (
         (sample_counts[None, :] >= minimum)
         & (positive_counts > 0)
         & (negative_counts > 0)
     )
 
-    label_rank_input = np.where(
-        finite[None, :, :], label_array[:, None, :], np.nan
-    ).reshape(n_permutations * n_factors, n_samples)
-    ranked_labels = cs_rank(label_rank_input).reshape(
-        n_permutations, n_factors, n_samples
-    )
-
     ranked_factor_values = np.nan_to_num(ranked_factors)
-    ranked_label_values = np.nan_to_num(ranked_labels)
     factor_sums = ranked_factor_values.sum(axis=1)
     factor_squares = (ranked_factor_values * ranked_factor_values).sum(axis=1)
-    label_sums = ranked_label_values.sum(axis=2)
-    label_squares = (ranked_label_values * ranked_label_values).sum(axis=2)
-    cross_products = (
-        ranked_label_values * ranked_factor_values[None, :, :]
-    ).sum(axis=2)
-
-    covariance = sample_counts[None, :] * cross_products - factor_sums * label_sums
     factor_variance = sample_counts * factor_squares - factor_sums * factor_sums
-    label_variance = sample_counts[None, :] * label_squares - label_sums * label_sums
-    denominator = np.sqrt(
-        np.maximum(factor_variance[None, :], 0.0)
-        * np.maximum(label_variance, 0.0)
+
+    ic = np.full((n_permutations, n_factors), np.nan, dtype=np.float64)
+    ranked_label_elements_per_factor = max(n_permutations * n_samples, 1)
+    factors_per_chunk = max(
+        _MAX_RANKED_LABEL_ELEMENTS // ranked_label_elements_per_factor, 1
     )
-    with np.errstate(invalid="ignore", divide="ignore"):
-        ic = np.where(denominator > 0, covariance / denominator, np.nan)
-    ic = np.where(usable, ic, np.nan)
+    for factor_start in range(0, n_factors, factors_per_chunk):
+        factor_stop = min(factor_start + factors_per_chunk, n_factors)
+        factor_slice = slice(factor_start, factor_stop)
+        chunk_size = factor_stop - factor_start
+        chunk_finite = finite[factor_slice]
+        ranked_labels = cs_rank(
+            np.where(
+                chunk_finite[None, :, :], label_array[:, None, :], np.nan
+            ).reshape(n_permutations * chunk_size, n_samples)
+        ).reshape(n_permutations, chunk_size, n_samples)
+        ranked_label_values = np.nan_to_num(ranked_labels, copy=False)
+
+        label_sums = ranked_label_values.sum(axis=2)
+        label_squares = (ranked_label_values * ranked_label_values).sum(axis=2)
+        cross_products = (
+            ranked_label_values
+            * ranked_factor_values[None, factor_slice, :]
+        ).sum(axis=2)
+        covariance = (
+            sample_counts[None, factor_slice] * cross_products
+            - factor_sums[None, factor_slice] * label_sums
+        )
+        label_variance = (
+            sample_counts[None, factor_slice] * label_squares
+            - label_sums * label_sums
+        )
+        denominator = np.sqrt(
+            np.maximum(factor_variance[None, factor_slice], 0.0)
+            * np.maximum(label_variance, 0.0)
+        )
+        with np.errstate(invalid="ignore", divide="ignore"):
+            chunk_ic = np.where(denominator > 0, covariance / denominator, np.nan)
+        ic[:, factor_slice] = np.where(
+            sample_counts[None, factor_slice] >= minimum,
+            chunk_ic,
+            np.nan,
+        )
 
     positive_rank_sums = labels_float @ ordinal_ranks.T
     auc_denominator = positive_counts * negative_counts
     auc = (
         positive_rank_sums - positive_counts * (positive_counts + 1.0) / 2.0
     ) / np.where(auc_denominator > 0, auc_denominator, 1.0)
-    gini = np.where(usable, 2.0 * auc - 1.0, np.nan)
+    gini = np.where(gini_usable, 2.0 * auc - 1.0, np.nan)
     return ic, gini
 
 

@@ -162,6 +162,105 @@ def test_vectorized_placebo_daily_metrics_match_existing_daily_metrics():
     np.testing.assert_allclose(actual_gini, expected_gini, rtol=0.0, atol=1e-12)
 
 
+def test_placebo_daily_metrics_match_canonical_metrics_with_factor_missingness():
+    from helix.eval.ic import daily_ic
+    from helix.eval.metrics import daily_gini
+    from helix.eval.placebo import placebo_daily_metrics
+
+    factors = np.array(
+        [
+            [4.0, np.nan],
+            [1.0, 4.0],
+            [3.0, 1.0],
+            [2.0, 3.0],
+            [np.nan, 2.0],
+        ]
+    )
+    permutations = np.array(
+        [
+            [1, 1, 1, 1, 0],
+            [0, 1, 0, 1, 1],
+            [0, 0, 0, 1, 1],
+        ],
+        dtype=bool,
+    )
+
+    actual_ic, actual_gini = placebo_daily_metrics(
+        factors, permutations, min_samples=1
+    )
+    expected_ic = np.empty_like(actual_ic)
+    expected_gini = np.empty_like(actual_gini)
+    daily_mask = np.ones((1, factors.shape[0]), dtype=bool)
+    for permutation_index, permuted_labels in enumerate(permutations):
+        target = permuted_labels.astype(float)[None, :]
+        for factor_index in range(factors.shape[1]):
+            factor = factors[:, factor_index][None, :]
+            expected_ic[permutation_index, factor_index] = daily_ic(
+                factor, target, daily_mask, min_samples=1
+            )[0]
+            expected_gini[permutation_index, factor_index] = daily_gini(
+                factor, target, daily_mask, min_samples=1
+            )[0]
+
+    assert np.isfinite(expected_ic[0, 0])
+    assert np.isnan(expected_gini[0, 0])
+    np.testing.assert_allclose(
+        actual_ic, expected_ic, rtol=0.0, atol=1e-12, equal_nan=True
+    )
+    np.testing.assert_allclose(
+        actual_gini, expected_gini, rtol=0.0, atol=1e-12, equal_nan=True
+    )
+
+
+def test_placebo_daily_metrics_bounds_ranked_label_workspaces(monkeypatch):
+    import helix.eval.placebo as placebo
+    from helix.eval.ic import daily_ic
+    from helix.eval.metrics import daily_gini
+
+    n_permutations, n_samples, n_factors = 5, 8, 9
+    rng = np.random.default_rng(31)
+    factors = rng.integers(-4, 5, size=(n_samples, n_factors)).astype(float)
+    base_labels = np.array([1, 1, 1, 0, 0, 0, 0, 0], dtype=bool)
+    permutations = np.vstack(
+        [np.roll(base_labels, shift) for shift in range(n_permutations)]
+    )
+    rank_element_budget = 80
+    rank_input_sizes = []
+    canonical_cs_rank = placebo.cs_rank
+
+    def recording_cs_rank(values):
+        rank_input_sizes.append(values.size)
+        return canonical_cs_rank(values)
+
+    monkeypatch.setattr(
+        placebo, "_MAX_RANKED_LABEL_ELEMENTS", rank_element_budget, raising=False
+    )
+    monkeypatch.setattr(placebo, "cs_rank", recording_cs_rank)
+
+    actual_ic, actual_gini = placebo.placebo_daily_metrics(
+        factors, permutations, min_samples=1
+    )
+    expected_ic = np.empty_like(actual_ic)
+    expected_gini = np.empty_like(actual_gini)
+    daily_mask = np.ones((1, n_samples), dtype=bool)
+    for permutation_index, permuted_labels in enumerate(permutations):
+        target = permuted_labels.astype(float)[None, :]
+        for factor_index in range(n_factors):
+            factor = factors[:, factor_index][None, :]
+            expected_ic[permutation_index, factor_index] = daily_ic(
+                factor, target, daily_mask, min_samples=1
+            )[0]
+            expected_gini[permutation_index, factor_index] = daily_gini(
+                factor, target, daily_mask, min_samples=1
+            )[0]
+
+    assert actual_ic.shape == (n_permutations, n_factors)
+    assert actual_gini.shape == (n_permutations, n_factors)
+    assert max(rank_input_sizes) <= rank_element_budget
+    np.testing.assert_allclose(actual_ic, expected_ic, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(actual_gini, expected_gini, rtol=0.0, atol=1e-12)
+
+
 def test_placebo_distribution_matches_full_cycle_metrics_and_formal_factor_maximum():
     from helix.eval.ic import daily_ic
     from helix.eval.metrics import daily_gini
