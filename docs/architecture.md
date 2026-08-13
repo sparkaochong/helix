@@ -108,7 +108,9 @@ touched  = high_hfq[D+2] >= target
 | 3 | D+1 或 D+2 停牌 → 未定义 | 结果不可观测。填 0 会低估命中率 |
 | 4 | 不在 D0 股票池 → 未定义 | — |
 
-产物 `LabelSet`：`y` / `valid` / `entry_price` / `target_price` / `exit_price`（D+2 收盘，供未触及退出用），全部 `(T, N)` 且按 D0 行对齐。
+产物 `LabelSet`：`y` / `valid` / `touch_tradable` / `entry_price` / `target_price` /
+`exit_price`（D+2 收盘，供未触及退出用），全部 `(T, N)` 且按 D0 行对齐。
+`touch_tradable` 对下游只暴露给回测成交校验，不参与因子 population 或候选池构建。
 
 `tests/test_labels.py` 逐条钉死这四条。
 
@@ -221,6 +223,11 @@ factors (T,N,K) ──截面 z-score（按日，population = D0 股票池）─�
 
 每折一个模型：训练用该折 train 行，早停看 valid 行，只给 test 行打分。拼接各折 test 预测 → 每个点都出自没见过该日期的模型。
 
+训练/验证索引用 `labels.valid`，因为损失与早停指标只能消费可观测标签；test 打分索引则用
+D0 `universe` 加当日因子覆盖率。两者必须分开：如果 test 也用 `labels.valid`，预测矩阵
+里的 NaN 分布本身就会泄露 D+1/D+2 是否可交易，回测即使显式传入 `universe` 也会在
+`isfinite(predictions)` 处再次把未来不可交易股票删掉。
+
 | 决策 | 值 | 理由 |
 |---|---|---|
 | 损失 | `BCEWithLogitsLoss(pos_weight)` | `pos_weight = n_neg/n_pos`，**上限 20**。不封顶时 2% 正样本率给出权重 49，模型去追异常值 |
@@ -269,10 +276,13 @@ factors (T,N,K) ──截面 z-score（按日，population = D0 股票池）─�
 
 **持仓规模** `top_k = 4`（`configs/default.yaml`、`argus_neutral.yaml`、pydantic 默认值三处一致）。资金按 `overlap = touch_offset − entry_offset + 1 = 2` 拆分（新一批每天开仓，上一批还没了结）。
 
-> **两条已知差距，都未处理：**
->
-> 1. **替补深度无上限。** `run_backtest` 把不可成交的名字打成 `-inf` 再取排序前 `top_k`，等价于沿整个排名无限往下顺延。`scripts/backtest_argus.py` 用 `--signal-k` 把替补限制在一张预定候选表内（TOP4 配 TOP5）。深度越深替补质量越差，无上限是偏乐观的一侧。
-> 2. **候选集用到了 D+2 才知道的信息。** `usable = labels.valid & ...`，而 `labels.valid` 含 `touch_tradable`（D+2 是否停牌）这一条。对标签本身这是对的——结果确实不可观测；但用它当**选股候选集**，等于让回测自动避开事后 D+2 停牌的票，而这在 D+1 早盘下单时不可知。影响量级未测。
+**候选与成交严格分层**：`run_backtest` 先用 D0 `universe` 和当时已有的预测固定
+`top_k` 名单，再对名单内股票应用 `labels.valid` / `touch_tradable` 成交校验。D+1
+涨停或 D+2 停牌可以让已选股票不计入成交，但不会从更深排名补位。`lift_at_k` 也按
+同一顺序先选股；若入选股票的结果不可观测，该日指标为 NaN，而不是偷换成下一名。
+标签的 `valid` / `y` 生成口径保持不变，因此停牌结果仍是 NaN、不会被填成 0。
+未成交槽位的资金留在现金；组合收益按 `sum(已成交净收益) / top_k / overlap` 计算，
+全未成交日保留为 0 收益，不删除交易日或把资金集中到剩余成交股票。
 
 ---
 
@@ -337,9 +347,10 @@ data/
 5. GP 搜索只看 `search_window()`。
 6. 所有指标按日算完再平均，不跨日池化。
 7. 截面标准化的 population 是 `universe`，不是 `labels.valid`。
-8. 槽位面板上时序算子是硬断言拒绝，不是约定。
-9. 特征集里不能出现 `label*` 前缀列，硬断言。
-10. `embargo_days ≥ touch_offset + 1`，配置加载时校验。
+8. D0 候选排名只用 `universe`；未来可交易性只能在固定名单后的成交校验中使用。
+9. 槽位面板上时序算子是硬断言拒绝，不是约定。
+10. 特征集里不能出现 `label*` 前缀列，硬断言。
+11. `embargo_days ≥ touch_offset + 1`，配置加载时校验。
 
 ---
 

@@ -77,7 +77,7 @@ L6 切分层      helix/splits.py    带 embargo 的滚动切分（被 L3/L4/L5 
 | 层 | 入口签名 | 输出契约 | 不变量 |
 |---|---|---|---|
 | L0→L1 | `Panel.f64(name) -> (T,N) float64` | 行=交易日，列=股票 | 缺失为 NaN，不填 0 |
-| L1 | `build_touch_label(panel, universe, cfg) -> LabelSet` | `y/valid/entry_price/target_price/exit_price`，均 `(T,N)` 且按 D0 对齐 | 不可观测 → NaN，**永不为 0** |
+| L1 | `build_touch_label(panel, universe, cfg) -> LabelSet` | `y/valid/touch_tradable/entry_price/target_price/exit_price`，均 `(T,N)` 且按 D0 对齐 | 不可观测 → NaN，**永不为 0** |
 | L0→L3(B) | `load_event_panel(...) -> EventPanel` | `(T, N_max)` 槽位网格 + `occupied` 掩码 | 槽位≠股票；时序算子硬断言拒绝 |
 | L2 | `operators.*(x, window) -> (T,N)` | 严格后视 | `lead` 不入算子集 |
 | L3 | `score_values(values, ctx, n_nodes) -> FactorScore` | `fitness/sign/fit_gini/fit_ir/sel_gini/coverage/n_nodes` | 非法返回 `INVALID = -1e9`，不返回 NaN 混入排序 |
@@ -86,9 +86,13 @@ L6 切分层      helix/splits.py    带 embargo 的滚动切分（被 L3/L4/L5 
 | L5 | `daily_gini(factor, y, mask, min_samples=50) -> (T,)` | 每日一个值，NaN=不可用日 | **按日算完再平均，永不跨日池化** |
 | L5 | `daily_ic / summarize_ic(ic) -> {ic, icir, ann_icir, pos_ratio}` | 同上 | 同上 |
 | L5 | `lift_at_k(score, y, mask, k) -> float` | 每日 `precision/base` 之比再平均 | 分母 `base > 0` 才计入 |
-| L5 | `run_backtest(predictions, labels, dates, label_cfg, cfg) -> BacktestResult` | `daily` DataFrame + `summary` dict | 成本乘法记账（§6.3） |
+| L5 | `run_backtest(predictions, labels, candidate_mask, dates, label_cfg, cfg) -> BacktestResult` | `daily` DataFrame + `summary` dict | D0 排名后再做成交校验；成本乘法记账（§6.3） |
 | L6 | `walk_forward(n_dates, cfg) -> list[Fold]` | `Fold(index, train, valid, test)` | 每条缝隙插入 `embargo_days` |
 | L6 | `search_window(n_dates, cfg) -> slice(0, train_days)` | 因子发现的**唯一**可见区 | 违反即 P0 |
+
+L4 的索引掩码分成两类：train/valid 用 `label_mask = labels.valid`，test 预测用
+`prediction_mask = universe & D0因子覆盖率达标`。禁止用 `label_mask` 决定 OOS 预测是否
+生成，否则预测矩阵的 NaN 会把未来标签有效性重新带回 D0 候选池。
 
 ### 2.3 两条数据通路的边界
 
@@ -438,13 +442,14 @@ lift / 命中率 vs 基准率 / 净收益每笔 / Sharpe / 最大回撤 + 滑点
 - [ ] `assert_no_label_columns` 在所有特征选择路径上被调用
 - [ ] `assert_no_time_series` 在所有槽位面板算子集构建处被调用
 - [ ] 截面标准化的 population 是 `universe`，不是 `labels.valid`
+- [ ] OOS 预测索引用 D0 `prediction_mask`，不是 `labels.valid`
 - [ ] `Config.load` 的 embargo 校验未被绕过
 - [ ] 任何"缺失"处置是 NaN 而非 0
 - [ ] 特征计算链路上没有任何 `≥ D+1` 的数据引用
 
 **B. 隐性泄漏（更难发现的一类）**
 
-- [ ] 候选集是否用到了 D+2 才知道的信息（当前**已知违反**，见 §8 缺口 D2）
+- [ ] 候选集是否用到了 D+2 才知道的信息（必须先按 D0 `universe` 固定名单）
 - [ ] 归一化/分箱的统计量是否在全样本上计算（应仅用训练段）
 - [ ] 缺失值填充是否用了全样本均值
 - [ ] 超参是否在 test 段上选过
@@ -489,8 +494,8 @@ lift / 命中率 vs 基准率 / 净收益每笔 / Sharpe / 最大回撤 + 滑点
 | # | 缺口 | 影响方向 | 量级 | 状态 |
 |---|---|---|---|---|
 | **D1** | **排序目标与执行不对口**：`P(触及8%)` 对 D+2 收盘收益 IC = **−0.064** | 未知 | 结构性 | **未决**。换回归 `label_d2_return` 在 hold≤4 时反而更差 |
-| **D2** | 候选集用到 D+2 信息：`labels.valid` 含 `touch_tradable` | **偏乐观** | 未测 | 未处理 |
-| **D3** | 替补深度无上限：`run_backtest` 把不可成交名字打成 `-inf` 后取前 k，等价沿排名无限顺延 | **偏乐观** | 未测 | 事件表通路用 `--signal-k` 限制，面板通路未对齐 |
+| **D2** | 候选集用到 D+2 信息：`labels.valid` 含 `touch_tradable` | **偏乐观** | 未测 | **已处理**：OOS 预测和候选只用 D0 掩码，未来掩码仅在固定名单后校验 |
+| **D3** | 替补深度无上限：`run_backtest` 把不可成交名字打成 `-inf` 后取前 k，等价沿排名无限顺延 | **偏乐观** | 未测 | **已处理**：先固定 `top_k`，成交失败不向更深排名补位 |
 | **D4** | 面板通路从未跑过完整实证 | — | — | 不得用于支撑上线决策 |
 | **D5** | D+2 跌停卖不掉未建模 | **偏乐观** | 未命中组 1% 分位到 −14.4% | **Sharpe 1.35 面前最大的问号** |
 | **D6** | 无冲击成本、未按成交量约束仓位 | **偏乐观** | 未测 | 未处理 |
@@ -514,13 +519,15 @@ lift / 命中率 vs 基准率 / 净收益每笔 / Sharpe / 最大回撤 + 滑点
 5. GP 搜索只看 `search_window()`。
 6. 所有指标按日算完再平均，不跨日池化。
 7. 截面标准化的 population 是 `universe`，不是 `labels.valid`。
-8. 槽位面板上时序算子是硬断言拒绝，不是约定。
-9. 特征集里不能出现 `label*` 前缀列，硬断言。
-10. `embargo_days ≥ touch_offset + 1`，配置加载时校验。
-11. **单种子结果不构成证据**（≥3 种子且报标准差）。
-12. **没有对照验证的零不构成证据**。
-13. **G3 增量消融是唯一具有否决权的门**，G0~G2 全过不等于入库。
-14. **lift 度量排序，不度量赔率**；任何回测汇报必须同时给出净收益/笔。
+8. D0 候选排名只用 `universe`；未来可交易性只能在固定名单后的成交校验中使用。
+9. OOS 预测的生成范围由 D0 `prediction_mask` 决定，不由 `labels.valid` 决定。
+10. 槽位面板上时序算子是硬断言拒绝，不是约定。
+11. 特征集里不能出现 `label*` 前缀列，硬断言。
+12. `embargo_days ≥ touch_offset + 1`，配置加载时校验。
+13. **单种子结果不构成证据**（≥3 种子且报标准差）。
+14. **没有对照验证的零不构成证据**。
+15. **G3 增量消融是唯一具有否决权的门**，G0~G2 全过不等于入库。
+16. **lift 度量排序，不度量赔率**；任何回测汇报必须同时给出净收益/笔。
 
 ---
 

@@ -58,24 +58,30 @@ def summarize_daily(values: np.ndarray) -> dict[str, float]:
 def precision_at_k(
     score: np.ndarray, y: np.ndarray, mask: np.ndarray, k: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Per-date hit rate of the top-``k`` names, plus the per-date base rate.
+    """Per-date hit rate of the D0 top-``k`` names, plus the observable base rate.
 
-    Returns ``(precision, base_rate)``, both NaN on dates with fewer than ``k`` names.
+    ``mask`` is the point-in-time candidate pool. Ranking never consults ``y``; if a
+    selected outcome is unobservable, precision remains NaN rather than substituting a
+    deeper-ranked name. Base rate uses the observable labels inside the D0 pool.
     """
-    usable = mask & np.isfinite(score) & np.isfinite(y)
-    scores = np.where(usable, score, -np.inf)
+    candidates = mask & np.isfinite(score)
+    scores = np.where(candidates, score, -np.inf)
     n_dates = score.shape[0]
     precision = np.full(n_dates, np.nan)
     base = np.full(n_dates, np.nan)
 
-    counts = usable.sum(axis=1)
+    counts = candidates.sum(axis=1)
     order = np.argsort(-scores, axis=1, kind="stable")
     for t in range(n_dates):
+        observable = candidates[t] & np.isfinite(y[t])
+        if observable.any():
+            base[t] = float(np.mean(y[t, observable]))
         if counts[t] < k:
             continue
         picked = order[t, :k]
+        if not np.isfinite(y[t, picked]).all():
+            continue
         precision[t] = float(np.mean(y[t, picked]))
-        base[t] = float(np.mean(y[t, usable[t]]))
     return precision, base
 
 

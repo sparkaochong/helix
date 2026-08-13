@@ -134,7 +134,7 @@ def test_gp_discovers_factors_that_hold_up_out_of_sample(library, prepared, spli
 def test_walk_forward_training_and_backtest_complete(library, prepared, market, split):
     fields, _, labels = prepared
     _, values = compute_factors(library, fields)
-    normalized = normalize_factors(values, labels.valid, n_sigma=4.0)
+    normalized = normalize_factors(values, np.ones(market.shape, dtype=bool), n_sigma=4.0)
     traded = (market["is_trading"] > 0).astype(np.float32)
 
     folds = walk_forward(N_DATES, split)
@@ -144,7 +144,8 @@ def test_walk_forward_training_and_backtest_complete(library, prepared, market, 
         values=normalized,
         traded=traded,
         y=labels.y,
-        mask=labels.valid,
+        label_mask=labels.valid,
+        prediction_mask=np.ones(market.shape, dtype=bool),
         cfg=DLConfig(seq_len=5, hidden_size=16, num_layers=1, epochs=2,
                      batch_size=512, early_stopping_patience=2, seed=1),
     )
@@ -157,7 +158,8 @@ def test_walk_forward_training_and_backtest_complete(library, prepared, market, 
     assert predictions[tested].min() >= 0.0 and predictions[tested].max() <= 1.0
 
     summary = run_backtest(
-        predictions, labels, market.dates, LabelConfig(target_ratio=1.08),
+        predictions, labels, np.ones(market.shape, dtype=bool), market.dates,
+        LabelConfig(target_ratio=1.08),
         BacktestConfig(top_k=5),
     ).summary
     assert summary["n_days"] > 0
@@ -183,10 +185,13 @@ def test_live_scoring_ranks_the_latest_date_which_has_no_label(
         names=names,
         labels=labels,
     )
-    pipeline.train(cfg, prep, library)
+    predictions, _ = pipeline.train(cfg, prep, library)
 
     latest = market.dates[-1]
     assert not labels.valid[-1].any(), "the final bar cannot have a resolved label"
+    assert np.isfinite(predictions[-1]).any(), (
+        "OOS scoring must not require the latest row's future label to be observable"
+    )
 
     frame = pipeline.score(cfg, prep, library)
     assert len(frame) > 0

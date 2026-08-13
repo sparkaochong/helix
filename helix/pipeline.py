@@ -95,8 +95,11 @@ def mine(cfg: Config, prepared: Prepared) -> FactorLibrary:
         panel.dates[rows][0], panel.dates[rows][-1], len(panel.dates[rows]),
     )
 
-    mask_rows = labels.valid[rows]
-    cols = liquidity_top_columns(panel.f64("amount")[rows], mask_rows, cfg.gp.search_max_stocks)
+    population_rows = prepared.universe[rows]
+    label_rows = labels.valid[rows]
+    cols = liquidity_top_columns(
+        panel.f64("amount")[rows], population_rows, cfg.gp.search_max_stocks
+    )
     log.info("evolving on %d liquidity-ranked stocks", len(cols))
 
     sub_fields = {k: np.asarray(v[rows][:, cols], dtype=np.float64) for k, v in prepared.fields.items()}
@@ -104,7 +107,7 @@ def mine(cfg: Config, prepared: Prepared) -> FactorLibrary:
         fields=sub_fields,
         field_names=prepared.names,
         y=labels.y[rows][:, cols],
-        mask=mask_rows[:, cols],
+        mask=label_rows[:, cols],
         cfg=cfg.gp,
         embargo_days=cfg.split.embargo_days,
     )
@@ -166,7 +169,10 @@ def train(cfg: Config, prepared: Prepared, library: FactorLibrary) -> tuple[np.n
         values=normalized,
         traded=traded,
         y=labels.y,
-        mask=labels.valid,
+        label_mask=labels.valid,
+        prediction_mask=(
+            prepared.universe & (np.isfinite(normalized).mean(axis=-1) >= 0.5)
+        ),
         cfg=cfg.dl,
         checkpoint_dir=models_dir(cfg),
         factor_names=names,
@@ -251,6 +257,7 @@ def backtest(cfg: Config, prepared: Prepared, predictions: np.ndarray) -> dict:
     result = run_backtest(
         predictions=predictions,
         labels=prepared.labels,
+        candidate_mask=prepared.universe,
         dates=prepared.panel.dates,
         label_cfg=cfg.label,
         cfg=cfg.backtest,
@@ -263,7 +270,7 @@ def backtest(cfg: Config, prepared: Prepared, predictions: np.ndarray) -> dict:
     summary = dict(result.summary)
     for k in (5, 10, 20, 50):
         summary[f"lift_at_{k}"] = lift_at_k(
-            predictions, prepared.labels.y, prepared.labels.valid & tested, k
+            predictions, prepared.labels.y, prepared.universe & tested, k
         )
     (out / "backtest_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"

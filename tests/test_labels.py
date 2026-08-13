@@ -98,6 +98,7 @@ def test_suspension_makes_the_outcome_undefined(cfg):
     trading[3, 0] = 0.0  # D+2 suspended for the row-1 decision
     panel = make_panel(is_trading=trading)
     labels = build_touch_label(panel, np.ones((6, 1), dtype=bool), cfg)
+    assert not labels.touch_tradable[1, 0]
     assert not labels.valid[1, 0]
 
 

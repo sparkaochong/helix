@@ -10,14 +10,20 @@ from helix.eval.backtest import run_backtest
 from helix.labels.touch_label import LabelSet
 
 
-def make_labels(y, entry, exit_price, valid=None) -> LabelSet:
+def make_labels(y, entry, exit_price, valid=None, touch_tradable=None) -> LabelSet:
     y = np.asarray(y, dtype=float)
     entry = np.asarray(entry, dtype=float)
     exit_price = np.asarray(exit_price, dtype=float)
     valid = np.ones_like(y, dtype=bool) if valid is None else np.asarray(valid, dtype=bool)
+    touch_tradable = (
+        valid.copy()
+        if touch_tradable is None
+        else np.asarray(touch_tradable, dtype=bool)
+    )
     return LabelSet(
         y=y,
         valid=valid,
+        touch_tradable=touch_tradable,
         entry_price=entry,
         target_price=entry * 1.08,
         exit_price=exit_price,
@@ -45,7 +51,10 @@ def test_the_default_exit_holds_a_hit_all_the_way_to_the_d2_close(cfg):
     """Touching +8% is not being filled at +8%; the default books the close, up or down."""
     labels = make_labels(y=[[1.0, 0.0]], entry=[[10.0, 10.0]], exit_price=[[11.0, 10.0]])
     predictions = np.array([[1.0, 0.0]])
-    result = run_backtest(predictions, labels, np.array(["20240101"]), cfg, free(top_k=1))
+    result = run_backtest(
+        predictions, labels, np.ones_like(predictions, dtype=bool),
+        np.array(["20240101"]), cfg, free(top_k=1),
+    )
     assert result.daily["gross_return"].iloc[0] == pytest.approx(0.10)
     assert result.summary["exit_rule"] == "close"
 
@@ -54,7 +63,8 @@ def test_a_hit_earns_exactly_the_target_under_the_label_mirroring_exit(cfg):
     labels = make_labels(y=[[1.0, 0.0]], entry=[[10.0, 10.0]], exit_price=[[3.0, 10.0]])
     predictions = np.array([[1.0, 0.0]])
     result = run_backtest(
-        predictions, labels, np.array(["20240101"]), cfg, free(top_k=1, exit_rule="target")
+        predictions, labels, np.ones_like(predictions, dtype=bool),
+        np.array(["20240101"]), cfg, free(top_k=1, exit_rule="target")
     )
     assert result.daily["gross_return"].iloc[0] == pytest.approx(0.08)
     assert result.summary["hit_rate"] == pytest.approx(1.0)
@@ -64,7 +74,8 @@ def test_a_miss_exits_at_the_d2_close(cfg):
     labels = make_labels(y=[[0.0, 0.0]], entry=[[10.0, 10.0]], exit_price=[[9.0, 10.0]])
     predictions = np.array([[1.0, 0.0]])
     result = run_backtest(
-        predictions, labels, np.array(["20240101"]), cfg, free(top_k=1, exit_rule="target")
+        predictions, labels, np.ones_like(predictions, dtype=bool),
+        np.array(["20240101"]), cfg, free(top_k=1, exit_rule="target")
     )
     assert result.daily["gross_return"].iloc[0] == pytest.approx(-0.10)
 
@@ -76,6 +87,7 @@ def test_costs_are_charged_per_side_against_notional(cfg):
     result = run_backtest(
         predictions,
         labels,
+        np.ones_like(predictions, dtype=bool),
         np.array(["20240101"]),
         cfg,
         BacktestConfig(top_k=1, slippage_bps=10.0),
@@ -95,6 +107,7 @@ def test_stamp_duty_doubles_before_the_2023_cut(cfg):
     result = run_backtest(
         predictions,
         labels,
+        np.ones_like(predictions, dtype=bool),
         np.array(["20230825", "20230828"]),
         cfg,
         BacktestConfig(top_k=1, slippage_bps=0.0),
@@ -115,7 +128,10 @@ def test_selection_follows_the_prediction_ranking(cfg):
         y=[[0.0, 1.0, 0.0]], entry=[[10.0] * 3], exit_price=[[10.0] * 3]
     )
     predictions = np.array([[0.1, 0.9, 0.5]])
-    result = run_backtest(predictions, labels, np.array(["20240101"]), cfg, free(top_k=1))
+    result = run_backtest(
+        predictions, labels, np.ones_like(predictions, dtype=bool),
+        np.array(["20240101"]), cfg, free(top_k=1),
+    )
     assert result.daily["hit_rate"].iloc[0] == pytest.approx(1.0)
     assert result.daily["base_rate"].iloc[0] == pytest.approx(1 / 3)
 
@@ -123,23 +139,82 @@ def test_selection_follows_the_prediction_ranking(cfg):
 def test_dates_with_too_few_candidates_are_skipped(cfg):
     labels = make_labels(y=[[1.0, 1.0]], entry=[[10.0, 10.0]], exit_price=[[10.0, 10.0]])
     predictions = np.array([[1.0, 0.5]])
-    result = run_backtest(predictions, labels, np.array(["20240101"]), cfg, free(top_k=5))
+    result = run_backtest(
+        predictions, labels, np.ones_like(predictions, dtype=bool),
+        np.array(["20240101"]), cfg, free(top_k=5),
+    )
     assert result.daily.empty
     assert result.summary == {}
 
 
-def test_invalid_samples_are_never_traded(cfg):
+def test_future_untradability_does_not_replace_the_d0_top_pick(cfg):
     labels = make_labels(
-        y=[[1.0, 0.0]],
+        y=[[np.nan, 0.0]],
         entry=[[10.0, 10.0]],
         exit_price=[[10.0, 9.0]],
         valid=[[False, True]],
+        touch_tradable=[[False, True]],
     )
     predictions = np.array([[0.99, 0.01]])
-    result = run_backtest(predictions, labels, np.array(["20240101"]), cfg, free(top_k=1))
-    # The high-scoring name is untradable, so the loser is what actually gets bought.
-    assert result.daily["hit_rate"].iloc[0] == pytest.approx(0.0)
-    assert result.daily["gross_return"].iloc[0] == pytest.approx(-0.10)
+    result = run_backtest(
+        predictions, labels, np.ones_like(predictions, dtype=bool),
+        np.array(["20240101"]), cfg, free(top_k=1),
+    )
+
+    # D0 selects the high-scoring name before D+2 tradability is known. Execution
+    # validation may reject it, but must not reach deeper into the ranking for a loser.
+    assert len(result.daily) == 1
+    assert result.daily["n_selected"].iloc[0] == 1
+    assert result.daily["n_executed"].iloc[0] == 0
+    assert result.daily["portfolio_return"].iloc[0] == pytest.approx(0.0)
+
+
+def test_partial_execution_keeps_unfilled_slots_in_cash(cfg):
+    labels = make_labels(
+        y=[[1.0, np.nan]],
+        entry=[[10.0, 10.0]],
+        exit_price=[[11.0, 10.0]],
+        valid=[[True, False]],
+        touch_tradable=[[True, False]],
+    )
+    predictions = np.array([[0.9, 0.8]])
+
+    result = run_backtest(
+        predictions,
+        labels,
+        np.ones_like(predictions, dtype=bool),
+        np.array(["20240101"]),
+        cfg,
+        free(top_k=2),
+    )
+
+    assert result.daily["n_selected"].iloc[0] == 2
+    assert result.daily["n_executed"].iloc[0] == 1
+    assert result.daily["portfolio_return"].iloc[0] == pytest.approx(0.10 / 2 / 2)
+
+
+def test_trade_summary_weights_individual_fills_not_daily_baskets(cfg):
+    labels = make_labels(
+        y=[[1.0, np.nan], [0.0, 0.0]],
+        entry=[[10.0, 10.0], [10.0, 10.0]],
+        exit_price=[[11.0, 10.0], [9.0, 9.0]],
+        valid=[[True, False], [True, True]],
+        touch_tradable=[[True, False], [True, True]],
+    )
+    predictions = np.array([[0.9, 0.8], [0.9, 0.8]])
+
+    result = run_backtest(
+        predictions,
+        labels,
+        np.ones_like(predictions, dtype=bool),
+        np.array(["20240101", "20240102"]),
+        cfg,
+        free(top_k=2),
+    )
+
+    # Three fills: +10%, -10%, -10%. Equal-weighting daily basket means is wrong.
+    assert result.summary["mean_trade_return_net"] == pytest.approx(-0.10 / 3)
+    assert result.summary["trade_win_rate"] == pytest.approx(1 / 3)
 
 
 def test_equity_divides_capital_across_overlapping_tranches(cfg):
@@ -150,7 +225,9 @@ def test_equity_divides_capital_across_overlapping_tranches(cfg):
     )
     predictions = np.tile([[1.0, 0.0]], (n, 1))
     dates = np.array([f"2024010{i}" for i in range(1, n + 1)])
-    result = run_backtest(predictions, labels, dates, cfg, free(top_k=1))
+    result = run_backtest(
+        predictions, labels, np.ones_like(predictions, dtype=bool), dates, cfg, free(top_k=1)
+    )
 
     # Holding spans D+1 and D+2, so a new book overlaps the previous one: 8% / 2 per day.
     assert result.daily["portfolio_return"].iloc[0] == pytest.approx(0.04)

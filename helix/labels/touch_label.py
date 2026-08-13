@@ -33,7 +33,8 @@ class LabelSet:
     """Aligned to D0 rows: row ``t`` describes the trade decided at the close of ``dates[t]``."""
 
     y: np.ndarray          # (T, N) float, 1.0 touched / 0.0 not / NaN undefined
-    valid: np.ndarray      # (T, N) bool, sample is usable for train / eval / trading
+    valid: np.ndarray      # (T, N) bool, sample has an observable train / eval target
+    touch_tradable: np.ndarray  # (T, N) bool, D+touch_offset traded; backtest validation only
     entry_price: np.ndarray  # (T, N) back-adjusted D+1 open
     target_price: np.ndarray  # (T, N) entry * target_ratio
     exit_price: np.ndarray   # (T, N) back-adjusted D+2 close, for the non-touch exit
@@ -80,6 +81,7 @@ def build_touch_label(panel, universe: np.ndarray, cfg: LabelConfig) -> LabelSet
     labels = LabelSet(
         y=y,
         valid=valid,
+        touch_tradable=touch_tradable,
         entry_price=np.where(valid, open_hfq_entry, np.nan),
         target_price=np.where(valid, target, np.nan),
         exit_price=np.where(valid, close_hfq_exit, np.nan),

@@ -76,7 +76,8 @@ def train_fold(
     values: np.ndarray,
     traded: np.ndarray,
     y: np.ndarray,
-    mask: np.ndarray,
+    label_mask: np.ndarray,
+    prediction_mask: np.ndarray,
     cfg: DLConfig,
     checkpoint_dir: Path | None = None,
     factor_names: list[str] | None = None,
@@ -86,9 +87,9 @@ def train_fold(
     np.random.seed(cfg.seed + fold.index)
     device = pick_device()
 
-    idx_train = sample_index(mask, fold.train, cfg.seq_len)
-    idx_valid = sample_index(mask, fold.valid, cfg.seq_len)
-    idx_test = sample_index(mask, fold.test, cfg.seq_len)
+    idx_train = sample_index(label_mask, fold.train, cfg.seq_len)
+    idx_valid = sample_index(label_mask, fold.valid, cfg.seq_len)
+    idx_test = sample_index(prediction_mask, fold.test, cfg.seq_len)
     if len(idx_train) == 0 or len(idx_valid) == 0:
         raise ValueError(f"fold {fold.index} has no usable train/valid samples")
 
@@ -127,7 +128,7 @@ def train_fold(
             seen += len(target)
 
         valid_grid = _scatter(predict_scores(model, ds_valid, device, cfg.batch_size), idx_valid, y.shape)
-        valid_gini = _grid_gini(valid_grid, y, mask, fold.valid)
+        valid_gini = _grid_gini(valid_grid, y, label_mask, fold.valid)
         log.info(
             "  fold %d epoch %02d | loss %.4f | valid gini %.4f",
             fold.index, epoch, total / max(seen, 1), valid_gini,
@@ -171,7 +172,7 @@ def train_fold(
         n_test=len(idx_test),
         best_epoch=best_epoch,
         valid_gini=float(best_gini),
-        test_gini=float(_grid_gini(test_grid, y, mask, fold.test)),
+        test_gini=float(_grid_gini(test_grid, y, label_mask, fold.test)),
     )
     log.info(
         "fold %d done | best epoch %d | valid gini %.4f | test gini %.4f",
@@ -185,7 +186,8 @@ def train_walk_forward(
     values: np.ndarray,
     traded: np.ndarray,
     y: np.ndarray,
-    mask: np.ndarray,
+    label_mask: np.ndarray,
+    prediction_mask: np.ndarray,
     cfg: DLConfig,
     checkpoint_dir: Path | None = None,
     factor_names: list[str] | None = None,
@@ -196,7 +198,7 @@ def train_walk_forward(
     results: list[FoldResult] = []
     for fold in folds:
         grid, result = train_fold(
-            fold, values, traded, y, mask, cfg,
+            fold, values, traded, y, label_mask, prediction_mask, cfg,
             checkpoint_dir=checkpoint_dir, factor_names=factor_names, dates=dates,
         )
         rows = fold.test

@@ -1,5 +1,9 @@
 """Trade-level backtest of the top-``k`` daily selection.
 
+The shortlist is fixed from the D0 point-in-time universe before any D+1/D+2
+tradability checks. Future execution data may reject a shortlisted trade, but can never
+promote a lower-ranked name into the book.
+
 Everyone enters at the D+1 open. Two accounting choices decide the answer, and the
 first version of this file got both of them wrong in the optimistic direction:
 
@@ -78,50 +82,72 @@ def _net_returns(gross: np.ndarray, buy: float, sell: float) -> np.ndarray:
 def run_backtest(
     predictions: np.ndarray,
     labels: LabelSet,
+    candidate_mask: np.ndarray,
     dates: np.ndarray,
     label_cfg: LabelConfig,
     cfg: BacktestConfig,
 ) -> BacktestResult:
     gross = _trade_returns(labels, label_cfg.target_ratio, cfg.exit_rule)
     buy_rate, sell_rates = _cost_rates(cfg, dates)
-    usable = labels.valid & np.isfinite(predictions) & np.isfinite(labels.y)
+    candidates = candidate_mask & np.isfinite(predictions)
 
     n_dates = predictions.shape[0]
     rows: list[dict] = []
-    scores = np.where(usable, predictions, -np.inf)
+    executed_net_returns: list[np.ndarray] = []
+    scores = np.where(candidates, predictions, -np.inf)
     order = np.argsort(-scores, axis=1, kind="stable")
+    overlap = max(label_cfg.touch_offset - label_cfg.entry_offset + 1, 1)
 
     for t in range(n_dates):
-        n_available = int(usable[t].sum())
+        n_available = int(candidates[t].sum())
         if n_available < cfg.top_k:
             continue
-        picked = order[t, : cfg.top_k]
-        trade_ret = gross[t, picked]
-        if not np.isfinite(trade_ret).all():
-            continue
+        selected = order[t, : cfg.top_k]
+        execution_valid = (
+            labels.valid[t, selected]
+            & labels.touch_tradable[t, selected]
+            & np.isfinite(gross[t, selected])
+        )
+        executed = selected[execution_valid]
+        trade_ret = gross[t, executed]
         net_ret = _net_returns(trade_ret, buy_rate, float(sell_rates[t]))
+        if net_ret.size:
+            executed_net_returns.append(net_ret)
+        observable = candidates[t] & labels.valid[t] & np.isfinite(labels.y[t])
+        base_rate = float(np.mean(labels.y[t, observable])) if observable.any() else float("nan")
         rows.append(
             {
                 "date": dates[t],
                 "n_available": n_available,
-                "hit_rate": float(np.mean(labels.y[t, picked])),
-                "base_rate": float(np.mean(labels.y[t, usable[t]])),
-                "gross_return": float(np.mean(trade_ret)),
-                "net_return": float(np.mean(net_ret)),
+                "n_selected": cfg.top_k,
+                "n_executed": int(executed.size),
+                "hit_rate": (
+                    float(np.mean(labels.y[t, executed])) if executed.size else float("nan")
+                ),
+                "base_rate": base_rate,
+                "gross_return": float(np.mean(trade_ret)) if executed.size else float("nan"),
+                "net_return": float(np.mean(net_ret)) if executed.size else float("nan"),
+                # Every D0 selection reserves one equal-weight slot. A failed execution
+                # stays in cash; its capital is not reassigned to another name or fill.
+                "portfolio_return": float(np.sum(net_ret) / cfg.top_k / overlap),
             }
         )
 
     daily = pd.DataFrame(rows)
     if daily.empty:
-        log.warning("backtest produced no tradable dates; check top_k against universe size")
+        log.warning("backtest produced no selectable dates; check top_k against universe size")
         return BacktestResult(daily=daily, summary={})
 
-    overlap = max(label_cfg.touch_offset - label_cfg.entry_offset + 1, 1)
-    daily["portfolio_return"] = daily["net_return"] / overlap
     daily["equity"] = (1.0 + daily["portfolio_return"]).cumprod()
 
-    net = daily["net_return"].to_numpy()
+    net = (
+        np.concatenate(executed_net_returns)
+        if executed_net_returns
+        else np.empty(0, dtype=np.float64)
+    )
     portfolio = daily["portfolio_return"].to_numpy()
+    hit_rate = float(daily["hit_rate"].mean())
+    base_rate = float(daily["base_rate"].mean())
     ann = 252.0
     vol = float(portfolio.std(ddof=1)) if len(portfolio) > 1 else float("nan")
     summary: dict[str, float | str] = {
@@ -131,11 +157,13 @@ def run_backtest(
         # this strategy's CAGR by ~100 percentage points.
         "exit_rule": cfg.exit_rule,
         "slippage_bps": float(cfg.slippage_bps),
-        "hit_rate": float(daily["hit_rate"].mean()),
-        "base_rate": float(daily["base_rate"].mean()),
-        "lift": float(daily["hit_rate"].mean() / max(daily["base_rate"].mean(), 1e-12)),
-        "mean_trade_return_net": float(net.mean()),
-        "trade_win_rate": float((net > 0).mean()),
+        "avg_executed": float(daily["n_executed"].mean()),
+        "fill_rate": float(daily["n_executed"].sum() / daily["n_selected"].sum()),
+        "hit_rate": hit_rate,
+        "base_rate": base_rate,
+        "lift": float(hit_rate / base_rate) if base_rate > 0 else float("nan"),
+        "mean_trade_return_net": float(net.mean()) if net.size else float("nan"),
+        "trade_win_rate": float((net > 0).mean()) if net.size else float("nan"),
         "ann_return": float(portfolio.mean() * ann),
         "ann_vol": float(vol * np.sqrt(ann)),
         "sharpe": float(portfolio.mean() / vol * np.sqrt(ann)) if vol > 0 else float("nan"),

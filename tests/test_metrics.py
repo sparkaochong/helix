@@ -84,6 +84,17 @@ def test_precision_is_nan_when_fewer_than_k_names_are_available():
     assert np.isnan(precision[0])
 
 
+def test_precision_does_not_replace_a_selected_name_with_an_unobservable_outcome():
+    score = np.array([[5.0, 4.0]])
+    y = np.array([[np.nan, 0.0]])
+    d0_candidates = np.ones((1, 2), dtype=bool)
+
+    precision, base = precision_at_k(score, y, d0_candidates, k=1)
+
+    assert np.isnan(precision[0])
+    assert base[0] == pytest.approx(0.0)
+
+
 def test_correlation_dedup_detects_a_duplicate_factor():
     rng = np.random.default_rng(1)
     a = rng.normal(size=(50, 20))
