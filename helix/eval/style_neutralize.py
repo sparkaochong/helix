@@ -122,14 +122,13 @@ def style_residualize(
         mask_array & np.isfinite(factor_array),
         industry_levels=industry_levels,
     )
-    q, r = np.linalg.qr(design, mode="reduced")
-    diagonal = np.abs(np.diagonal(r, axis1=1, axis2=2))
-    tolerance = EPS * np.maximum(diagonal.max(axis=1, keepdims=True), EPS)
-    q = np.where((diagonal > tolerance)[:, None, :], q, 0.0)
-
     values = np.where(valid, factor_array, 0.0)
-    coefficients = np.matmul(values[:, None, :], q)
-    projection = np.matmul(q, coefficients.transpose(0, 2, 1))[:, :, 0]
+    transpose = design.transpose(0, 2, 1)
+    gram = np.matmul(transpose, design)
+    right_hand_side = np.matmul(transpose, values[..., None])
+    inverse = np.linalg.pinv(gram, rcond=EPS, hermitian=True)
+    coefficients = np.matmul(inverse, right_hand_side)
+    projection = np.matmul(design, coefficients)[:, :, 0]
     residual = values - projection
 
     counts = valid.sum(axis=1)

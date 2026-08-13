@@ -696,11 +696,26 @@ def _evaluate_window(
         design.transpose(0, 2, 1), np.nan_to_num(neutral)[..., None]
     )
     scale = np.maximum(valid.sum(axis=1), 1)[:, None, None]
+    design_norm = np.sqrt(np.einsum("tnk,tnk->tk", design, design))
+    residual_norm = np.sqrt(
+        np.einsum("tn,tn->t", np.nan_to_num(neutral), np.nan_to_num(neutral))
+    )
+    normalized_denominator = design_norm * residual_norm[:, None]
+    normalized_exposure = np.divide(
+        exposure[:, :, 0],
+        normalized_denominator,
+        out=np.zeros_like(exposure[:, :, 0]),
+        where=normalized_denominator > 0,
+    )
+    raw_rows = panel.occupied & np.isfinite(raw)
     orthogonality = {
-        "max_abs_exposure": float(np.max(np.abs(exposure / scale))),
+        "max_abs_normalized_exposure": float(np.max(np.abs(normalized_exposure))),
+        "max_abs_covariance": float(np.max(np.abs(exposure / scale))),
         "style_complete_rows": int(common_mask.sum()),
+        "raw_factor_rows": int(raw_rows.sum()),
         "total_rows": int(panel.occupied.sum()),
-        "style_coverage": float(common_mask.sum() / panel.occupied.sum()),
+        "analysis_coverage_of_events": float(common_mask.sum() / panel.occupied.sum()),
+        "style_coverage_of_raw_factor": float(common_mask.sum() / raw_rows.sum()),
         "industry_count": len(industry_names),
     }
     return {
@@ -774,6 +789,15 @@ def render_report(payload: dict[str, object]) -> str:
         {"arm": arm, **{key: values.get(key, np.nan) for key in REQUIRED_METRICS}}
         for arm, values in oos.items()
     ]
+    raw = deterministic["raw"]
+    neutral = deterministic["style_neutral"]
+    icir_retention = abs(float(neutral["icir"]) / float(raw["icir"]))
+    economic_warning = (
+        "两臂训练窗净收益均为负，因此本 GO 仅表示风格中性后仍保留统计排序能力，"
+        "不构成盈利或实盘准入结论。"
+        if float(raw["net_per_trade"]) < 0 and float(neutral["net_per_trade"]) < 0
+        else "收益方向条件通过；仍须结合治理文档其余未关闭风险判断实盘资格。"
+    )
     return f"""# G3 Style Ablation
 
 **{decision['decision']}**。本结论只读取训练窗口确定性统计量；样本外结果不参与 GO/NO-GO。
@@ -787,12 +811,30 @@ def render_report(payload: dict[str, object]) -> str:
 - 原始/中性净收益每笔：`{float(decision['raw_net_return']):.8g}` / `{float(decision['neutral_net_return']):.8g}`
 - 收益同向条件：`{decision['direction_pass']}`
 
+## 结果解读
+
+中性后 ICIR 保留原始值的 `{icir_retention:.2%}`，仍显著高于训练匹配的安慰剂 p95；
+因此按预先登记规则判为 **{decision['decision']}**。{economic_warning}
+
+原始与中性 Top10 净收益每笔分别为 `{float(raw['net_per_trade']):.4%}` 和
+`{float(neutral['net_per_trade']):.4%}`，CAGR 分别为 `{float(raw['cagr']):.2%}` 和
+`{float(neutral['cagr']):.2%}`。这说明“存在非风格排序信息”和“按 D+2 收盘可盈利”
+是两个不同命题；本实验只让前者通过 G3 风格门。
+
 ## 数据与泄漏控制
 
 正式因子为 `data/artifacts/argus/event_factors.json` 中唯一的 `gp_000`。五类风格为
 对数总市值、申万 2021 一级行业哑变量、20 日动量、20 日波动率和 20 日平均自由
-流通换手率。每个 D0 的风格只使用 D0 及此前 19 个市场交易日；每日 QR 回归相互
+流通换手率。每个 D0 的风格只使用 D0 及此前 19 个市场交易日；每日 Gram 伪逆回归相互
 独立。训练窗末日之后的标签、退出价、衰减目标和样本外指标均不进入判定函数。
+两臂始终在同一完整风格交集上比较；该交集覆盖原始因子有限行的
+`{float(payload.get('orthogonality', {}).get('style_coverage_of_raw_factor', np.nan)):.2%}`。
+
+- 输入：`{metadata.get('input_path', '')}`
+- 因子库 SHA-256：`{metadata.get('library_sha256', '')}`
+- 市场缓存 SHA-256：`{metadata.get('market_cache_sha256', '')}`
+- 行业缓存 SHA-256：`{metadata.get('industry_cache_sha256', '')}`
+- 正式表达式：`{metadata.get('factor_expression', '')}`
 
 ## 确定性核心指标
 
@@ -825,6 +867,8 @@ def render_report(payload: dict[str, object]) -> str:
 
 - 行业分类使用 SW2021 的历史 `in_date/out_date` 区间；无有效行业映射的行不插补。
 - 移动块 bootstrap 衡量日期采样不确定性；确定性全训练窗估计才是门控输入。
+- 现有安慰剂线来自正式因子的原始缺失结构；共同风格交集剔除了约 4.4% 的原始
+  因子有限行。中性 ICIR 与 p95 的距离较大，但阈值并非为该交集重新校准。
 - 本实验回答风格暴露问题，不关闭 D6 冲击成本或 D13 递延资金占用等独立风险。
 
 ## 复现命令
@@ -1124,8 +1168,12 @@ def run_experiment(
             "input_path": str(input_path),
             "library_path": str(library_path),
             "library_sha256": _sha256(library_path),
+            "factor_expression": library.factors[0].expression,
             "market_cache_sha256": _sha256(market_cache),
             "industry_cache_sha256": _sha256(industry_cache),
+            "market_cache_rows": int(len(market)),
+            "market_cache_start": str(market["trade_date"].min()),
+            "market_cache_end": str(market["trade_date"].max()),
             "result_path": str(result_path),
             "command": command,
         },

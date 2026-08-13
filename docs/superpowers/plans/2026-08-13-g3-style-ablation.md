@@ -14,7 +14,7 @@
 
 - Create `tests/test_style_neutralize.py`: numerical contract for batched daily style residualisation.
 - Create `tests/test_g3_style_ablation.py`: window isolation, style construction, bootstrap, metrics, decision, and report contracts.
-- Create `helix/eval/style_neutralize.py`: fully vectorised daily design construction and QR residualisation.
+- Create `helix/eval/style_neutralize.py`: fully vectorised daily design construction and rank-safe pseudoinverse residualisation.
 - Create `scripts/g3_style_ablation.py`: data/cache orchestration, factor replay, evaluation, report generation, and CLI.
 - Create `docs/risk/g3_style_ablation.md`: generated experiment report.
 - Modify `docs/factor-governance.md`: update D7 only; preserve D13 byte-for-byte.
@@ -142,7 +142,7 @@ def style_residualize(
     industry_levels: np.ndarray | None = None,
     min_residual_fraction: float = 1e-6,
 ) -> np.ndarray:
-    """Batched per-date QR residual; NaN outside complete observations."""
+    """Batched per-date pseudoinverse residual; NaN outside complete observations."""
 ```
 
 Implementation rules:
@@ -158,9 +158,10 @@ valid = (
 
 Compute cross-sectional means/standard deviations by masked reductions over axis 1,
 zero constant continuous directions, create all but one fixed industry dummy, and zero
-every design row outside `valid`. Call `np.linalg.qr(design, mode="reduced")` once on
-the full batch. Zero Q directions whose R diagonal is below a scaled tolerance before
-the two batched matrix multiplications. Return NaN for dates whose residual norm is
+every design row outside `valid`. Form every daily Gram matrix in one batched multiply,
+apply `np.linalg.pinv(gram, rcond=EPS, hermitian=True)` to the full batch, and project
+with two further batched multiplies. This remains rank-safe when an absent industry
+dummy appears before a later populated dummy. Return NaN for dates whose residual norm is
 negligible relative to the demeaned factor norm. Validate dimensional consistency,
 nonempty fixed industry levels, and a positive finite residual fraction.
 

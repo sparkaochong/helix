@@ -54,7 +54,7 @@ This new module contains only reusable, fully vectorised numerical operations:
 - cross-sectional standardisation of continuous style columns;
 - construction of an intercept plus continuous exposures plus a fixed-width industry
   one-hot tensor;
-- batched per-date QR projection; and
+- batched per-date Hermitian pseudoinverse projection; and
 - residual extraction with rank-deficiency and negligible-residual guards.
 
 Inputs use the shapes `(T, N)` for the factor and mask, `(T, N, C)` for continuous
@@ -62,7 +62,8 @@ styles, and `(T, N)` for integer industry codes. The output is `(T, N)`, with Na
 outside rows where the factor and every required style are observed. Industry levels
 are determined once from the approved SW2021 L1 taxonomy, not inferred independently
 on each date. One reference category is omitted to avoid the intercept/one-hot dummy
-trap; batched QR also zeros numerically degenerate directions. No loop over dates or
+trap; a batched pseudoinverse of each date's Gram matrix handles absent and collinear
+industry directions without dropping later populated dummy columns. No loop over dates or
 stocks is permitted in the neutralisation path.
 
 This module does not change `helix/gp/neutralize.py`: GP residual fitness remains a
@@ -122,8 +123,8 @@ stocks whose factor and all styles are observed on date `t`, compute
 
 `f_neutral,t = f_t - X_t (X_t' X_t)^+ X_t' f_t`.
 
-The implementation uses batched QR but is tested against `numpy.linalg.lstsq` date by
-date as a reference. Required invariants are:
+The implementation uses batched Hermitian pseudoinverses of the daily Gram matrices but
+is tested against `numpy.linalg.lstsq` date by date as a reference. Required invariants are:
 
 - the residual is orthogonal to every retained design column within numerical
   tolerance on every usable date;

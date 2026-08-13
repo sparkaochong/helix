@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+
 from helix.eval.style_neutralize import build_style_design, style_residualize
 
 
@@ -95,6 +96,44 @@ def test_absent_and_collinear_industries_are_rank_safe():
 
     assert np.isfinite(residual[0]).all()
     assert np.isfinite(residual[1]).all()
+
+
+def test_missing_dummy_columns_before_active_industries_remain_orthogonal():
+    """A rank gap must not discard components of later, populated dummy columns."""
+    rng = np.random.default_rng(19)
+    continuous = rng.normal(size=(1, 131, 4))
+    present_levels = np.array([0, 1, 3, 4, 8, 13, 17, 22, 30], dtype=float)
+    industry = rng.choice(present_levels, size=(1, 131))
+    factor = (
+        continuous[..., 0] ** 2
+        + 0.3 * continuous[..., 1] ** 3
+        + 0.7 * (industry == 22)
+    )
+    mask = np.ones(factor.shape, dtype=bool)
+    levels = np.arange(31, dtype=float)
+
+    residual = style_residualize(
+        factor, continuous, industry, mask, industry_levels=levels
+    )
+    design, _ = build_style_design(
+        continuous, industry, mask, industry_levels=levels
+    )
+    products = np.matmul(
+        design.transpose(0, 2, 1), np.nan_to_num(residual)[..., None]
+    )[:, :, 0]
+    design_norm = np.sqrt(np.einsum("tnk,tnk->tk", design, design))
+    residual_norm = np.sqrt(
+        np.einsum("tn,tn->t", np.nan_to_num(residual), np.nan_to_num(residual))
+    )
+    denominator = design_norm * residual_norm[:, None]
+    normalized = np.divide(
+        products,
+        denominator,
+        out=np.zeros_like(products),
+        where=denominator > 0,
+    )
+
+    assert np.max(np.abs(normalized)) < 1e-10
 
 
 def test_fully_explained_factor_is_nan_not_rankable_float_noise():
