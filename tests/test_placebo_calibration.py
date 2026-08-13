@@ -150,6 +150,12 @@ def test_quantiles_use_numpy_linear_method():
     assert quantiles.loc["ic_mean", "p95"] == pytest.approx(3.8)
     assert quantiles.loc["ic_mean", "p99"] == pytest.approx(3.96)
     assert quantiles.loc["ic_mean", "p999"] == pytest.approx(3.996)
+    assert quantiles.loc["icir", "p95"] == pytest.approx(7.6)
+    assert quantiles.loc["icir", "p99"] == pytest.approx(7.92)
+    assert quantiles.loc["icir", "p999"] == pytest.approx(7.992)
+    assert quantiles.loc["gini", "p95"] == pytest.approx(11.4)
+    assert quantiles.loc["gini", "p99"] == pytest.approx(11.88)
+    assert quantiles.loc["gini", "p999"] == pytest.approx(11.988)
 
 
 def test_admission_requires_every_metric_to_strictly_exceed_p99():
@@ -165,7 +171,9 @@ def test_admission_requires_every_metric_to_strictly_exceed_p99():
         assert not passes_placebo_threshold(metrics, thresholds)
 
 
-def test_training_loader_excludes_post_cutoff_extremes_from_frame_and_result(tmp_path):
+def test_training_loader_excludes_post_cutoff_extremes_from_frame_and_result(
+    tmp_path, monkeypatch
+):
     from scripts.calibrate_placebo import load_training_frame
 
     train_end = "2024-09-04"
@@ -194,6 +202,15 @@ def test_training_loader_excludes_post_cutoff_extremes_from_frame_and_result(tmp
         contaminated_path, index=False
     )
 
+    real_read_parquet = pd.read_parquet
+    read_calls = []
+
+    def recording_read_parquet(path, *args, **kwargs):
+        read_calls.append({"path": path, **kwargs})
+        return real_read_parquet(path, *args, **kwargs)
+
+    monkeypatch.setattr(pd, "read_parquet", recording_read_parquet)
+
     expected = load_training_frame(training_path, ["signal"], train_end)
     actual = load_training_frame(contaminated_path, ["signal"], train_end)
 
@@ -201,6 +218,16 @@ def test_training_loader_excludes_post_cutoff_extremes_from_frame_and_result(tmp
     assert actual["trade_date"].max() == train_end
     assert actual["signal"].mean() == pytest.approx(2.5)
     assert "unused" not in actual.columns
+    assert len(read_calls) == 2
+    for call in read_calls:
+        assert call["filters"] == [("trade_date", "<=", train_end)]
+        assert call["columns"] == [
+            "trade_date",
+            "stock_code",
+            "label_d2_hit_8pct",
+            "signal",
+        ]
+        assert "unused" not in call["columns"]
 
 
 @pytest.mark.parametrize("train_end", [None, "", "2024-09-03", "2024-09-05"])
@@ -217,8 +244,8 @@ def test_training_loader_accepts_only_the_formal_cutoff():
     assert validate_train_end("2024-09-04") == "2024-09-04"
 
 
-def test_supplemental_metrics_cannot_change_formal_quantiles_or_become_eligible():
-    from helix.eval.placebo import metric_quantiles, screen_factor_metrics
+def test_supplemental_metrics_cannot_change_formal_calibration_outputs():
+    from helix.eval.placebo import assemble_calibration_outputs
 
     formal_distribution = pd.DataFrame(
         {
@@ -228,35 +255,52 @@ def test_supplemental_metrics_cannot_change_formal_quantiles_or_become_eligible(
             "gini": np.arange(5, dtype=float) / 10,
         }
     )
-    formal_quantiles = metric_quantiles(formal_distribution)
+    formal_metrics = pd.DataFrame([_factor_metric_row("gp_000", 0.35)])
     high_supplemental = pd.DataFrame([_factor_metric_row("gp_000", 0.50)])
     low_supplemental = pd.DataFrame([_factor_metric_row("gp_000", 0.00)])
+    library_paths = {
+        "formal": "data/artifacts/argus/event_factors.json",
+        "argus_n40": "data/artifacts/argus_n40/event_factors.json",
+    }
 
-    high_screen = screen_factor_metrics(
-        high_supplemental,
-        formal_quantiles,
-        scope="argus_n40",
-        library_path="data/artifacts/argus_n40/event_factors.json",
+    high_distribution, high_quantiles, high_config, high_screen = (
+        assemble_calibration_outputs(
+            formal_distribution,
+            {"formal": formal_metrics, "argus_n40": high_supplemental},
+            library_paths,
+        )
     )
-    low_screen = screen_factor_metrics(
-        low_supplemental,
-        formal_quantiles,
-        scope="argus_n40",
-        library_path="data/artifacts/argus_n40/event_factors.json",
+    low_distribution, low_quantiles, low_config, low_screen = (
+        assemble_calibration_outputs(
+            formal_distribution,
+            {"formal": formal_metrics, "argus_n40": low_supplemental},
+            library_paths,
+        )
     )
 
-    pd.testing.assert_frame_equal(metric_quantiles(formal_distribution), formal_quantiles)
-    assert high_screen.loc[0, "ic_level"] == "超 p99.9"
-    assert high_screen.loc[0, "icir_level"] == "超 p99.9"
-    assert high_screen.loc[0, "gini_level"] == "超 p99.9"
-    assert high_screen.loc[0, "overall_level"] == "超 p99.9"
-    assert low_screen.loc[0, "overall_level"] == "低于随机水平"
-    assert not bool(high_screen.loc[0, "candidate_eligible"])
-    assert not bool(low_screen.loc[0, "candidate_eligible"])
-    assert pd.isna(high_screen.loc[0, "suggest_evict"])
-    assert pd.isna(low_screen.loc[0, "suggest_evict"])
-    assert high_screen.loc[0, "scope"] == "argus_n40"
-    assert high_screen.loc[0, "library_path"].endswith("argus_n40/event_factors.json")
+    pd.testing.assert_frame_equal(high_distribution, formal_distribution)
+    pd.testing.assert_frame_equal(low_distribution, formal_distribution)
+    pd.testing.assert_frame_equal(high_quantiles, low_quantiles)
+    assert high_config == low_config
+    assert high_config == pytest.approx(
+        {"ic_mean": 0.396, "icir": 0.396, "gini": 0.396}
+    )
+    pd.testing.assert_frame_equal(
+        high_screen.query("scope == 'formal'").reset_index(drop=True),
+        low_screen.query("scope == 'formal'").reset_index(drop=True),
+    )
+
+    high_supplemental_screen = high_screen.query("scope == 'argus_n40'").iloc[0]
+    low_supplemental_screen = low_screen.query("scope == 'argus_n40'").iloc[0]
+    assert high_supplemental_screen["overall_level"] == "超 p99.9"
+    assert low_supplemental_screen["overall_level"] == "低于随机水平"
+    assert not bool(high_supplemental_screen["candidate_eligible"])
+    assert not bool(low_supplemental_screen["candidate_eligible"])
+    assert pd.isna(high_supplemental_screen["suggest_evict"])
+    assert pd.isna(low_supplemental_screen["suggest_evict"])
+    assert high_supplemental_screen["library_path"].endswith(
+        "argus_n40/event_factors.json"
+    )
 
 
 def test_formal_screening_uses_joint_admission_and_eviction_advice():
@@ -290,6 +334,29 @@ def test_placebo_threshold_config_accepts_valid_contract():
     assert config.quantile == pytest.approx(0.99)
     assert config.train_start == "2022-01-04"
     assert config.train_end == "2024-09-04"
+
+
+def test_placebo_threshold_config_accepts_zero_thresholds():
+    from helix.config import PlaceboThresholdConfig
+
+    values = _threshold_kwargs()
+    values.update(ic_mean=0.0, icir=0.0, gini=0.0)
+
+    config = PlaceboThresholdConfig(**values)
+
+    assert config.ic_mean == pytest.approx(0.0)
+    assert config.icir == pytest.approx(0.0)
+    assert config.gini == pytest.approx(0.0)
+
+
+def test_placebo_threshold_config_rejects_unknown_fields():
+    from helix.config import PlaceboThresholdConfig
+
+    values = _threshold_kwargs()
+    values["unexpected"] = "silently accepting this would hide stale configuration"
+
+    with pytest.raises(ValueError):
+        PlaceboThresholdConfig(**values)
 
 
 @pytest.mark.parametrize("metric", ["ic_mean", "icir", "gini"])
