@@ -8,6 +8,7 @@ from numbers import Integral
 import numpy as np
 import pandas as pd
 
+from ..config import PlaceboThresholdConfig
 from ..features.operators import cs_rank, cs_rank_ordinal
 from .ic import daily_ic, summarize_ic
 from .metrics import daily_gini, summarize_daily
@@ -338,13 +339,22 @@ def metric_quantiles(distribution: pd.DataFrame) -> pd.DataFrame:
 
 
 def passes_placebo_threshold(
-    metrics: Mapping[str, float], thresholds: Mapping[str, float]
+    metrics: Mapping[str, float],
+    thresholds: Mapping[str, float] | PlaceboThresholdConfig,
 ) -> bool:
     """Return whether every finite metric strictly exceeds its finite threshold."""
     try:
         values = np.array([metrics[metric] for metric in METRICS], dtype=np.float64)
-        limits = np.array([thresholds[metric] for metric in METRICS], dtype=np.float64)
-    except (KeyError, TypeError, ValueError):
+        if isinstance(thresholds, PlaceboThresholdConfig):
+            limits = np.array(
+                [getattr(thresholds, metric) for metric in METRICS],
+                dtype=np.float64,
+            )
+        else:
+            limits = np.array(
+                [thresholds[metric] for metric in METRICS], dtype=np.float64
+            )
+    except (AttributeError, KeyError, TypeError, ValueError):
         return False
     return bool(np.isfinite(values).all() and np.isfinite(limits).all() and np.all(values > limits))
 
@@ -380,9 +390,15 @@ def screen_factor_metrics(
 
     weakest = np.minimum.reduce(level_codes)
     result["overall_level"] = _LEVEL_LABELS[weakest]
-    p99 = thresholds.loc[list(METRICS), "p99"].to_numpy(dtype=np.float64)
-    metric_values = result.loc[:, list(METRICS)].to_numpy(dtype=np.float64)
-    eligible = np.isfinite(metric_values).all(axis=1) & np.all(metric_values > p99, axis=1)
+    p99 = thresholds.loc[list(METRICS), "p99"].to_dict()
+    eligible = np.fromiter(
+        (
+            passes_placebo_threshold(row, p99)
+            for row in result.loc[:, list(METRICS)].to_dict(orient="records")
+        ),
+        dtype=bool,
+        count=len(result),
+    )
     result["candidate_eligible"] = eligible if scope == "formal" else False
     if scope == "formal":
         result["suggest_evict"] = ~eligible

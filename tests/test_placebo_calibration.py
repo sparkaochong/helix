@@ -500,6 +500,20 @@ def test_admission_requires_every_metric_to_strictly_exceed_p99():
         assert not passes_placebo_threshold(metrics, thresholds)
 
 
+def test_admission_accepts_typed_placebo_threshold_config():
+    from helix.config import PlaceboThresholdConfig
+    from helix.eval.placebo import passes_placebo_threshold
+
+    config = PlaceboThresholdConfig(**_threshold_kwargs())
+    metrics = {
+        "ic_mean": config.ic_mean + 0.001,
+        "icir": config.icir + 0.001,
+        "gini": config.gini + 0.001,
+    }
+
+    assert passes_placebo_threshold(metrics, config)
+
+
 def test_training_loader_excludes_post_cutoff_extremes_from_frame_and_result(
     tmp_path, monkeypatch
 ):
@@ -1352,6 +1366,35 @@ def test_formal_screening_uses_joint_admission_and_eviction_advice():
     assert not bool(screened.loc["eligible", "suggest_evict"])
     assert not bool(screened.loc["at_p99", "candidate_eligible"])
     assert bool(screened.loc["at_p99", "suggest_evict"])
+
+
+def test_formal_screening_uses_shared_admission_entrypoint(monkeypatch):
+    import helix.eval.placebo as placebo
+
+    metrics = pd.DataFrame(
+        [
+            _factor_metric_row("first", 0.31),
+            _factor_metric_row("second", 0.31),
+        ]
+    )
+    calls = []
+
+    def fake_admission(row, thresholds):
+        calls.append((dict(row), dict(thresholds)))
+        return len(calls) == 1
+
+    monkeypatch.setattr(placebo, "passes_placebo_threshold", fake_admission)
+
+    screened = placebo.screen_factor_metrics(
+        metrics,
+        _screening_quantiles(),
+        scope="formal",
+        library_path="data/artifacts/argus/event_factors.json",
+    )
+
+    assert screened["candidate_eligible"].tolist() == [True, False]
+    assert len(calls) == len(metrics)
+    assert calls[0][1] == {"ic_mean": 0.3, "icir": 0.3, "gini": 0.3}
 
 
 def test_screening_levels_each_metric_and_uses_the_weakest_overall_level():
