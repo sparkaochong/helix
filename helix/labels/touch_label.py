@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..config import LabelConfig
+from ..eval.shared_entry_check import entry_is_fillable
 from ..features.operators import lead
 from ..logging_setup import get_logger
 
@@ -38,6 +39,12 @@ class LabelSet:
     entry_price: np.ndarray  # (T, N) back-adjusted D+1 open
     target_price: np.ndarray  # (T, N) entry * target_ratio
     exit_price: np.ndarray   # (T, N) back-adjusted D+2 close, for the non-touch exit
+    entry_valid: np.ndarray | None = None  # (T, N) bool, D+1 entry actually fillable
+
+    @property
+    def executable_entry(self) -> np.ndarray:
+        """D+1 entry observability, with compatibility for older constructed labels."""
+        return self.valid if self.entry_valid is None else self.entry_valid
 
     @property
     def base_rate(self) -> float:
@@ -56,35 +63,31 @@ def build_touch_label(panel, universe: np.ndarray, cfg: LabelConfig) -> LabelSet
     touched = high_hfq_touch >= target
 
     trading = panel["is_trading"] > 0
-    entry_tradable = lead(trading.astype(np.float64), entry_off) > 0
     touch_tradable = lead(trading.astype(np.float64), touch_off) > 0
 
-    valid = (
-        universe
-        & entry_tradable
-        & touch_tradable
-        & np.isfinite(open_hfq_entry)
-        & np.isfinite(high_hfq_touch)
-        & (open_hfq_entry > 0)
+    entry_fillable = np.asarray(
+        entry_is_fillable(
+            panel,
+            np.arange(panel.shape[0])[:, None],
+            np.arange(panel.shape[1])[None, :],
+            cfg,
+        ),
+        dtype=bool,
     )
+    entry_valid = universe & entry_fillable
+    blocked = int(np.sum(universe & ~entry_fillable))
+    log.info("dropped %d samples not fillable at D+%d entry", blocked, entry_off)
 
-    if cfg.exclude_entry_limit_up:
-        # Raw prices here: up_limit is quoted raw, so it must be compared raw.
-        open_raw_entry = lead(panel.f64("open"), entry_off)
-        up_limit_entry = lead(panel.f64("up_limit"), entry_off)
-        unfillable = open_raw_entry >= (up_limit_entry - cfg.limit_price_eps)
-        blocked = int(np.sum(valid & np.nan_to_num(unfillable).astype(bool)))
-        valid &= ~np.nan_to_num(unfillable, nan=0.0).astype(bool)
-        log.info("dropped %d samples that would open at the D+%d up-limit", blocked, entry_off)
-
+    valid = entry_valid & touch_tradable & np.isfinite(high_hfq_touch)
     y = np.where(valid, touched.astype(np.float64), np.nan)
     labels = LabelSet(
         y=y,
         valid=valid,
         touch_tradable=touch_tradable,
-        entry_price=np.where(valid, open_hfq_entry, np.nan),
-        target_price=np.where(valid, target, np.nan),
+        entry_price=np.where(entry_valid, open_hfq_entry, np.nan),
+        target_price=np.where(entry_valid, target, np.nan),
         exit_price=np.where(valid, close_hfq_exit, np.nan),
+        entry_valid=entry_valid,
     )
     log.info(
         "label: %d usable samples, base rate %.3f%% (target ratio %.2f)",

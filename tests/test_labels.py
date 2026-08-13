@@ -24,6 +24,7 @@ def make_panel(n_dates: int = 6, n_codes: int = 1, **overrides) -> Panel:
         "low_hfq": np.full(shape, 10.0),
         "close_hfq": np.full(shape, 10.0),
         "up_limit": np.full(shape, 11.0),
+        "limit_price_observed": np.ones(shape),
         "is_trading": np.ones(shape),
     }
     fields.update(overrides)
@@ -100,6 +101,21 @@ def test_suspension_makes_the_outcome_undefined(cfg):
     labels = build_touch_label(panel, np.ones((6, 1), dtype=bool), cfg)
     assert not labels.touch_tradable[1, 0]
     assert not labels.valid[1, 0]
+    assert np.isnan(labels.y[1, 0])
+
+
+def test_d2_suspension_preserves_d1_entry_observability(cfg):
+    """A filled D+1 entry remains a position even when its planned exit is suspended."""
+    trading = np.ones((6, 1))
+    trading[3, 0] = 0.0  # D+2 for the decision made on row 1
+    panel = make_panel(is_trading=trading)
+
+    labels = build_touch_label(panel, np.ones((6, 1), dtype=bool), cfg)
+
+    assert labels.entry_valid[1, 0]
+    assert labels.entry_price[1, 0] == pytest.approx(10.0)
+    assert not labels.valid[1, 0]
+    assert np.isnan(labels.y[1, 0])
 
 
 def test_universe_exclusion_propagates(cfg):

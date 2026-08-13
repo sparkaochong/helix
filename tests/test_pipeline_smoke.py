@@ -59,6 +59,7 @@ def market() -> Panel:
         "vol": volume, "amount": volume * close / 10.0,
         "up_limit": np.round(prev_close * 1.1, 2),
         "down_limit": np.round(prev_close * 0.9, 2),
+        "limit_price_observed": np.ones(shape),
         "is_trading": np.ones(shape),
         "turnover_rate_f": rng.uniform(0.5, 8.0, size=shape),
         "volume_ratio": rng.uniform(0.5, 3.0, size=shape),

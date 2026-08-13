@@ -78,6 +78,8 @@ backtest:
   # label, caps the winners, lets the losers run, and turns this edge negative
   # (README「成本回测」: -46.7% vs +51.6% CAGR on the same predictions).
   exit_rule: close
+  # true: D+2 停牌/全天封死跌停时，按真实逐日行情递延到首次可卖开盘或收盘。
+  enable_realistic_exit: false
   # A 股法定费率，单位 bp。印花税仅卖出，2023-08-28 由 10bp 减半为 5bp（按交易日取值）。
   commission_bps: 2.5
   transfer_bps: 0.1

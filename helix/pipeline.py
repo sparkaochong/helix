@@ -33,6 +33,8 @@ from .splits import search_window, walk_forward
 
 log = get_logger(__name__)
 
+PANEL_CACHE_REQUIRED_FIELDS = ("limit_price_observed",)
+
 
 @dataclass
 class Prepared:
@@ -65,10 +67,17 @@ def prepare(cfg: Config, rebuild: bool = False) -> Prepared:
     """Build (or reload) the panel, universe mask, base fields and labels."""
     store = ParquetStore(cfg.data.root)
     panel_path = cache_dir(cfg) / "panel.npz"
-    if panel_path.exists() and not rebuild:
+    rebuild_panel = rebuild or not panel_path.exists()
+    if not rebuild_panel:
         panel = Panel.load(panel_path)
-        log.info("loaded cached panel %d dates x %d codes", *panel.shape)
-    else:
+        missing = [field for field in PANEL_CACHE_REQUIRED_FIELDS if field not in panel]
+        if missing:
+            log.warning("cached panel lacks required fields %s; rebuilding", missing)
+            rebuild_panel = True
+            rebuild = True
+        else:
+            log.info("loaded cached panel %d dates x %d codes", *panel.shape)
+    if rebuild_panel:
         panel = build_panel(store, cfg.data.start_date, cfg.data.end_date)
         panel.save(panel_path)
 
@@ -261,6 +270,7 @@ def backtest(cfg: Config, prepared: Prepared, predictions: np.ndarray) -> dict:
         dates=prepared.panel.dates,
         label_cfg=cfg.label,
         cfg=cfg.backtest,
+        panel=prepared.panel if cfg.backtest.enable_realistic_exit else None,
     )
     out = artifacts_dir(cfg)
     if not result.daily.empty:

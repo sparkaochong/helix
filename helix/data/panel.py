@@ -126,6 +126,7 @@ def build_panel(store: ParquetStore, start_date: str = "", end_date: str = "") -
     limits = store.read_dated(schema.STK_LIMIT, start_date, end_date)
     if limits.empty:
         log.warning("stk_limit is empty; falling back to rule-based limit prices")
+        limit_price_observed = np.zeros(panel.shape, dtype=bool)
         up, down = _fallback_limit_prices(panel, store)
     else:
         limits["trade_date"] = limits["trade_date"].astype(str)
@@ -133,11 +134,13 @@ def build_panel(store: ParquetStore, start_date: str = "", end_date: str = "") -
         limits = limits.drop_duplicates(["trade_date", "ts_code"], keep="last")
         up = _pivot(limits, "up_limit", dates, codes)
         down = _pivot(limits, "down_limit", dates, codes)
+        limit_price_observed = np.isfinite(up) & np.isfinite(down)
         rule_up, rule_down = _fallback_limit_prices(panel, store)
         up = np.where(np.isnan(up), rule_up, up)
         down = np.where(np.isnan(down), rule_down, down)
     panel.add("up_limit", up.astype(np.float32))
     panel.add("down_limit", down.astype(np.float32))
+    panel.add("limit_price_observed", limit_price_observed.astype(np.float32))
 
     basic = store.read_dated(schema.DAILY_BASIC, start_date, end_date)
     if not basic.empty:

@@ -116,6 +116,7 @@ class BacktestConfig(BaseModel):
 
     top_k: int = Field(4, gt=0)
     exit_rule: Literal["close", "target"] = "close"
+    enable_realistic_exit: bool = False
     commission_bps: float = Field(2.5, ge=0)               # 佣金，双边
     transfer_bps: float = Field(0.1, ge=0)                 # 过户费，双边
     stamp_sell_bps: float = Field(5.0, ge=0)               # 印花税，仅卖出，2023-08-28 起

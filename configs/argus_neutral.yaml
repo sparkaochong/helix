@@ -69,6 +69,7 @@ dl:
 backtest:
   top_k: 4
   exit_rule: close
+  enable_realistic_exit: false
   commission_bps: 2.5
   transfer_bps: 0.1
   stamp_sell_bps: 5.0
