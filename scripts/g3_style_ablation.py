@@ -895,10 +895,9 @@ def _refresh_market_cache(
     required_dates = calendar[max(first - 19, 0) : last]
     existing = pd.read_parquet(path) if path.exists() else pd.DataFrame()
     have = set(existing["trade_date"].astype(str)) if not existing.empty else set()
-    frames = [existing] if not existing.empty else []
-    for date in required_dates:
-        if date in have:
-            continue
+    pending: list[pd.DataFrame] = []
+    missing_dates = [date for date in required_dates if date not in have]
+    for number, date in enumerate(missing_dates, start=1):
         daily = source._call(
             "daily",
             trade_date=_digits(date),
@@ -917,12 +916,21 @@ def _refresh_market_cache(
         )
         merged = merged.loc[merged["stock_code"].astype(str).isin(event_codes)].copy()
         merged["trade_date"] = date
-        frames.append(merged)
-    market = pd.concat(frames, ignore_index=True)
-    market = market.drop_duplicates(["trade_date", "stock_code"], keep="last")
-    market = market.sort_values(["trade_date", "stock_code"]).reset_index(drop=True)
-    _atomic_parquet(path, market)
-    return market, calendar
+        pending.append(merged)
+        if len(pending) >= 50 or number == len(missing_dates):
+            market = pd.concat([existing, *pending], ignore_index=True)
+            market = market.drop_duplicates(["trade_date", "stock_code"], keep="last")
+            market = market.sort_values(["trade_date", "stock_code"]).reset_index(drop=True)
+            _atomic_parquet(path, market)
+            existing = market
+            pending.clear()
+            print(
+                f"style market cache: {number}/{len(missing_dates)} missing dates fetched",
+                flush=True,
+            )
+    if existing.empty:
+        raise ValueError("style market cache refresh returned no rows")
+    return existing, calendar
 
 
 def _refresh_industry_cache(path: Path) -> pd.DataFrame:
