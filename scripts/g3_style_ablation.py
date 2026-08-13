@@ -9,8 +9,10 @@ import json
 import os
 import tempfile
 from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from threading import local
 
 import numpy as np
 import pandas as pd
@@ -897,13 +899,29 @@ def _refresh_market_cache(
     have = set(existing["trade_date"].astype(str)) if not existing.empty else set()
     pending: list[pd.DataFrame] = []
     missing_dates = [date for date in required_dates if date not in have]
-    for number, date in enumerate(missing_dates, start=1):
-        daily = source._call(
+    worker_count = 8
+    per_worker_limit = max(Config.load().data.requests_per_minute // worker_count - 2, 1)
+    worker_config = Config.load()
+    worker_config = worker_config.model_copy(
+        update={
+            "data": worker_config.data.model_copy(
+                update={"requests_per_minute": per_worker_limit}
+            )
+        }
+    )
+    worker_state = local()
+
+    def fetch_date(date: str) -> pd.DataFrame:
+        worker_source = getattr(worker_state, "source", None)
+        if worker_source is None:
+            worker_source = TushareSource(worker_config)
+            worker_state.source = worker_source
+        daily = worker_source._call(
             "daily",
             trade_date=_digits(date),
             fields="ts_code,trade_date,open,close,pct_chg",
         ).rename(columns={"ts_code": "stock_code"})
-        basic = source._call(
+        basic = worker_source._call(
             "daily_basic",
             trade_date=_digits(date),
             fields="ts_code,trade_date,total_mv,turnover_rate_f",
@@ -916,18 +934,27 @@ def _refresh_market_cache(
         )
         merged = merged.loc[merged["stock_code"].astype(str).isin(event_codes)].copy()
         merged["trade_date"] = date
-        pending.append(merged)
-        if len(pending) >= 50 or number == len(missing_dates):
-            market = pd.concat([existing, *pending], ignore_index=True)
-            market = market.drop_duplicates(["trade_date", "stock_code"], keep="last")
-            market = market.sort_values(["trade_date", "stock_code"]).reset_index(drop=True)
-            _atomic_parquet(path, market)
-            existing = market
-            pending.clear()
-            print(
-                f"style market cache: {number}/{len(missing_dates)} missing dates fetched",
-                flush=True,
-            )
+        return merged
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        fetched = executor.map(fetch_date, missing_dates)
+        for number, merged in enumerate(fetched, start=1):
+            pending.append(merged)
+            if len(pending) >= 50 or number == len(missing_dates):
+                market = pd.concat([existing, *pending], ignore_index=True)
+                market = market.drop_duplicates(
+                    ["trade_date", "stock_code"], keep="last"
+                )
+                market = market.sort_values(
+                    ["trade_date", "stock_code"]
+                ).reset_index(drop=True)
+                _atomic_parquet(path, market)
+                existing = market
+                pending.clear()
+                print(
+                    f"style market cache: {number}/{len(missing_dates)} missing dates fetched",
+                    flush=True,
+                )
     if existing.empty:
         raise ValueError("style market cache refresh returned no rows")
     return existing, calendar
