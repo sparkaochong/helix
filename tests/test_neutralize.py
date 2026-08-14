@@ -171,7 +171,7 @@ def test_neutralised_rounds_find_a_second_independent_driver():
     has to reach for ``beta`` -- which is exactly the behaviour that produces a set of
     factors worth adding to a model rather than one idea restated five times.
     """
-    from helix.config import GPConfig
+    from helix.config import BacktestConfig, GPConfig
     from helix.gp.engine import run_search
     from helix.gp.event_primitives import build_event_pset
 
@@ -181,8 +181,17 @@ def test_neutralised_rounds_find_a_second_independent_driver():
     beta = rng.normal(size=shape)
     noise = rng.normal(size=shape)
     logit = 1.6 * alpha + 0.9 * beta
-    y = (rng.uniform(size=shape) < 1 / (1 + np.exp(-logit))).astype(float)
+    gross = 0.005 + 0.02 * np.tanh(logit) + rng.normal(0.0, 0.002, size=shape)
     mask = np.ones(shape, dtype=bool)
+    dates = np.array([f"{20200101 + i:08d}" for i in range(shape[0])])
+    costs = BacktestConfig(
+        top_k=4,
+        commission_bps=0,
+        transfer_bps=0,
+        stamp_sell_bps=0,
+        stamp_sell_bps_before_cut=0,
+        slippage_bps=0,
+    )
 
     fields = {"alpha": alpha, "beta": beta, "noise": noise}
     names = ["alpha", "beta", "noise"]
@@ -192,13 +201,38 @@ def test_neutralised_rounds_find_a_second_independent_driver():
     )
     pset = build_event_pset(names)
 
-    plain = run_search(fields, names, y, mask, cfg, embargo_days=5, pset=pset, kind="event")
+    plain = run_search(
+        fields=fields,
+        field_names=names,
+        gross_returns=gross,
+        candidate_mask=mask,
+        dates=dates,
+        cfg=cfg,
+        backtest_cfg=costs,
+        entry_offset=1,
+        touch_offset=2,
+        embargo_days=5,
+        pset=pset,
+        kind="event",
+    )
     assert plain.library.factors
     assert "alpha" in plain.library.factors[0].expression
 
     basis = build_basis([alpha], mask)
     neutralised = run_search(
-        fields, names, y, mask, cfg, embargo_days=5, pset=pset, kind="event", basis=basis
+        fields=fields,
+        field_names=names,
+        gross_returns=gross,
+        candidate_mask=mask,
+        dates=dates,
+        cfg=cfg,
+        backtest_cfg=costs,
+        entry_offset=1,
+        touch_offset=2,
+        embargo_days=5,
+        pset=pset,
+        kind="event",
+        basis=basis,
     )
     assert neutralised.library.factors, "nothing survived once alpha was projected out"
     top = neutralised.library.factors[0].expression

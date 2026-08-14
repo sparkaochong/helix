@@ -4,8 +4,8 @@ Design choices that matter more than the GP hyper-parameters:
 
 * **Search sees only the oldest training block.** Everything after it is reserved for
   walk-forward evaluation, so the reported out-of-sample numbers mean something.
-* **Fit and select on different rows.** Evolution maximises |gini| on the fit rows;
-  survival requires the same sign to hold on embargoed selection rows.
+* **Fit and select on different rows.** Evolution maximises production Top-K net P&L
+  on the fit rows; survival requires positive P&L on embargoed training rows.
 * **Deduplicate before handing factors to the network.** GP converges on families of
   near-identical expressions; feeding 24 copies of one idea to a GRU is worse than
   feeding 8 distinct ones.
@@ -22,8 +22,9 @@ from dataclasses import dataclass
 import numpy as np
 from deap import algorithms, base, creator, gp, tools
 
-from ..config import GPConfig
+from ..config import BacktestConfig, GPConfig
 from ..eval.metrics import pairwise_max_abs_corr
+from ..eval.objective import cost_adjusted_returns
 from ..features.operators import cs_rank
 from ..logging_setup import get_logger
 from .fitness import INVALID, EvalContext, evaluate
@@ -42,7 +43,7 @@ def _ensure_creator() -> None:
     global _CREATOR_READY
     if _CREATOR_READY:
         return
-    creator.create("HelixFitness", base.Fitness, weights=(1.0,))
+    creator.create("HelixFitness", base.Fitness, weights=(1.0, -1.0))
     creator.create("HelixIndividual", gp.PrimitiveTree, fitness=creator.HelixFitness)
     _CREATOR_READY = True
 
@@ -69,15 +70,37 @@ def build_toolbox(pset: gp.PrimitiveSetTyped, cfg: GPConfig) -> base.Toolbox:
 def make_context(
     fields: dict[str, np.ndarray],
     field_names: list[str],
-    y: np.ndarray,
-    mask: np.ndarray,
+    gross_returns: np.ndarray,
+    candidate_mask: np.ndarray,
+    dates: np.ndarray,
     cfg: GPConfig,
+    backtest_cfg: BacktestConfig,
+    entry_offset: int,
+    touch_offset: int,
     embargo_days: int,
     fit_fraction: float = 0.8,
     basis: np.ndarray | None = None,
 ) -> EvalContext:
-    """Split the search block into fit rows and embargoed selection rows."""
-    n_rows = y.shape[0]
+    """Precompute costs and split training into fit and embargoed selection rows."""
+    gross = np.asarray(gross_returns, dtype=np.float64)
+    candidates = np.asarray(candidate_mask, dtype=bool)
+    date_values = np.asarray(dates)
+    if gross.ndim != 2 or candidates.shape != gross.shape:
+        raise ValueError("gross returns and candidate mask must share one two-dimensional shape")
+    if date_values.ndim != 1 or len(date_values) != gross.shape[0]:
+        raise ValueError("dates must align with gross returns")
+    for name in field_names:
+        if name not in fields:
+            raise ValueError(f"missing GP field: {name}")
+        if np.asarray(fields[name]).shape != gross.shape:
+            raise ValueError(f"GP field {name!r} does not align with gross returns")
+    if basis is not None and basis.shape[:2] != gross.shape:
+        raise ValueError("neutralisation basis does not align with gross returns")
+    overlap = touch_offset - entry_offset + 1
+    if overlap <= 0:
+        raise ValueError("touch_offset must be greater than or equal to entry_offset")
+
+    n_rows = gross.shape[0]
     cut = int(n_rows * fit_fraction)
     sel_start = min(cut + embargo_days, n_rows)
     if n_rows - sel_start < 20:
@@ -91,13 +114,13 @@ def make_context(
     )
     return EvalContext(
         field_arrays=[np.asarray(fields[n], dtype=np.float64) for n in field_names],
-        y=y,
-        mask=mask,
+        net_returns=cost_adjusted_returns(gross, date_values, backtest_cfg),
+        candidate_mask=candidates,
         fit_rows=slice(0, cut),
         sel_rows=slice(sel_start, n_rows),
-        min_daily_samples=cfg.min_daily_samples,
+        top_k=backtest_cfg.top_k,
+        overlap=overlap,
         min_coverage=cfg.min_coverage,
-        complexity_penalty=cfg.complexity_penalty,
         basis=basis,
     )
 
@@ -121,15 +144,19 @@ def liquidity_top_columns(amount: np.ndarray, mask: np.ndarray, k: int) -> np.nd
 @dataclass
 class SearchResult:
     library: FactorLibrary
-    hall_of_fame: list[tuple[str, float, float]]  # expression, fit_gini, sel_gini
+    hall_of_fame: list[tuple[str, float, float]]  # expression, fit net P&L, selection net P&L
 
 
 def run_search(
     fields: dict[str, np.ndarray],
     field_names: list[str],
-    y: np.ndarray,
-    mask: np.ndarray,
+    gross_returns: np.ndarray,
+    candidate_mask: np.ndarray,
+    dates: np.ndarray,
     cfg: GPConfig,
+    backtest_cfg: BacktestConfig,
+    entry_offset: int,
+    touch_offset: int,
     embargo_days: int,
     pset: gp.PrimitiveSetTyped | None = None,
     kind: str = "panel",
@@ -142,7 +169,19 @@ def run_search(
 
     pset = pset if pset is not None else build_pset(field_names, cfg.windows)
     toolbox = build_toolbox(pset, cfg)
-    ctx = make_context(fields, field_names, y, mask, cfg, embargo_days, basis=basis)
+    ctx = make_context(
+        fields,
+        field_names,
+        gross_returns,
+        candidate_mask,
+        dates,
+        cfg,
+        backtest_cfg,
+        entry_offset,
+        touch_offset,
+        embargo_days,
+        basis=basis,
+    )
 
     population = toolbox.population(n=cfg.population)
     hof = tools.HallOfFame(cfg.hall_of_fame)
@@ -150,7 +189,8 @@ def run_search(
     for generation in range(cfg.generations + 1):
         pending = [ind for ind in population if not ind.fitness.valid]
         for ind in pending:
-            ind.fitness.values = (evaluate(ind, toolbox, ctx).fitness,)
+            score = evaluate(ind, toolbox, ctx)
+            ind.fitness.values = (score.fitness, score.n_nodes)
         hof.update(population)
 
         valid_fitness = [
@@ -182,11 +222,15 @@ def _select_factors(
         score = ctx._cache.get(str(ind))
         if score is None or score.fitness <= INVALID / 2:
             continue
-        if not np.isfinite(score.sel_gini) or score.sel_gini <= 0:
+        if not np.isfinite(score.sel_net_return) or score.sel_net_return <= 0:
             continue  # sign did not survive the embargoed selection block
         ranked.append((str(ind), score))
-    ranked.sort(key=lambda item: item[1].sel_gini, reverse=True)
-    log.info("%d/%d hall-of-fame factors survived out-of-sample sign check", len(ranked), len(hof))
+    ranked.sort(key=lambda item: (-item[1].sel_net_return, item[1].n_nodes))
+    log.info(
+        "%d/%d hall-of-fame factors survived the training selection-P&L check",
+        len(ranked),
+        len(hof),
+    )
 
     kept_specs: list[FactorSpec] = []
     kept_ranks: list[np.ndarray] = []
@@ -197,11 +241,11 @@ def _select_factors(
         func = toolbox.compile(expr=tree)
         with np.errstate(all="ignore"):
             values = func(*ctx.field_arrays)
-        if not isinstance(values, np.ndarray) or values.shape != ctx.y.shape:
+        if not isinstance(values, np.ndarray) or values.shape != ctx.net_returns.shape:
             continue
-        oriented = np.where(ctx.mask, values * score.sign, np.nan)
+        oriented = np.where(ctx.candidate_mask, values, np.nan)
         if ctx.basis is not None:
-            oriented = residualize(oriented, ctx.basis, ctx.mask)
+            oriented = residualize(oriented, ctx.basis, ctx.candidate_mask)
         ranks = cs_rank(oriented)
         if pairwise_max_abs_corr(ranks, kept_ranks) > cfg.max_abs_corr:
             continue
@@ -209,7 +253,7 @@ def _select_factors(
             FactorSpec(
                 name=f"gp_{len(kept_specs):03d}",
                 expression=expression,
-                sign=score.sign,
+                sign=1.0,
                 metrics=score.as_dict(),
             )
         )
@@ -218,8 +262,10 @@ def _select_factors(
     log.info("kept %d factors after correlation dedup (threshold %.2f)", len(kept_specs), cfg.max_abs_corr)
     for spec in kept_specs:
         log.info(
-            "  %s  fit_gini=%.4f  sel_gini=%.4f  nodes=%d\n    %s",
-            spec.name, spec.metrics["fit_gini"], spec.metrics["sel_gini"],
+            "  %s  fit_net=%.4f%%  sel_net=%.4f%%  nodes=%d\n    %s",
+            spec.name,
+            100 * spec.metrics["fit_net_return"],
+            100 * spec.metrics["sel_net_return"],
             int(spec.metrics["n_nodes"]), spec.expression,
         )
 
@@ -227,5 +273,5 @@ def _select_factors(
         library=FactorLibrary(
             factors=kept_specs, field_names=field_names, windows=cfg.windows, kind=kind
         ),
-        hall_of_fame=[(e, s.fit_gini, s.sel_gini) for e, s in ranked],
+        hall_of_fame=[(e, s.fit_net_return, s.sel_net_return) for e, s in ranked],
     )
