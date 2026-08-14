@@ -22,6 +22,13 @@ import pandas as pd
 
 from ..logging_setup import get_logger
 from . import schema
+from .price_lineage import (
+    PriceLineage,
+    PriceLineageError,
+    adjustment_factor_version,
+    make_hfq_lineage,
+    require_hfq_lineage,
+)
 from .store import ParquetStore
 
 log = get_logger(__name__)
@@ -34,6 +41,7 @@ class Panel:
     dates: np.ndarray  # (T,) YYYYMMDD strings, ascending
     codes: np.ndarray  # (N,) ts_codes, sorted
     fields: dict[str, np.ndarray] = field(default_factory=dict)
+    price_lineage: dict[str, PriceLineage] = field(default_factory=dict)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -48,13 +56,25 @@ class Panel:
     def __contains__(self, name: str) -> bool:
         return name in self.fields
 
-    def add(self, name: str, values: np.ndarray) -> None:
+    def add(
+        self, name: str, values: np.ndarray, *, price_lineage: PriceLineage | None = None
+    ) -> None:
         if values.shape != self.shape:
             raise ValueError(f"field {name!r} has shape {values.shape}, expected {self.shape}")
         self.fields[name] = values
+        if price_lineage is None:
+            self.price_lineage.pop(name, None)
+        else:
+            self.price_lineage[name] = price_lineage
 
     def f64(self, name: str) -> np.ndarray:
         return np.asarray(self[name], dtype=np.float64)
+
+    def require_adjusted_prices(self, fields: tuple[str, ...], purpose: str):
+        missing = [field for field in fields if field not in self]
+        if missing:
+            raise PriceLineageError(f"{purpose}: missing adjusted price fields {missing}")
+        return require_hfq_lineage(self.dates, self.price_lineage, fields, purpose)
 
     # ------------------------------------------------------------- subsetting --
     def slice_dates(self, start: str = "", end: str = "") -> Panel:
@@ -64,6 +84,15 @@ class Panel:
             dates=self.dates[lo:hi],
             codes=self.codes,
             fields={k: v[lo:hi] for k, v in self.fields.items()},
+            price_lineage={
+                name: PriceLineage(
+                    source_date=item.source_date[lo:hi],
+                    as_of_time=item.as_of_time[lo:hi],
+                    price_basis=item.price_basis,
+                    adj_factor_version=item.adj_factor_version,
+                )
+                for name, item in self.price_lineage.items()
+            },
         )
 
     def select_codes(self, col_index: np.ndarray) -> Panel:
@@ -71,12 +100,20 @@ class Panel:
             dates=self.dates,
             codes=self.codes[col_index],
             fields={k: v[:, col_index] for k, v in self.fields.items()},
+            price_lineage=dict(self.price_lineage),
         )
 
     # ----------------------------------------------------------------- cache --
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(path, dates=self.dates, codes=self.codes, **self.fields)
+        lineage = {}
+        for name, item in self.price_lineage.items():
+            prefix = f"__lineage__{name}__"
+            lineage[f"{prefix}source_date"] = np.asarray(item.source_date, dtype=str)
+            lineage[f"{prefix}as_of_time"] = np.asarray(item.as_of_time, dtype=str)
+            lineage[f"{prefix}price_basis"] = np.asarray(item.price_basis, dtype=str)
+            lineage[f"{prefix}adj_factor_version"] = np.asarray(item.adj_factor_version, dtype=str)
+        np.savez_compressed(path, dates=self.dates, codes=self.codes, **self.fields, **lineage)
         log.info("panel cached to %s (%d dates x %d codes)", path, *self.shape)
 
     @classmethod
@@ -84,14 +121,73 @@ class Panel:
         with np.load(path, allow_pickle=False) as z:
             dates = z["dates"].astype(str)
             codes = z["codes"].astype(str)
-            fields = {k: z[k] for k in z.files if k not in ("dates", "codes")}
-        return cls(dates=dates, codes=codes, fields=fields)
+            lineage_keys = [key for key in z.files if key.startswith("__lineage__")]
+            fields = {k: z[k] for k in z.files if k not in ("dates", "codes", *lineage_keys)}
+            lineage: dict[str, PriceLineage] = {}
+            suffix = "__source_date"
+            for key in lineage_keys:
+                if not key.endswith(suffix):
+                    continue
+                name = key[len("__lineage__") : -len(suffix)]
+                prefix = f"__lineage__{name}__"
+                required = ("source_date", "as_of_time", "price_basis", "adj_factor_version")
+                if not all(f"{prefix}{part}" in z.files for part in required):
+                    raise PriceLineageError(f"malformed cached price lineage for field {name!r}")
+                lineage[name] = PriceLineage(
+                    source_date=z[f"{prefix}source_date"],
+                    as_of_time=z[f"{prefix}as_of_time"],
+                    price_basis=str(z[f"{prefix}price_basis"]),
+                    adj_factor_version=str(z[f"{prefix}adj_factor_version"]),
+                )
+        return cls(dates=dates, codes=codes, fields=fields, price_lineage=lineage)
 
 
 def _pivot(df: pd.DataFrame, value: str, dates: np.ndarray, codes: np.ndarray) -> np.ndarray:
     wide = df.pivot(index="trade_date", columns="ts_code", values=value)
     wide = wide.reindex(index=dates, columns=codes)
     return wide.to_numpy(dtype=np.float32)
+
+
+def _deduplicate_adjustment_rows(adj: pd.DataFrame) -> pd.DataFrame:
+    keys = ["trade_date", "ts_code"]
+    duplicate_rows = adj[adj.duplicated(keys, keep=False)]
+    for (date, code), group in duplicate_rows.groupby(keys, sort=True):
+        values = group["adj_factor"].to_numpy()
+        if not all(
+            (pd.isna(value) and pd.isna(values[0])) or value == values[0] for value in values[1:]
+        ):
+            raise PriceLineageError(
+                f"adj_factor rows conflict for {date} {code}: conflicting values"
+            )
+    return adj.drop_duplicates(keys, keep="first")
+
+
+def build_adjusted_price_fields(
+    daily: pd.DataFrame, adj: pd.DataFrame, dates: np.ndarray, codes: np.ndarray
+) -> tuple[dict[str, np.ndarray], dict[str, PriceLineage]]:
+    """Build HFQ price fields using only same-date adjustment factors."""
+    adj = adj.copy()
+    adj["trade_date"] = adj["trade_date"].astype(str)
+    adj["ts_code"] = adj["ts_code"].astype(str)
+    adj["adj_factor"] = pd.to_numeric(adj["adj_factor"], errors="coerce")
+    adj = adj[adj["trade_date"].isin(dates) & adj["ts_code"].isin(codes)]
+    adj = _deduplicate_adjustment_rows(adj)
+    adj_factor = _pivot(adj, "adj_factor", dates, codes)
+    raw_close = _pivot(daily, "close", dates, codes)
+    invalid = np.isfinite(raw_close) & (~np.isfinite(adj_factor) | (adj_factor <= 0))
+    if invalid.any():
+        row, column = np.argwhere(invalid)[0]
+        raise PriceLineageError(
+            f"missing or invalid adj_factor for {dates[row]} {codes[column]}: same-date factor required"
+        )
+    version = adjustment_factor_version(adj)
+    lineage = make_hfq_lineage(dates, version)
+    fields = {"adj_factor": adj_factor}
+    field_lineage = {}
+    for column in PRICE_COLUMNS:
+        fields[f"{column}_hfq"] = _pivot(daily, column, dates, codes) * adj_factor
+        field_lineage[f"{column}_hfq"] = lineage
+    return fields, field_lineage
 
 
 def build_panel(store: ParquetStore, start_date: str = "", end_date: str = "") -> Panel:
@@ -117,11 +213,9 @@ def build_panel(store: ParquetStore, start_date: str = "", end_date: str = "") -
         raise RuntimeError("adj_factor table is empty; back-adjusted prices are required")
     adj["trade_date"] = adj["trade_date"].astype(str)
     adj["ts_code"] = adj["ts_code"].astype(str)
-    adj = adj.drop_duplicates(["trade_date", "ts_code"], keep="last")
-    adj_factor = _pivot(adj, "adj_factor", dates, codes)
-    panel.add("adj_factor", adj_factor)
-    for col in PRICE_COLUMNS:
-        panel.add(f"{col}_hfq", panel[col] * adj_factor)
+    adjusted_fields, price_lineage = build_adjusted_price_fields(daily, adj, dates, codes)
+    for name, values in adjusted_fields.items():
+        panel.add(name, values, price_lineage=price_lineage.get(name))
 
     limits = store.read_dated(schema.STK_LIMIT, start_date, end_date)
     if limits.empty:

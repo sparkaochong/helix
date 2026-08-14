@@ -9,9 +9,10 @@ import numpy as np
 from helix import pipeline
 from helix.config import Config, DataConfig
 from helix.data.panel import Panel
+from helix.data.price_lineage import make_hfq_lineage
 
 
-def test_prepare_rebuilds_a_legacy_panel_without_limit_provenance(monkeypatch, tmp_path):
+def test_prepare_rebuilds_a_legacy_panel_without_required_provenance(monkeypatch, tmp_path):
     shape = (2, 1)
     dates = np.asarray(["20240101", "20240102"])
     codes = np.asarray(["000001.SZ"])
@@ -22,11 +23,11 @@ def test_prepare_rebuilds_a_legacy_panel_without_limit_provenance(monkeypatch, t
     upgraded = Panel(
         dates=dates,
         codes=codes,
-        fields={
-            "open": np.ones(shape),
-            "limit_price_observed": np.ones(shape),
-        },
+        fields={"open": np.ones(shape), "limit_price_observed": np.ones(shape)},
     )
+    lineage = make_hfq_lineage(dates, "raw-times-same-day-adj-v1:abc")
+    for field in ("open_hfq", "high_hfq", "low_hfq", "close_hfq"):
+        upgraded.add(field, np.ones(shape), price_lineage=lineage)
     rebuilds: list[bool] = []
 
     def fake_build_panel(*args, **kwargs):
@@ -55,3 +56,4 @@ def test_prepare_rebuilds_a_legacy_panel_without_limit_provenance(monkeypatch, t
     assert rebuilds == [True]
     assert "limit_price_observed" in prepared.panel
     assert "limit_price_observed" in Panel.load(panel_path)
+    assert Panel.load(panel_path).price_lineage["open_hfq"] == lineage

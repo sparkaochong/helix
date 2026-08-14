@@ -16,6 +16,7 @@ import pandas as pd
 
 from .config import Config
 from .data.panel import Panel, build_panel
+from .data.price_lineage import PriceLineageError
 from .data.store import ParquetStore
 from .data.universe import build_universe
 from .dl.checkpoint import latest_checkpoint, load_checkpoint, require_matching_factors
@@ -36,6 +37,7 @@ from .splits import complete_outcome_window, search_window, walk_forward
 log = get_logger(__name__)
 
 PANEL_CACHE_REQUIRED_FIELDS = ("limit_price_observed",)
+PANEL_CACHE_REQUIRED_ADJUSTED_FIELDS = ("open_hfq", "high_hfq", "low_hfq", "close_hfq")
 
 
 @dataclass
@@ -78,7 +80,14 @@ def prepare(cfg: Config, rebuild: bool = False) -> Prepared:
             rebuild_panel = True
             rebuild = True
         else:
-            log.info("loaded cached panel %d dates x %d codes", *panel.shape)
+            try:
+                panel.require_adjusted_prices(PANEL_CACHE_REQUIRED_ADJUSTED_FIELDS, "cached panel")
+            except PriceLineageError as exc:
+                log.warning("cached panel lacks valid adjusted-price lineage: %s; rebuilding", exc)
+                rebuild_panel = True
+                rebuild = True
+            else:
+                log.info("loaded cached panel %d dates x %d codes", *panel.shape)
     if rebuild_panel:
         panel = build_panel(store, cfg.data.start_date, cfg.data.end_date)
         panel.save(panel_path)
