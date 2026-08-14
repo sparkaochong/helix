@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -7,6 +11,7 @@ import pytest
 from helix.config import BacktestConfig
 from helix.gp.library import FactorLibrary, FactorSpec
 from scripts.gp000_loss_attribution import (
+    OutputPaths,
     audit_adjustment_chain,
     build_price_lookup,
     evaluate_horizon_decay,
@@ -15,7 +20,12 @@ from scripts.gp000_loss_attribution import (
     evaluate_style_neutral_book,
     evaluate_top_k_book,
     outcome_complete_dates,
+    rank_root_causes,
+    render_decay_svg,
+    render_equity_svg,
+    render_report,
     validate_formal_factor,
+    write_outputs,
 )
 
 
@@ -262,3 +272,100 @@ def test_style_neutral_book_uses_common_mask_and_is_orthogonal() -> None:
 
     assert result["raw"]["n_days"] == result["style_neutral"]["n_days"]
     assert result["orthogonality"]["max_abs_normalized_exposure"] < 1e-10
+
+
+def _minimal_evidence() -> dict[str, object]:
+    daily = pd.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-03"],
+            "gross_portfolio_return": [0.01, -0.02],
+            "net_portfolio_return": [0.008, -0.022],
+            "style_neutral_return": [0.004, -0.006],
+        }
+    )
+    decay_daily = pd.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-03"] * 2,
+            "horizon": [1, 1, 2, 2],
+            "net_portfolio_return": [0.01, -0.01, 0.005, -0.005],
+        }
+    )
+    return {
+        "metadata": {
+            "command": "PYTHONPATH=. .venv/bin/python scripts/gp000_loss_attribution.py",
+            "train_start": "2022-01-04",
+            "train_end": "2024-09-04",
+        },
+        "summary": "复权口径存在跨路径错配，但不是亏损核心原因。",
+        "adjustment_matrix": pd.DataFrame(
+            [{"节点": "数据源层", "口径": "原始价+点时复权因子", "未来函数": "未发现"}]
+        ),
+        "adjustment_stats": pd.DataFrame([{"指标": "收益错配数", "值": 1}]),
+        "ex_right_samples": pd.DataFrame([{"trade_date": "2024-01-03", "n": 1}]),
+        "quintiles": pd.DataFrame([{"quintile": 1, "n": 2}]),
+        "cost_split": pd.DataFrame([{"口径": "毛收益", "CAGR": -0.1}]),
+        "decay": {
+            "summary": pd.DataFrame([{"horizon": 1, "ic_mean": -0.1}]),
+            "daily": decay_daily,
+        },
+        "monthly": pd.DataFrame([{"month": "2024-01", "net_return": -0.01}]),
+        "daily": daily,
+        "style_table": pd.DataFrame([{"组合": "原始", "CAGR": -0.1}]),
+        "root_causes": [
+            {"category": "因子 alpha", "priority": 1, "cause": "弱", "evidence": "IC<0"},
+            {"category": "工程 bug", "priority": 1, "cause": "错配", "evidence": "raw/hfq"},
+            {"category": "参数配置", "priority": 1, "cause": "目标", "evidence": "hit/close"},
+        ],
+        "repairs": [
+            {"类别": "工程 bug", "修复路径": "统一 HFQ", "预期效果": "消除错配"}
+        ],
+    }
+
+
+def test_root_causes_rank_engineering_before_config_before_alpha() -> None:
+    causes = rank_root_causes(_minimal_evidence())
+
+    assert [cause["category"] for cause in causes] == [
+        "工程 bug",
+        "参数配置",
+        "因子 alpha",
+    ]
+
+
+def test_report_contains_every_required_section() -> None:
+    report = render_report(_minimal_evidence())
+
+    for heading in (
+        "复权全链路审计",
+        "除权日专项校验",
+        "五分位单调性",
+        "成本拆分",
+        "收益衰减",
+        "时间分布",
+        "风格中性收益",
+        "根因优先级",
+        "修复路径与预期效果",
+        "复现方式",
+    ):
+        assert heading in report
+
+
+def test_svg_and_machine_outputs_are_well_formed(tmp_path: Path) -> None:
+    evidence = _minimal_evidence()
+    ET.fromstring(render_equity_svg(evidence["daily"]))
+    ET.fromstring(render_decay_svg(evidence["decay"]))
+    paths = OutputPaths(
+        report=tmp_path / "report.md",
+        json=tmp_path / "evidence.json",
+        daily=tmp_path / "daily.parquet",
+        equity_svg=tmp_path / "equity.svg",
+        decay_svg=tmp_path / "decay.svg",
+    )
+
+    write_outputs(evidence, paths)
+
+    assert "NaN" not in paths.json.read_text(encoding="utf-8")
+    json.loads(paths.json.read_text(encoding="utf-8"))
+    ET.parse(paths.equity_svg)
+    ET.parse(paths.decay_svg)
+    assert pd.read_parquet(paths.daily).shape == evidence["daily"].shape

@@ -3,8 +3,13 @@
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
+from html import escape
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -48,6 +53,17 @@ class PriceLookup:
     ex_right: np.ndarray
     date_positions: dict[str, int]
     code_positions: dict[str, int]
+
+
+@dataclass(frozen=True)
+class OutputPaths:
+    """Tracked and machine-readable outputs emitted from one evidence payload."""
+
+    report: Path
+    json: Path
+    daily: Path
+    equity_svg: Path
+    decay_svg: Path
 
 
 def _hyphenated(value: object) -> str:
@@ -690,3 +706,276 @@ def evaluate_style_neutral_book(
         "style_neutral_daily": daily_frames["style_neutral"],
         "orthogonality": orthogonality,
     }
+
+
+CATEGORY_ORDER = {"工程 bug": 0, "参数配置": 1, "因子 alpha": 2}
+
+
+def rank_root_causes(evidence: dict[str, object]) -> list[dict[str, object]]:
+    """Enforce the requested engineering/configuration/alpha presentation order."""
+    causes = [dict(row) for row in evidence["root_causes"]]
+    unknown = {str(row.get("category")) for row in causes} - set(CATEGORY_ORDER)
+    if unknown:
+        raise ValueError(f"unknown root-cause categories: {sorted(unknown)}")
+    return sorted(
+        causes,
+        key=lambda row: (
+            CATEGORY_ORDER[str(row["category"])],
+            int(row.get("priority", 0)),
+        ),
+    )
+
+
+def _display_cell(value: object) -> str:
+    if value is None or (isinstance(value, float) and not np.isfinite(value)):
+        return "—"
+    if isinstance(value, (bool, np.bool_)):
+        return "是" if value else "否"
+    if isinstance(value, (float, np.floating)):
+        return f"{float(value):.6g}"
+    return str(value).replace("|", "\\|").replace("\n", "<br>")
+
+
+def markdown_table(frame: pd.DataFrame) -> str:
+    """Render a compact Markdown table without an optional tabulate dependency."""
+    if frame.empty:
+        return "_无样本。_"
+    headers = [str(column) for column in frame.columns]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    lines.extend(
+        "| " + " | ".join(_display_cell(value) for value in row) + " |"
+        for row in frame.itertuples(index=False, name=None)
+    )
+    return "\n".join(lines)
+
+
+def render_report(evidence: dict[str, object]) -> str:
+    """Render the complete Chinese audit report from calculated evidence."""
+    metadata = evidence["metadata"]
+    sections = [
+        "# gp_000 亏损根因排查与复权全链路审计",
+        "## 执行摘要",
+        str(evidence["summary"]),
+        (
+            f"审计窗口严格限定为 `{metadata['train_start']}` 至 "
+            f"`{metadata['train_end']}`，所有 D+h 结果均按各自出场日做边界截断。"
+        ),
+        "## 第一部分：复权全链路审计",
+        "### 四节点口径与点时性",
+        markdown_table(evidence["adjustment_matrix"]),
+        "### 口径一致性校验",
+        markdown_table(evidence["adjustment_stats"]),
+        "### 除权日专项校验",
+        markdown_table(evidence["ex_right_samples"]),
+        "## 第二部分：gp_000 亏损归因",
+        "### 五分位单调性",
+        markdown_table(evidence["quintiles"]),
+        "### 成本拆分",
+        markdown_table(evidence["cost_split"]),
+        "### 收益衰减",
+        markdown_table(evidence["decay"]["summary"]),
+        "![D+1 至 D+10 衰减](assets/gp000_loss_attribution_decay.svg)",
+        "### 时间分布",
+        markdown_table(evidence["monthly"]),
+        "![累计收益](assets/gp000_loss_attribution_equity.svg)",
+        "### 风格中性收益",
+        markdown_table(evidence["style_table"]),
+        "## 根因优先级",
+        markdown_table(pd.DataFrame(rank_root_causes(evidence))),
+        "## 修复路径与预期效果",
+        markdown_table(pd.DataFrame(evidence["repairs"])),
+        "## 复现方式",
+        f"```bash\n{metadata['command']}\n```",
+    ]
+    return "\n\n".join(sections) + "\n"
+
+
+def line_chart_svg(
+    series: dict[str, Sequence[float] | np.ndarray],
+    *,
+    title: str,
+    y_label: str,
+) -> str:
+    """Render deterministic shared-axis line series as standalone SVG."""
+    prepared = {
+        str(name): np.asarray(values, dtype=float)
+        for name, values in series.items()
+        if np.asarray(values).size
+    }
+    finite_values = np.concatenate(
+        [values[np.isfinite(values)] for values in prepared.values()]
+    )
+    if finite_values.size == 0:
+        raise ValueError("chart has no finite values")
+    width, height = 960.0, 480.0
+    left, right, top, bottom = 75.0, 30.0, 55.0, 55.0
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    y_min = float(min(finite_values.min(), 1.0))
+    y_max = float(max(finite_values.max(), 1.0))
+    if np.isclose(y_min, y_max):
+        y_min -= 0.01
+        y_max += 0.01
+    margin = (y_max - y_min) * 0.05
+    y_min -= margin
+    y_max += margin
+
+    def y_position(value: float) -> float:
+        return top + (y_max - value) / (y_max - y_min) * plot_height
+
+    colors = ("#2563eb", "#dc2626", "#059669", "#7c3aed", "#d97706")
+    elements = [
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 480">',
+        '<rect width="960" height="480" fill="#ffffff"/>',
+        f'<text x="480" y="30" text-anchor="middle" font-size="20">{escape(title)}</text>',
+        f'<text x="18" y="240" text-anchor="middle" font-size="13" transform="rotate(-90 18 240)">{escape(y_label)}</text>',
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{height-bottom}" stroke="#334155"/>',
+        f'<line x1="{left}" y1="{height-bottom}" x2="{width-right}" y2="{height-bottom}" stroke="#334155"/>',
+        f'<line x1="{left}" y1="{y_position(1.0):.2f}" x2="{width-right}" y2="{y_position(1.0):.2f}" stroke="#94a3b8" stroke-dasharray="4 4"/>',
+    ]
+    for index, (name, values) in enumerate(prepared.items()):
+        denominator = max(len(values) - 1, 1)
+        points = [
+            f"{left + position / denominator * plot_width:.2f},{y_position(value):.2f}"
+            for position, value in enumerate(values)
+            if np.isfinite(value)
+        ]
+        color = colors[index % len(colors)]
+        elements.append(
+            f'<polyline fill="none" stroke="{color}" stroke-width="2" points="'
+            + " ".join(points)
+            + '"/>'
+        )
+        legend_x = left + index * 155
+        elements.extend(
+            [
+                f'<line x1="{legend_x}" y1="462" x2="{legend_x + 24}" y2="462" stroke="{color}" stroke-width="3"/>',
+                f'<text x="{legend_x + 30}" y="466" font-size="12">{escape(name)}</text>',
+            ]
+        )
+    elements.extend(
+        [
+            f'<text x="{left - 8}" y="{top + 5}" text-anchor="end" font-size="11">{y_max:.3f}</text>',
+            f'<text x="{left - 8}" y="{height-bottom}" text-anchor="end" font-size="11">{y_min:.3f}</text>',
+            "</svg>",
+        ]
+    )
+    return "\n".join(elements) + "\n"
+
+
+def render_equity_svg(daily: pd.DataFrame) -> str:
+    """Render D+2 gross, net, and style-neutral cumulative equity."""
+    required = {
+        "gross_portfolio_return",
+        "net_portfolio_return",
+        "style_neutral_return",
+    }
+    missing = required - set(daily.columns)
+    if missing:
+        raise KeyError(f"equity daily frame is missing: {sorted(missing)}")
+    series = {
+        "毛收益": np.r_[
+            1.0,
+            np.cumprod(1.0 + daily["gross_portfolio_return"].to_numpy(dtype=float)),
+        ],
+        "净收益": np.r_[
+            1.0,
+            np.cumprod(1.0 + daily["net_portfolio_return"].to_numpy(dtype=float)),
+        ],
+        "风格中性净收益": np.r_[
+            1.0,
+            np.cumprod(1.0 + daily["style_neutral_return"].to_numpy(dtype=float)),
+        ],
+    }
+    return line_chart_svg(series, title="gp_000 Top4 累计收益", y_label="净值")
+
+
+def render_decay_svg(decay: dict[str, pd.DataFrame]) -> str:
+    """Render one Top-K net-equity path per tested holding horizon."""
+    daily = decay["daily"]
+    series = {
+        f"D+{int(horizon)}": np.r_[
+            1.0,
+            np.cumprod(1.0 + block["net_portfolio_return"].to_numpy(dtype=float)),
+        ]
+        for horizon, block in daily.groupby("horizon", sort=True)
+    }
+    return line_chart_svg(series, title="gp_000 Top4 净收益衰减", y_label="净值")
+
+
+def json_ready(value: object) -> object:
+    """Recursively convert analytical objects to strict JSON-compatible values."""
+    if isinstance(value, pd.DataFrame):
+        return json_ready(value.to_dict(orient="records"))
+    if isinstance(value, pd.Series):
+        return json_ready(value.tolist())
+    if isinstance(value, np.ndarray):
+        return json_ready(value.tolist())
+    if isinstance(value, dict):
+        return {str(key): json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_ready(item) for item in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        return float(value) if np.isfinite(value) else None
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, (pd.Timestamp, Path)):
+        return str(value)
+    return value
+
+
+def atomic_text(path: Path, content: str) -> None:
+    """Write UTF-8 text atomically through a sibling temporary file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            handle.write(content)
+            temporary = Path(handle.name)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+def atomic_parquet(path: Path, frame: pd.DataFrame) -> None:
+    """Write a parquet DataFrame atomically through a sibling temporary file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=".parquet",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+        frame.to_parquet(temporary, index=False)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+def write_outputs(evidence: dict[str, object], paths: OutputPaths) -> None:
+    """Emit every artifact from the same immutable-in-practice evidence mapping."""
+    payload = json.dumps(
+        json_ready(evidence),
+        indent=2,
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    atomic_text(paths.report, render_report(evidence))
+    atomic_text(paths.json, payload + "\n")
+    atomic_parquet(paths.daily, evidence["daily"])
+    atomic_text(paths.equity_svg, render_equity_svg(evidence["daily"]))
+    atomic_text(paths.decay_svg, render_decay_svg(evidence["decay"]))
