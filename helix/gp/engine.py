@@ -27,6 +27,7 @@ from ..eval.metrics import pairwise_max_abs_corr
 from ..eval.objective import cost_adjusted_returns
 from ..features.operators import cs_rank
 from ..logging_setup import get_logger
+from ..splits import fit_selection_windows
 from .fitness import INVALID, EvalContext, evaluate
 from .generate import gen_grow, gen_half_and_half
 from .library import FactorLibrary, FactorSpec
@@ -101,23 +102,17 @@ def make_context(
         raise ValueError("touch_offset must be greater than or equal to entry_offset")
 
     n_rows = gross.shape[0]
-    cut = int(n_rows * fit_fraction)
-    sel_start = min(cut + embargo_days, n_rows)
-    if n_rows - sel_start < 20:
-        raise ValueError(
-            f"search window of {n_rows} dates is too short to hold out a selection block; "
-            "increase split.train_days or lengthen the data range"
-        )
+    fit_rows, sel_rows = fit_selection_windows(n_rows, embargo_days, fit_fraction)
     log.info(
         "GP search: fit rows [0:%d], selection rows [%d:%d] (embargo %d)",
-        cut, sel_start, n_rows, embargo_days,
+        fit_rows.stop, sel_rows.start, n_rows, embargo_days,
     )
     return EvalContext(
         field_arrays=[np.asarray(fields[n], dtype=np.float64) for n in field_names],
         net_returns=cost_adjusted_returns(gross, date_values, backtest_cfg),
         candidate_mask=candidates,
-        fit_rows=slice(0, cut),
-        sel_rows=slice(sel_start, n_rows),
+        fit_rows=fit_rows,
+        sel_rows=sel_rows,
         top_k=backtest_cfg.top_k,
         overlap=overlap,
         min_coverage=cfg.min_coverage,
