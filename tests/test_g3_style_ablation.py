@@ -9,6 +9,10 @@ from copy import deepcopy
 import numpy as np
 import pandas as pd
 import pytest
+
+import scripts.g3_style_ablation as g3
+from helix.config import BacktestConfig
+from helix.gp.library import FactorLibrary, FactorSpec
 from scripts.g3_style_ablation import (
     TRAIN_END,
     TRAIN_START,
@@ -17,17 +21,14 @@ from scripts.g3_style_ablation import (
     circular_block_bootstrap_indices,
     compute_trailing_styles,
     decide_go,
-    forward_return_panel,
     load_placebo_icir_p95,
     render_report,
     split_evaluation_windows,
+    split_training_outcomes,
     validate_formal_library,
     validate_seed_contract,
     validate_training_calendar,
 )
-
-from helix.config import BacktestConfig
-from helix.gp.library import FactorLibrary, FactorSpec
 
 
 def test_training_window_is_exact_and_oos_is_returned_separately():
@@ -78,18 +79,133 @@ def test_training_decision_receives_no_oos_values():
     ]
 
 
-def test_forward_horizon_drops_exits_after_window_end():
-    result = forward_return_panel(
-        entry_open=np.array([[10.0, 10.0, 10.0]]),
-        exit_close=np.array([[11.0, 12.0, 13.0]]),
-        entry_adjustment=np.array([[2.0, 2.0, 2.0]]),
-        exit_adjustment=np.array([[2.0, 2.0, 2.0]]),
-        exit_dates=np.array([["2024-09-03", "2024-09-04", "2024-09-05"]]),
-        window_end=TRAIN_END,
+def test_training_outcomes_use_d2_date_and_move_boundary_rows_to_appendix():
+    calendar = np.array(
+        [
+            "2024-09-02",
+            "2024-09-03",
+            "2024-09-04",
+            "2024-09-05",
+            "2024-09-06",
+        ]
+    )
+    frame = pd.DataFrame(
+        {
+            "trade_date": calendar[:3],
+            "stock_code": ["A", "B", "C"],
+        }
     )
 
-    np.testing.assert_allclose(result[0, :2], [0.1, 0.2])
-    assert np.isnan(result[0, 2])
+    decision_train, boundary = split_training_outcomes(
+        frame,
+        calendar,
+        train_end=TRAIN_END,
+    )
+
+    assert decision_train["trade_date"].tolist() == ["2024-09-02"]
+    assert decision_train["label_d2_date"].tolist() == [TRAIN_END]
+    assert boundary["trade_date"].tolist() == ["2024-09-03", TRAIN_END]
+    assert boundary["label_d2_date"].tolist() == ["2024-09-05", "2024-09-06"]
+
+
+def test_training_outcomes_reject_unresolvable_d2_dates():
+    frame = pd.DataFrame(
+        {"trade_date": [TRAIN_END], "stock_code": ["A"]}
+    )
+
+    with pytest.raises(ValueError, match=r"D\+2"):
+        split_training_outcomes(frame, np.array([TRAIN_END]), train_end=TRAIN_END)
+
+
+def test_run_experiment_routes_d2_boundary_rows_only_to_oos_appendix(
+    monkeypatch, tmp_path
+):
+    calendar = np.array(
+        [
+            "2024-09-02",
+            "2024-09-03",
+            "2024-09-04",
+            "2024-09-05",
+            "2024-09-06",
+            "2024-09-09",
+            "2024-09-10",
+        ]
+    )
+    frame = pd.DataFrame(
+        {
+            "trade_date": calendar[:5],
+            "stock_code": ["A", "B", "C", "D", "E"],
+            "feat": 1.0,
+            "label_d2_hit_8pct": 0.0,
+            "label_px_d1_open": 10.0,
+            "label_px_d2_close": 11.0,
+        }
+    )
+    library = FactorLibrary(
+        factors=[FactorSpec("gp_000", "feat", 1.0)],
+        field_names=["feat"],
+        windows=[],
+        kind="event",
+    )
+    market = pd.DataFrame({"trade_date": calendar, "stock_code": "A"})
+    calls = []
+    metrics = {"icir": 0.4, "net_return": 0.2, "net_per_trade": 0.01}
+
+    monkeypatch.setattr(g3, "load_factors", lambda _: library)
+    monkeypatch.setattr(g3.pd, "read_parquet", lambda *_, **__: frame.copy())
+    monkeypatch.setattr(
+        g3,
+        "validate_training_calendar",
+        lambda dates: np.unique(np.asarray(dates).astype(str)),
+    )
+    monkeypatch.setattr(
+        g3,
+        "_load_caches",
+        lambda *_, **__: (market.copy(), pd.DataFrame(), calendar),
+    )
+    monkeypatch.setattr(g3, "compute_trailing_styles", lambda *_: pd.DataFrame())
+    monkeypatch.setattr(g3, "_price_lookup", lambda *_: object())
+
+    def fake_evaluate(evaluation_frame, *_, with_bootstrap, **__):
+        calls.append(evaluation_frame.copy())
+        return {
+            "deterministic": {"raw": metrics.copy(), "style_neutral": metrics.copy()},
+            "bootstrap": {},
+            "orthogonality": {},
+            "decay": [],
+        }
+
+    monkeypatch.setattr(g3, "_evaluate_window", fake_evaluate)
+    monkeypatch.setattr(g3, "load_placebo_icir_p95", lambda _: 0.3)
+    monkeypatch.setattr(g3, "render_report", lambda _: "report")
+    monkeypatch.setattr(g3, "_sha256", lambda _: "sha256")
+    monkeypatch.setattr(g3, "_atomic_text", lambda *_: None)
+
+    g3.run_experiment(
+        input_path=tmp_path / "input.parquet",
+        library_path=tmp_path / "library.json",
+        placebo_path=tmp_path / "placebo.parquet",
+        market_cache=tmp_path / "market.parquet",
+        industry_cache=tmp_path / "industry.parquet",
+        result_path=tmp_path / "result.json",
+        report_path=tmp_path / "report.md",
+        seeds=(1, 2, 3),
+        horizons=(1, 2),
+    )
+
+    assert calls[0]["trade_date"].tolist() == ["2024-09-02"]
+    assert calls[0]["label_d2_date"].tolist() == [TRAIN_END]
+    assert calls[1]["trade_date"].tolist() == [
+        "2024-09-02",
+        "2024-09-03",
+        TRAIN_END,
+    ]
+    assert calls[2]["trade_date"].tolist() == [
+        "2024-09-03",
+        TRAIN_END,
+        "2024-09-05",
+        "2024-09-06",
+    ]
 
 
 def test_trailing_styles_use_d0_and_exactly_19_prior_sessions():
@@ -289,6 +405,11 @@ def _report_payload() -> dict:
         "metadata": {
             "train_start": TRAIN_START,
             "train_end": TRAIN_END,
+            "n_train_dates": 649,
+            "n_decision_dates": 647,
+            "decision_d0_end": "2024-09-02",
+            "boundary_d0_dates": ["2024-09-03", TRAIN_END],
+            "boundary_rows_moved_to_oos": 592,
             "seeds": [7, 13, 42],
             "command": "python scripts/g3_style_ablation.py --cache-only",
         },
@@ -305,6 +426,31 @@ def _report_payload() -> dict:
         "decay": [
             {"horizon": 1, "arm": "raw", "ic_mean": 0.1, "icir": 0.4, "net_per_trade": 0.01}
         ],
+        "c1_boundary_comparison": {
+            "before": {
+                "neutral_icir": 0.41,
+                "raw_net_return": 0.19,
+                "raw_net_per_trade": 0.009,
+                "neutral_net_return": 0.18,
+                "neutral_net_per_trade": 0.004,
+            },
+            "after": {
+                "neutral_icir": 0.4,
+                "raw_net_return": 0.2,
+                "raw_net_per_trade": 0.01,
+                "neutral_net_return": 0.2,
+                "neutral_net_per_trade": 0.005,
+            },
+            "delta": {
+                "neutral_icir": -0.01,
+                "raw_net_return": 0.01,
+                "raw_net_per_trade": 0.001,
+                "neutral_net_return": 0.02,
+                "neutral_net_per_trade": 0.001,
+            },
+            "decision_before": "GO",
+            "decision_after": "GO",
+        },
         "oos": {"raw": metrics, "style_neutral": metrics},
     }
 
@@ -319,6 +465,9 @@ def test_report_has_training_tables_decision_decay_reproduction_and_oos_appendix
         "2024-09-04",
         "确定性核心指标",
         "种子稳健性",
+        "C1 边界修复前后对比",
+        "2024-09-02",
+        "647",
         "因子收益衰减",
         "样本外附录",
         "不参与 GO/NO-GO",
@@ -338,3 +487,9 @@ def test_oos_numbers_cannot_change_rendered_decision():
 
     assert first_report.splitlines()[2] == second_report.splitlines()[2]
     assert "**GO**" in first_report.splitlines()[2]
+
+
+def test_boundary_reproduction_is_contained_in_oos_appendix():
+    report = render_report(_report_payload())
+
+    assert report.index("## 样本外附录") < report.index("C1 边界修复前后对比")

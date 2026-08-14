@@ -212,9 +212,11 @@ DEFAULT_TOP_K = 10
 
 `split_evaluation_windows` sorts and deduplicates keys, returns independent copies for
 `TRAIN_START <= trade_date <= TRAIN_END` and `trade_date > TRAIN_END`, and rejects an
-incomplete primary calendar. `validate_seed_contract` requires at least three distinct
-integer seeds. Keep the two frames separate throughout `run_experiment`; call
-`decide_go` before constructing or rendering OOS results.
+incomplete primary calendar. `split_training_outcomes` then resolves D+2 on the market
+calendar: only the 647 D0 dates through 2024-09-02 reach deterministic or bootstrap
+metrics, while 2024-09-03 and 2024-09-04 are routed to the OOS appendix.
+`validate_seed_contract` requires at least three distinct integer seeds. Call
+`decide_go` only from the label-complete training result.
 
 - [ ] **Step 2: Implement point-in-time style construction and cache coverage**
 
@@ -270,7 +272,7 @@ REQUIRED_METRICS = (
 
 - [ ] **Step 5: Implement decay and forward-window truncation**
 
-`forward_return_panel` aligns each D0 event with D+1 raw open and D+h raw close,
+`_forward_returns_for_events` aligns each D0 event with D+1 raw open and D+h raw close,
 adjusted via same-day factors or the equivalent pct-change chain, and returns NaN when
 the entry/exit is missing or the exit exceeds the evaluated window end. Decay reports
 IC mean, ICIR, and Top10 net return per trade for each requested horizon and arm.
@@ -359,7 +361,8 @@ the JSON artifact.
 
 Use a short Python assertion command to verify:
 
-- report metadata says `2022-01-04` through `2024-09-04` and 649 dates;
+- report metadata says `2022-01-04` through `2024-09-04`, 649 formal D0 dates, and
+  647 decision-eligible D0 dates ending 2024-09-02;
 - ten unique seeds are present;
 - p95 equals a fresh linear quantile from the saved placebo distribution;
 - decision inputs equal the training deterministic metrics;

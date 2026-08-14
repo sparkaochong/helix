@@ -16,11 +16,12 @@ The style set is fixed:
 4. trailing 20-trading-day return volatility;
 5. trailing 20-trading-day mean free-float turnover rate.
 
-The primary window is exactly 2022-01-04 through 2024-09-04. D0 factor and style
-observations, labels, exits, decay targets, bootstrap inputs, and decision statistics
-must all remain inside that interval. Rows whose required future exit is after
-2024-09-04 are excluded at that horizon. The appendix may evaluate later rows but is
-labelled reference-only and is not read by the decision function.
+The formal D0 calendar is exactly 2022-01-04 through 2024-09-04 (649 dates). Primary
+decision metrics additionally require the D+2 label date to be no later than
+2024-09-04, leaving 647 eligible D0 dates through 2024-09-02. D0 rows on 2024-09-03
+and 2024-09-04 are moved to the reference-only appendix before metric or bootstrap
+arrays are built. The same exit-date rule applies independently at every decay horizon.
+The appendix may evaluate later outcomes but is not read by the decision function.
 
 ## Chosen Statistical Design
 
@@ -79,13 +80,16 @@ The experiment script owns orchestration and publication:
 2. load only the formal factor's required source columns and replay its recorded sign
    through the existing factor-library evaluator;
 3. load or build a local market/style cache;
-4. align style data to the event-table `(trade_date, stock_code)` population;
-5. calculate the raw and style-neutral factor arms;
-6. calculate deterministic metrics and seeded bootstrap summaries;
-7. calculate the decay table;
-8. calculate a separately tagged OOS appendix when OOS rows and style data are
+4. map each training D0 to its market-calendar D+2 and move boundary outcomes beyond
+   `train_end` to the appendix;
+5. align style data to the event-table `(trade_date, stock_code)` population;
+6. calculate the raw and style-neutral factor arms;
+7. calculate deterministic metrics and seeded bootstrap summaries from the 647-date
+   label-complete training subset;
+8. calculate the decay table;
+9. calculate a separately tagged OOS appendix when OOS rows and style data are
    available; and
-9. atomically write the Markdown report and compact machine-readable result artifact.
+10. atomically write the Markdown report and compact machine-readable result artifact.
 
 The script exposes explicit CLI options for the input event table, formal factor
 library, style cache, report path, result path, training bounds, seeds, bootstrap block
@@ -138,7 +142,9 @@ is tested against `numpy.linalg.lstsq` date by date as a reference. Required inv
 ## Metrics and Backtest
 
 The primary predictive target is `label_d2_hit_8pct`, matching the existing placebo
-calibration. Metrics are calculated per date and then averaged:
+calibration. Before these labels enter any primary metric, the script resolves each D0
+against the market calendar and retains it only if D0+2 is no later than `train_end`.
+Metrics are calculated per eligible date and then averaged:
 
 - Spearman IC mean and ICIR via the canonical IC functions;
 - signed mean daily gini via the canonical gini function;
@@ -200,7 +206,8 @@ unchanged.
 Tests are written before production code. The numerical suite covers exact continuous
 and industry exposure removal, per-date isolation, missingness, rank deficiency,
 negligible residuals, input immutability, and agreement with a small looped reference
-solver. Script-level tests cover the strict training bounds, forward-horizon truncation,
+solver. Script-level tests cover the strict D+2-complete training bounds, boundary
+routing, forward-horizon truncation,
 minimum seed count, deterministic bootstrap indices, metric aggregation, decision-rule
 strictness and sign handling, formal-library identity, cache coverage, and report
 sections.

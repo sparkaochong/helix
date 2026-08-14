@@ -137,6 +137,46 @@ def split_evaluation_windows(
     return train.reset_index(drop=True), oos.reset_index(drop=True)
 
 
+def split_training_outcomes(
+    frame: pd.DataFrame,
+    calendar: Sequence[object],
+    *,
+    train_end: str = TRAIN_END,
+    label_offset: int = 2,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Partition D0 rows by whether their label date is inside the train window."""
+    if "trade_date" not in frame:
+        raise KeyError("frame is missing trade_date")
+    if label_offset <= 0:
+        raise ValueError("label offset must be positive")
+    normalized = frame.copy()
+    normalized["trade_date"] = normalized["trade_date"].astype(str)
+    if (normalized["trade_date"] > train_end).any():
+        raise ValueError("training outcomes require D0 dates on or before train_end")
+
+    sessions = np.unique(_date_text(calendar))
+    if sessions.size == 0:
+        raise ValueError("market calendar is empty")
+    d0_dates = normalized["trade_date"].to_numpy(dtype=str)
+    positions = np.searchsorted(sessions, d0_dates)
+    safe_positions = np.clip(positions, 0, sessions.size - 1)
+    label_positions = positions + label_offset
+    resolvable = (
+        (positions < sessions.size)
+        & (sessions[safe_positions] == d0_dates)
+        & (label_positions < sessions.size)
+    )
+    if not resolvable.all():
+        bad_dates = sorted(set(d0_dates[~resolvable]))
+        raise ValueError(f"D+{label_offset} label dates cannot be resolved: {bad_dates}")
+
+    normalized["label_d2_date"] = sessions[label_positions]
+    eligible = normalized["label_d2_date"] <= train_end
+    decision_train = normalized.loc[eligible].copy()
+    boundary = normalized.loc[~eligible].copy()
+    return decision_train.reset_index(drop=True), boundary.reset_index(drop=True)
+
+
 def circular_block_bootstrap_indices(
     n_dates: int, block_length: int, seed: int
 ) -> np.ndarray:
@@ -221,38 +261,6 @@ def compute_trailing_styles(
             "turnover_mean_20d": turnover.to_numpy().reshape(-1),
         }
     )
-
-
-def forward_return_panel(
-    entry_open: np.ndarray,
-    exit_close: np.ndarray,
-    entry_adjustment: np.ndarray,
-    exit_adjustment: np.ndarray,
-    exit_dates: np.ndarray,
-    window_end: str,
-) -> np.ndarray:
-    arrays = tuple(
-        np.asarray(array)
-        for array in (entry_open, exit_close, entry_adjustment, exit_adjustment, exit_dates)
-    )
-    if len({array.shape for array in arrays}) != 1:
-        raise ValueError("forward return inputs must have the same shape")
-    entry, exit_, entry_adj, exit_adj, dates = arrays
-    with np.errstate(invalid="ignore", divide="ignore"):
-        result = (
-            exit_.astype(np.float64)
-            * exit_adj.astype(np.float64)
-            / (entry.astype(np.float64) * entry_adj.astype(np.float64))
-            - 1.0
-        )
-    valid = (
-        np.isfinite(entry.astype(np.float64))
-        & np.isfinite(exit_.astype(np.float64))
-        & np.isfinite(entry_adj.astype(np.float64))
-        & np.isfinite(exit_adj.astype(np.float64))
-        & (_date_text(dates) <= window_end)
-    )
-    return np.where(valid, result, np.nan)
 
 
 def decide_go(
@@ -789,6 +797,36 @@ def render_report(payload: dict[str, object]) -> str:
         {"arm": arm, **{key: values.get(key, np.nan) for key in REQUIRED_METRICS}}
         for arm, values in oos.items()
     ]
+    c1_comparison = payload.get("c1_boundary_comparison") or {}
+    comparison_rows = []
+    for key, label in (
+        ("neutral_icir", "中性 ICIR"),
+        ("raw_net_return", "原始 Top10 累计净收益"),
+        ("raw_net_per_trade", "原始 Top10 净收益/笔"),
+        ("neutral_net_return", "中性 Top10 累计净收益"),
+        ("neutral_net_per_trade", "中性 Top10 净收益/笔"),
+    ):
+        comparison_rows.append(
+            {
+                "metric": label,
+                "before": c1_comparison.get("before", {}).get(key, np.nan),
+                "after": c1_comparison.get("after", {}).get(key, np.nan),
+                "delta": c1_comparison.get("delta", {}).get(key, np.nan),
+            }
+        )
+    comparison_rows.append(
+        {
+            "metric": "GO/NO-GO",
+            "before": c1_comparison.get("decision_before", ""),
+            "after": c1_comparison.get("decision_after", ""),
+            "delta": (
+                "不变"
+                if c1_comparison.get("decision_before")
+                == c1_comparison.get("decision_after")
+                else "翻转"
+            ),
+        }
+    )
     raw = deterministic["raw"]
     neutral = deterministic["style_neutral"]
     icir_retention = abs(float(neutral["icir"]) / float(raw["icir"]))
@@ -805,6 +843,8 @@ def render_report(payload: dict[str, object]) -> str:
 ## 判定规则与输入
 
 - 训练窗口：`{metadata['train_start']}` 至 `{metadata['train_end']}`
+- 正式 D0 日历 / 决策可用日历：`{metadata.get('n_train_dates', '')}` / `{metadata.get('n_decision_dates', '')}` 日
+- 决策样本最后 D0：`{metadata.get('decision_d0_end', '')}`（其 D+2 为训练末日）
 - 中性因子 `|ICIR| = {abs(float(decision['neutral_icir'])):.12g}`
 - 安慰剂 ICIR p95：`{float(decision['placebo_icir_p95']):.12g}`
 - ICIR 条件：`{decision['icir_pass']}`（严格大于，不接受相等）
@@ -813,7 +853,7 @@ def render_report(payload: dict[str, object]) -> str:
 
 ## 结果解读
 
-中性后 ICIR 保留原始值的 `{icir_retention:.2%}`，仍显著高于训练匹配的安慰剂 p95；
+中性后 ICIR 保留原始值的 `{icir_retention:.2%}`，仍显著高于既有安慰剂 p95；
 因此按预先登记规则判为 **{decision['decision']}**。{economic_warning}
 
 原始与中性 Top10 净收益每笔分别为 `{float(raw['net_per_trade']):.4%}` 和
@@ -827,6 +867,9 @@ def render_report(payload: dict[str, object]) -> str:
 对数总市值、申万 2021 一级行业哑变量、20 日动量、20 日波动率和 20 日平均自由
 流通换手率。每个 D0 的风格只使用 D0 及此前 19 个市场交易日；每日 Gram 伪逆回归相互
 独立。训练窗末日之后的标签、退出价、衰减目标和样本外指标均不进入判定函数。
+主指标和 bootstrap 在调用评估函数之前即截为 `{metadata.get('n_decision_dates', '')}` 个
+D+2 完整落入训练窗的 D0；边界 D0 `{metadata.get('boundary_d0_dates', [])}` 共
+`{metadata.get('boundary_rows_moved_to_oos', '')}` 行只进入附录。
 两臂始终在同一完整风格交集上比较；该交集覆盖原始因子有限行的
 `{float(payload.get('orthogonality', {}).get('style_coverage_of_raw_factor', np.nan)):.2%}`。
 
@@ -859,7 +902,16 @@ def render_report(payload: dict[str, object]) -> str:
 
 ## 样本外附录
 
-以下数据仅作对照参考，**不参与 GO/NO-GO**，也不能覆盖训练窗结论。
+以下数据包括被移出的 D0 边界日及原 D0 样本外日期，仅作对照参考，
+**不参与 GO/NO-GO**，也不能覆盖训练窗结论。
+
+### C1 边界修复前后对比
+
+“修复前”仅为复算旧 D0 截断口径的审计对照，不参与当前决策；“修复后”是唯一门控输入。
+
+{_markdown_table(pd.DataFrame(comparison_rows))}
+
+### 边界日与后续 D0 合并对照
 
 {_markdown_table(pd.DataFrame(oos_rows))}
 
@@ -867,8 +919,9 @@ def render_report(payload: dict[str, object]) -> str:
 
 - 行业分类使用 SW2021 的历史 `in_date/out_date` 区间；无有效行业映射的行不插补。
 - 移动块 bootstrap 衡量日期采样不确定性；确定性全训练窗估计才是门控输入。
-- 现有安慰剂线来自正式因子的原始缺失结构；共同风格交集剔除了约 4.4% 的原始
-  因子有限行。中性 ICIR 与 p95 的距离较大，但阈值并非为该交集重新校准。
+- 既有安慰剂线是预注册的外生门槛，来自正式因子的原始 D0 日历与缺失结构；本次
+  修复不利用边界标签重估门槛。共同风格交集剔除了约 4.4% 的原始因子有限行，
+  阈值也未为该交集重新校准。
 - 本实验回答风格暴露问题，不关闭 D6 冲击成本或 D13 递延资金占用等独立风险。
 
 ## 复现命令
@@ -1093,9 +1146,9 @@ def run_experiment(
     validate_formal_library(library)
     columns = ["trade_date", "stock_code", *library.field_names, *LABEL_COLUMNS]
     frame = pd.read_parquet(input_path, columns=list(dict.fromkeys(columns)))
-    train, oos = split_evaluation_windows(frame)
-    training_dates = validate_training_calendar(train["trade_date"])
-    if train.empty:
+    train_by_d0, oos = split_evaluation_windows(frame)
+    training_dates = validate_training_calendar(train_by_d0["trade_date"])
+    if train_by_d0.empty:
         raise ValueError("training window is empty")
 
     event_dates = np.unique(frame["trade_date"].astype(str))
@@ -1107,6 +1160,16 @@ def run_experiment(
         event_codes,
         max(horizon_values),
         refresh=refresh_style_cache,
+    )
+    train, boundary = split_training_outcomes(
+        train_by_d0,
+        calendar,
+        train_end=TRAIN_END,
+    )
+    if train.empty or train["label_d2_date"].max() > TRAIN_END:
+        raise AssertionError("decision training rows must have D+2 labels inside train_end")
+    oos = pd.concat((boundary, oos), ignore_index=True).sort_values(
+        ["trade_date", "stock_code"], kind="stable"
     )
     styles = compute_trailing_styles(market, calendar)
     prices = _price_lookup(market, calendar)
@@ -1133,6 +1196,52 @@ def run_experiment(
         raw_metrics["net_per_trade"],
         neutral_metrics["net_per_trade"],
     )
+
+    legacy_result = _evaluate_window(
+        train_by_d0,
+        library,
+        styles,
+        members,
+        prices,
+        TRAIN_END,
+        seed_values,
+        block_length,
+        horizon_values,
+        config,
+        with_bootstrap=False,
+    )
+    legacy_raw = legacy_result["deterministic"]["raw"]
+    legacy_neutral = legacy_result["deterministic"]["style_neutral"]
+    legacy_decision = decide_go(
+        legacy_neutral["icir"],
+        placebo_p95,
+        legacy_raw["net_per_trade"],
+        legacy_neutral["net_per_trade"],
+    )
+    comparison_before = {
+        "neutral_icir": legacy_neutral["icir"],
+        "raw_net_return": legacy_raw["net_return"],
+        "raw_net_per_trade": legacy_raw["net_per_trade"],
+        "neutral_net_return": legacy_neutral["net_return"],
+        "neutral_net_per_trade": legacy_neutral["net_per_trade"],
+    }
+    comparison_after = {
+        "neutral_icir": neutral_metrics["icir"],
+        "raw_net_return": raw_metrics["net_return"],
+        "raw_net_per_trade": raw_metrics["net_per_trade"],
+        "neutral_net_return": neutral_metrics["net_return"],
+        "neutral_net_per_trade": neutral_metrics["net_per_trade"],
+    }
+    c1_boundary_comparison = {
+        "before": comparison_before,
+        "after": comparison_after,
+        "delta": {
+            key: float(comparison_after[key] - comparison_before[key])
+            for key in comparison_before
+        },
+        "decision_before": legacy_decision["decision"],
+        "decision_after": decision["decision"],
+    }
 
     oos_metrics: dict[str, object] = {}
     if not oos.empty:
@@ -1161,6 +1270,10 @@ def run_experiment(
             "train_start": str(training_dates[0]),
             "train_end": str(training_dates[-1]),
             "n_train_dates": int(training_dates.size),
+            "n_decision_dates": int(train["trade_date"].nunique()),
+            "decision_d0_end": str(train["trade_date"].max()),
+            "boundary_d0_dates": sorted(boundary["trade_date"].unique().tolist()),
+            "boundary_rows_moved_to_oos": int(len(boundary)),
             "seeds": list(seed_values),
             "block_length": block_length,
             "top_k": top_k,
@@ -1183,6 +1296,7 @@ def run_experiment(
         "bootstrap": train_result["bootstrap"],
         "orthogonality": train_result["orthogonality"],
         "decay": train_result["decay"],
+        "c1_boundary_comparison": c1_boundary_comparison,
         "oos": oos_metrics,
     }
     report = render_report(payload)
