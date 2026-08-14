@@ -152,9 +152,10 @@ def test_split_chain_uses_exact_hfq_lineage_and_keeps_raw_out_of_accounting(
     raw_multipliers = np.asarray([3.0, 7.0, 2.0, 11.0, 5.0, 13.0])[:, None]
     for field in (*PRICE_COLUMNS, "up_limit", "down_limit"):
         raw_poisoned.fields[field] *= raw_multipliers
-    assert raw_poisoned["close"][1, 0] / raw_poisoned["close"][0, 0] != pytest.approx(
-        raw_poisoned["close_hfq"][1, 0] / raw_poisoned["close_hfq"][0, 0]
+    poisoned_raw_accounting_gross = (
+        raw_poisoned["close"][2, 0] / raw_poisoned["open"][1, 0] - 1.0
     )
+    assert poisoned_raw_accounting_gross != pytest.approx(expected_gross)
     poisoned_fields = compute_base_fields(raw_poisoned)
     for field in ("ret1", "gap", "intraday", "hl_range"):
         np.testing.assert_allclose(poisoned_fields[field], fields[field], equal_nan=True)
@@ -247,11 +248,37 @@ def test_d10_and_adjustment_report_keep_exact_reciprocal_evidence() -> None:
         r"\| Top4 单笔净收益 \| (-?\d+\.\d+)% \| (-?\d+\.\d+)% \| ([+-]?\d+\.\d+)% \|",
         report,
     )
-    assert report_net is not None
+    report_ic = re.search(
+        r"\| D\+2 close IC \| (-?\d+\.\d+) \| (-?\d+\.\d+) \| ([+-]?\d+\.\d+) \|",
+        report,
+    )
+    report_sharpe = re.search(
+        r"\| 年化 Sharpe \| (-?\d+\.\d+) \| (-?\d+\.\d+) \| ([+-]?\d+\.\d+) \|",
+        report,
+    )
+    assert report_net is not None and report_ic is not None and report_sharpe is not None
     report_raw, report_hfq, report_delta = map(float, report_net.groups())
     assert report_raw == pytest.approx(raw_net * 100.0, abs=1e-6)
     assert report_hfq == pytest.approx(hfq_net * 100.0, abs=1e-6)
     assert report_delta == pytest.approx(net_delta * 100.0, abs=1e-6)
     assert report_hfq - report_raw == pytest.approx(report_delta, abs=1.5e-6)
+
+    report_raw_ic, report_hfq_ic, report_ic_delta = map(float, report_ic.groups())
+    assert report_raw_ic == pytest.approx(EXPECTED_RAW_IC, abs=5e-11)
+    assert report_hfq_ic == pytest.approx(EXPECTED_HFQ_IC, abs=5e-11)
+    assert report_ic_delta == pytest.approx(EXPECTED_HFQ_IC - EXPECTED_RAW_IC, abs=5e-11)
+    assert report_hfq_ic - report_raw_ic == pytest.approx(report_ic_delta, abs=1.5e-10)
+
+    report_raw_sharpe, report_hfq_sharpe, report_sharpe_delta = map(
+        float, report_sharpe.groups()
+    )
+    assert report_raw_sharpe == pytest.approx(EXPECTED_RAW_SHARPE, abs=5e-7)
+    assert report_hfq_sharpe == pytest.approx(EXPECTED_HFQ_SHARPE, abs=5e-7)
+    assert report_sharpe_delta == pytest.approx(
+        EXPECTED_HFQ_SHARPE - EXPECTED_RAW_SHARPE, abs=5e-7
+    )
+    assert report_hfq_sharpe - report_raw_sharpe == pytest.approx(
+        report_sharpe_delta, abs=1.5e-6
+    )
     assert "跨日价格因子、标签、成交计价与收益核算" in report
     assert "同日涨跌停状态特征" in report
