@@ -22,6 +22,12 @@ import numpy as np
 import pandas as pd
 
 from ..logging_setup import get_logger
+from .event_lineage import (
+    audit_column_names,
+    load_event_lineage,
+    validate_event_fields,
+    validate_event_schema,
+)
 
 log = get_logger(__name__)
 
@@ -188,19 +194,30 @@ def load_event_panel(
     label_columns: list[str],
     feature_columns: list[str] | None = None,
     meta_columns: tuple[str, ...] = (DATE_COLUMN, CODE_COLUMN),
+    *,
+    lineage_path: Path | str | None = None,
+    train_end: str | None = None,
 ) -> EventPanel:
-    """Read a parquet event table and pack it. ``None`` features means every numeric column."""
-    frame = pd.read_parquet(path)
+    """Read and govern a parquet event table before packing selected numeric fields."""
+    manifest = load_event_lineage(lineage_path)
+    audit_columns = audit_column_names(manifest)
     if feature_columns is None:
-        excluded = set(meta_columns) | set(label_columns)
-        feature_columns = [
-            c
-            for c in frame.columns
-            if c not in excluded
-            and not is_label_column(c)
-            and pd.api.types.is_numeric_dtype(frame[c])
-        ]
+        feature_columns = numeric_feature_columns(
+            path,
+            label_columns,
+            meta_columns,
+            extra_excluded=tuple(audit_columns),
+        )
     assert_no_label_columns(feature_columns)
+    requested = list(dict.fromkeys([*feature_columns, *label_columns]))
+    import pyarrow.parquet as pq
+
+    schema_names = set(pq.ParquetFile(path).schema_arrow.names)
+    validate_event_schema(schema_names, manifest, requested)
+    required_audits = audit_column_names({field: manifest[field] for field in requested})
+    columns = list(dict.fromkeys([*meta_columns, *requested, *sorted(required_audits)]))
+    frame = pd.read_parquet(path, columns=columns)
+    validate_event_fields(frame, manifest, requested, train_end=train_end)
     return build_event_panel(frame, feature_columns, label_columns)
 
 
@@ -257,6 +274,9 @@ def open_event_source(
     label_columns: list[str],
     date_column: str = DATE_COLUMN,
     code_column: str = CODE_COLUMN,
+    *,
+    lineage_path: Path | str | None = None,
+    feature_columns: list[str] | None = None,
 ) -> tuple[SlotIndex, dict[str, np.ndarray], pd.DataFrame]:
     """Build the slot index and label grids, returning the key frame for streaming reads.
 
@@ -266,7 +286,15 @@ def open_event_source(
     """
     import pyarrow.parquet as pq
 
-    keys = pq.read_table(path, columns=[date_column, code_column] + list(label_columns)).to_pandas()
+    manifest = load_event_lineage(lineage_path)
+    governed = list(dict.fromkeys([*(feature_columns or []), *label_columns]))
+    schema_names = set(pq.ParquetFile(path).schema_arrow.names)
+    validate_event_schema(schema_names, manifest, governed)
+    audits = audit_column_names({field: manifest[field] for field in governed})
+    projected = list(dict.fromkeys([date_column, code_column, *label_columns, *sorted(audits)]))
+    keys = pq.read_table(path, columns=projected).to_pandas()
+    validate_event_fields(keys, manifest, governed)
+    keys = keys[[date_column, code_column, *label_columns]].copy()
     keys["_row"] = np.arange(len(keys))
     keys = normalize_frame(keys, date_column, code_column)
     index = build_slot_index(keys, date_column, code_column)

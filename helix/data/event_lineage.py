@@ -1,0 +1,301 @@
+"""Fail-closed field lineage for long-format event tables."""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from .price_lineage import ADJUSTMENT_ALGORITHM, HFQ_BASIS
+
+_ENTRY_KEYS = {
+    "source_date",
+    "as_of_time",
+    "price_basis",
+    "adj_factor_version",
+    "horizon",
+}
+_VERSION_RE = re.compile(rf"{re.escape(ADJUSTMENT_ALGORITHM)}:[0-9a-f]{{64}}")
+_AS_OF_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?[+-]\d{2}:\d{2}"
+)
+
+
+class EventLineageError(ValueError):
+    """Raised when an event field's point-in-time price provenance is untrusted."""
+
+
+@dataclass(frozen=True)
+class EventAuditColumns:
+    """Actual audit-column names and declared trading-day horizon for one field."""
+
+    source_date: str
+    as_of_time: str
+    price_basis: str
+    adj_factor_version: str
+    horizon: int
+
+    def __post_init__(self) -> None:
+        for name in ("source_date", "as_of_time", "price_basis", "adj_factor_version"):
+            value = getattr(self, name)
+            if type(value) is not str or not value:
+                raise EventLineageError(
+                    f"event lineage manifest entry {name!r} must be a non-empty string"
+                )
+        if type(self.horizon) is not int or self.horizon < 0:
+            raise EventLineageError(
+                "event lineage manifest entry 'horizon' must be an integer >= 0"
+            )
+
+
+EventLineageManifest = dict[str, EventAuditColumns]
+
+
+def _manifest_error(message: str, exc: Exception | None = None) -> EventLineageError:
+    error = EventLineageError(f"invalid event lineage manifest: {message}")
+    if exc is not None:
+        error.__cause__ = exc
+    return error
+
+
+def load_event_lineage(path: Path | str | None) -> EventLineageManifest:
+    """Load and strictly validate a schema-version-1 event lineage manifest."""
+    if path is None:
+        raise EventLineageError("event lineage manifest is required")
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
+        raise _manifest_error(f"cannot read {path!s}: {exc}", exc) from exc
+    if type(payload) is not dict:
+        raise _manifest_error("root must be an object")
+    if set(payload) != {"schema_version", "fields"}:
+        raise _manifest_error("root must contain exactly 'schema_version' and 'fields'")
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+        raise _manifest_error("schema_version must be integer 1")
+    fields = payload["fields"]
+    if type(fields) is not dict:
+        raise _manifest_error("fields must be an object")
+
+    manifest: EventLineageManifest = {}
+    for field, raw_entry in fields.items():
+        if type(field) is not str or not field:
+            raise _manifest_error("field names must be non-empty strings")
+        if type(raw_entry) is not dict or set(raw_entry) != _ENTRY_KEYS:
+            raise _manifest_error(
+                f"field {field!r} must contain exactly {sorted(_ENTRY_KEYS)}"
+            )
+        try:
+            manifest[field] = EventAuditColumns(**raw_entry)
+        except (EventLineageError, TypeError) as exc:
+            raise _manifest_error(f"field {field!r}: {exc}", exc) from exc
+    return manifest
+
+
+def audit_column_names(manifest: Mapping[str, EventAuditColumns]) -> set[str]:
+    """Return all physical audit columns, deduplicating entries shared by fields."""
+    return {
+        column
+        for item in manifest.values()
+        for column in (
+            item.source_date,
+            item.as_of_time,
+            item.price_basis,
+            item.adj_factor_version,
+        )
+    }
+
+
+def validate_event_schema(
+    columns: Sequence[str],
+    manifest: Mapping[str, EventAuditColumns],
+    fields: Sequence[str],
+) -> None:
+    """Validate governed fields and their physical audits before projected file reads."""
+    available = set(columns)
+    for field in dict.fromkeys(fields):
+        item = manifest.get(field)
+        if item is None:
+            raise EventLineageError(f"field {field!r} has no event lineage manifest entry")
+        if field not in available:
+            raise EventLineageError(f"governed field {field!r} is missing from the event table")
+        for rule, column in (
+            ("source_date", item.source_date),
+            ("as_of_time", item.as_of_time),
+            ("price_basis", item.price_basis),
+            ("adj_factor_version", item.adj_factor_version),
+        ):
+            if column not in available:
+                raise EventLineageError(
+                    f"field {field!r} {rule} audit column {column!r} is missing"
+                )
+
+
+def _parse_date(value: Any, *, field: str, rule: str, row_date: Any) -> date:
+    if type(value) is not str:
+        raise EventLineageError(
+            f"field {field!r} {rule} must be literal YYYYMMDD or YYYY-MM-DD at row {row_date}"
+        )
+    try:
+        if re.fullmatch(r"\d{8}", value):
+            return datetime.strptime(value, "%Y%m%d").date()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        pass
+    raise EventLineageError(
+        f"field {field!r} invalid {rule} {value!r} at row {row_date}"
+    )
+
+
+def _parse_as_of(value: Any, source: date, *, field: str, row_date: Any) -> datetime:
+    if type(value) is not str or not _AS_OF_RE.fullmatch(value):
+        raise EventLineageError(
+            f"field {field!r} invalid as_of_time {value!r} at row {row_date}"
+        )
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise EventLineageError(
+            f"field {field!r} invalid as_of_time {value!r} at row {row_date}"
+        ) from exc
+    if parsed.utcoffset() != timedelta(hours=8):
+        raise EventLineageError(
+            f"field {field!r} as_of_time must use +08:00 at row {row_date}: {value!r}"
+        )
+    if parsed.date() != source:
+        raise EventLineageError(
+            f"field {field!r} as_of_time is not local to source_date at row {row_date}"
+        )
+    if parsed.timetz().replace(tzinfo=None) > time(15):
+        raise EventLineageError(
+            f"field {field!r} as_of_time is after market close at row {row_date}: {value!r}"
+        )
+    return parsed
+
+
+def validate_event_fields(
+    frame: pd.DataFrame,
+    manifest: Mapping[str, EventAuditColumns],
+    fields: Sequence[str],
+    *,
+    train_end: str | None = None,
+) -> None:
+    """Validate governed HFQ lineage for every requested field and row.
+
+    The trading calendar is the sorted union of decision dates and the requested
+    outcome source dates. Formal callers request the default D+1 and D+2 labels
+    together, making both intervening sessions observable without treating a mere
+    chronological ``after`` relationship as sufficient.
+    """
+    requested = list(dict.fromkeys(fields))
+    if "trade_date" not in frame:
+        raise EventLineageError("event lineage validation requires trade_date")
+    row_dates_raw = frame["trade_date"].tolist()
+    row_dates = [
+        _parse_date(value, field="trade_date", rule="trade_date", row_date=value)
+        for value in row_dates_raw
+    ]
+    cutoff = (
+        _parse_date(train_end, field="train_end", rule="train_end", row_date=train_end)
+        if train_end is not None
+        else None
+    )
+
+    parsed_sources: dict[str, list[date]] = {}
+    parsed_audits: dict[EventAuditColumns, list[date]] = {}
+    shared_version: str | None = None
+    for field in requested:
+        item = manifest.get(field)
+        if item is None:
+            raise EventLineageError(f"field {field!r} has no event lineage manifest entry")
+        for rule, column in (
+            ("source_date", item.source_date),
+            ("as_of_time", item.as_of_time),
+            ("price_basis", item.price_basis),
+            ("adj_factor_version", item.adj_factor_version),
+        ):
+            if column not in frame:
+                raise EventLineageError(
+                    f"field {field!r} {rule} audit column {column!r} is missing"
+                )
+        cached_sources = parsed_audits.get(item)
+        if cached_sources is not None:
+            parsed_sources[field] = cached_sources
+            continue
+
+        sources: list[date] = []
+        audit_rows = zip(
+            frame[item.price_basis].tolist(),
+            frame[item.adj_factor_version].tolist(),
+            frame[item.source_date].tolist(),
+            frame[item.as_of_time].tolist(),
+            strict=True,
+        )
+        for position, (basis, version, source_value, as_of_value) in enumerate(audit_rows):
+            row_date = row_dates_raw[position]
+            if type(basis) is not str or basis != HFQ_BASIS:
+                raise EventLineageError(
+                    f"field {field!r} price_basis must be literal 'hfq' at row {row_date}, "
+                    f"got {basis!r}"
+                )
+            if type(version) is not str or not _VERSION_RE.fullmatch(version):
+                raise EventLineageError(
+                    f"field {field!r} unsupported adj_factor_version at row {row_date}: "
+                    f"{version!r}"
+                )
+            if shared_version is None:
+                shared_version = version
+            elif version != shared_version:
+                raise EventLineageError(
+                    f"field {field!r} has inconsistent adjustment version at row {row_date}: "
+                    f"{version!r} != {shared_version!r}"
+                )
+            source = _parse_date(
+                source_value, field=field, rule="source_date", row_date=row_date
+            )
+            _parse_as_of(as_of_value, source, field=field, row_date=row_date)
+            sources.append(source)
+            if cutoff is not None and item.horizon > 0 and source > cutoff:
+                raise EventLineageError(
+                    f"field {field!r} outcome exceeds train_end {train_end!r} at row {row_date}: "
+                    f"source_date={source.isoformat()}"
+                )
+        parsed_audits[item] = sources
+        parsed_sources[field] = sources
+
+    calendar = sorted(
+        set(row_dates).union(
+            source
+            for field in requested
+            if manifest[field].horizon > 0
+            for source in parsed_sources[field]
+        )
+    )
+    positions = {day: position for position, day in enumerate(calendar)}
+    for field in requested:
+        item = manifest[field]
+        for position, (decision, source) in enumerate(
+            zip(row_dates, parsed_sources[field], strict=True)
+        ):
+            row_date = row_dates_raw[position]
+            if item.horizon == 0:
+                if source != decision:
+                    raise EventLineageError(
+                        f"field {field!r} horizon=0 source_date mismatch at row {row_date}: "
+                        f"got {source.isoformat()}, expected {decision.isoformat()}"
+                    )
+                continue
+            expected_position = positions[decision] + item.horizon
+            expected = calendar[expected_position] if expected_position < len(calendar) else None
+            if source != expected:
+                expected_text = expected.isoformat() if expected is not None else "calendar end"
+                raise EventLineageError(
+                    f"field {field!r} horizon={item.horizon} source mismatch at row {row_date}: "
+                    f"got {source.isoformat()}, expected {expected_text}"
+                )

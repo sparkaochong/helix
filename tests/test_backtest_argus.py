@@ -20,6 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from backtest_argus import (  # noqa: E402
     COMMISSION_BPS,
+    ENTRY_HFQ,
+    EXIT_HFQ,
+    HIGH_HFQ,
     STAMP_SELL_BPS,
     TRANSFER_BPS,
     cost_rates,
@@ -29,6 +32,7 @@ from backtest_argus import (  # noqa: E402
     run_book,
     target_hit,
 )
+from fillability import unfillable_mask  # noqa: E402
 
 
 def test_stamp_duty_is_charged_on_the_sell_side_only():
@@ -72,8 +76,9 @@ def _picks(hit: tuple[int, ...], to_close: tuple[float, ...],
         max(t, 0.08 if h else 0.0) for h, t in zip(hit, to_close, strict=True))
     return pd.DataFrame({
         "label_px_d1_open": [open_d1] * len(to_close),
-        "label_px_d2_high": [open_d1 * (1 + p) for p in peaks],
-        "label_px_d2_close": [open_d1 * (1 + r) for r in to_close],
+        ENTRY_HFQ: [open_d1] * len(to_close),
+        HIGH_HFQ: [open_d1 * (1 + p) for p in peaks],
+        EXIT_HFQ: [open_d1 * (1 + r) for r in to_close],
     })
 
 
@@ -99,6 +104,33 @@ def test_the_take_profit_level_decides_which_trades_it_applies_to():
     assert gross_returns(frame, 1.08, "target") == pytest.approx([0.08, 0.08])
     assert gross_returns(frame, 1.10, "target") == pytest.approx([0.10, -0.02])
     assert target_hit(frame, 1.10) == pytest.approx([True, False])
+
+
+def test_raw_open_cannot_change_hits_or_returns_but_hfq_entry_can():
+    frame = _picks(hit=(1, 0), to_close=(0.10, -0.05))
+    expected_hit = target_hit(frame, 1.08)
+    expected_return = gross_returns(frame, 1.08, "close")
+
+    changed_raw = frame.assign(label_px_d1_open=[1.0, 1000.0])
+    np.testing.assert_array_equal(target_hit(changed_raw, 1.08), expected_hit)
+    np.testing.assert_allclose(gross_returns(changed_raw, 1.08, "close"), expected_return)
+
+    changed_hfq = frame.copy()
+    changed_hfq[ENTRY_HFQ] = [9.0, 9.0]
+    assert target_hit(changed_hfq, 1.08).tolist() != expected_hit.tolist()
+    assert gross_returns(changed_hfq, 1.08, "close") != pytest.approx(expected_return)
+
+
+def test_fillability_still_uses_raw_open_not_hfq_entry():
+    frame = _picks(hit=(1,), to_close=(0.0,)).assign(
+        stock_code="000001.SZ", label_open_gap=0.1, label_px_d1_open=11.0
+    )
+    assert unfillable_mask(frame).tolist() == [True]
+
+    frame[ENTRY_HFQ] = 1000.0
+    assert unfillable_mask(frame).tolist() == [True]
+    frame["label_px_d1_open"] = np.nan
+    assert unfillable_mask(frame).tolist() == [False]
 
 
 def _book(scores, unfillable, hit, to_close) -> pd.DataFrame:

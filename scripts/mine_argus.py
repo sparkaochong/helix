@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from helix.config import Config
+from helix.data.event_lineage import audit_column_names, load_event_lineage
 from helix.data.event_table import (
     EventPanel,
     numeric_feature_columns,
@@ -34,6 +35,7 @@ from helix.logging_setup import get_logger, setup_logging
 from helix.pipeline_events import (
     DEFAULT_LABELS,
     PRIMARY_TARGET,
+    RETURN_TARGET,
     EventRun,
     evaluate_ic,
     save,
@@ -46,6 +48,7 @@ log = get_logger(__name__)
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", required=True)
+    ap.add_argument("--lineage", required=True)
     ap.add_argument("--out", default="data/artifacts/argus")
     ap.add_argument("--config", default=None)
     ap.add_argument("--search-fraction", type=float, default=0.6)
@@ -63,9 +66,18 @@ def main() -> None:
     cfg = Config.load(args.config)
     path = Path(args.input)
     labels = list(DEFAULT_LABELS)
+    manifest = load_event_lineage(args.lineage)
+    features = numeric_feature_columns(
+        path, labels, extra_excluded=tuple(audit_column_names(manifest))
+    )
 
     # ---------------------------------------------------------------- pass 1 --
-    index, label_grids, keys = open_event_source(path, labels)
+    index, label_grids, keys = open_event_source(
+        path,
+        labels,
+        lineage_path=args.lineage,
+        feature_columns=features,
+    )
     n_dates = len(index.dates)
     rows = complete_outcome_window(
         slice(0, max(int(n_dates * args.search_fraction), 1)), cfg.label.touch_offset
@@ -76,7 +88,6 @@ def main() -> None:
         n_dates - rows.stop,
     )
 
-    features = numeric_feature_columns(path, labels)
     log.info("streaming %d feature columns for univariate screening", len(features))
 
     mask = index.occupied[rows]
@@ -119,7 +130,7 @@ def main() -> None:
     # none of them can. Without this the search just keeps rediscovering the same
     # linear blend of the same few volatility columns.
     search_fields = {k: panel.fields[k][rows].astype(np.float64) for k in kept}
-    gross_returns = panel.f64("label_d2_return")[rows]
+    gross_returns = panel.f64(RETURN_TARGET)[rows]
     pset = build_event_pset(kept)
 
     base_grids = [search_fields[n] for n in kept[: args.neutralize_base]]

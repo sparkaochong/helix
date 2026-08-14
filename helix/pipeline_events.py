@@ -33,11 +33,12 @@ log = get_logger(__name__)
 
 #: Continuous target is primary -- it uses the full magnitude of the D+2 excursion
 #: instead of collapsing it to a yes/no, so IC is far less noisy per date.
-PRIMARY_TARGET = "label_d2_peak_return"
-BINARY_TARGET = "label_d2_hit_8pct"
+PRIMARY_TARGET = "label_d2_peak_return_hfq"
+BINARY_TARGET = "label_d2_hit_8pct_hfq"
+RETURN_TARGET = "label_d2_return_hfq"
 DEFAULT_LABELS = (
-    PRIMARY_TARGET, BINARY_TARGET, "label_d2_return",
-    "label_px_d1_open", "label_px_d2_high", "label_px_d2_close",
+    PRIMARY_TARGET, BINARY_TARGET, RETURN_TARGET,
+    "label_px_d1_open_hfq", "label_px_d2_high_hfq", "label_px_d2_close_hfq",
 )
 
 
@@ -55,8 +56,12 @@ def _search_rows(n_dates: int, fraction: float) -> slice:
     return slice(0, max(int(n_dates * fraction), 1))
 
 
-def load(path: Path, labels: tuple[str, ...] = DEFAULT_LABELS) -> EventPanel:
-    panel = load_event_panel(Path(path), label_columns=[c for c in labels])
+def load(
+    path: Path, lineage_path: Path, labels: tuple[str, ...] = DEFAULT_LABELS
+) -> EventPanel:
+    panel = load_event_panel(
+        Path(path), label_columns=[c for c in labels], lineage_path=Path(lineage_path)
+    )
     log.info("loaded %d features, %d rows", len(panel.fields), panel.n_rows)
     return panel
 
@@ -98,7 +103,7 @@ def mine_events(
     result = run_search(
         fields={k: np.asarray(panel.fields[k][rows], dtype=np.float64) for k in selected},
         field_names=selected,
-        gross_returns=panel.f64("label_d2_return")[rows],
+        gross_returns=panel.f64(RETURN_TARGET)[rows],
         candidate_mask=mask,
         dates=panel.dates[rows],
         cfg=cfg.gp,
@@ -137,7 +142,7 @@ def evaluate_ic(run: EventRun, min_samples: int = 30) -> dict:
             score=values[rows, :, k].astype(np.float64),
             hit_label=panel.f64(BINARY_TARGET)[rows],
             peak_return=panel.f64(PRIMARY_TARGET)[rows],
-            gross_return=panel.f64("label_d2_return")[rows],
+            gross_return=panel.f64(RETURN_TARGET)[rows],
             candidate_mask=panel.occupied[rows],
             dates=panel.dates[rows],
             config=cfg.backtest,

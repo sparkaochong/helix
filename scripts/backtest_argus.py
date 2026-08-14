@@ -44,8 +44,22 @@ import json
 
 import numpy as np
 import pandas as pd
-from fill_impact import build_model, build_regressor, daily_ic, feature_columns
+from fill_impact import build_model, build_regressor, daily_ic
 from fillability import REQUIRED_COLUMNS, unfillable_mask
+
+from helix.data.event_lineage import (
+    audit_column_names,
+    load_event_lineage,
+    validate_event_fields,
+    validate_event_schema,
+)
+from helix.data.event_table import numeric_feature_columns
+from helix.pipeline_events import BINARY_TARGET, PRIMARY_TARGET, RETURN_TARGET
+
+ENTRY_HFQ = "label_px_d1_open_hfq"
+HIGH_HFQ = "label_px_d2_high_hfq"
+EXIT_HFQ = "label_px_d2_close_hfq"
+RETURN_HFQ = RETURN_TARGET
 
 #: Statutory A-share round-trip costs, in basis points of notional.
 #: Stamp duty is sell-side only and was halved to 5bp on 2023-08-28; every out-of-sample
@@ -88,14 +102,14 @@ def target_hit(frame: pd.DataFrame, target_ratio: float) -> np.ndarray:
     a strictly better strategy than any that exists. `main` checks this reproduces the
     published label at 1.08 before trusting it anywhere else.
     """
-    return ((frame["label_px_d2_high"].to_numpy(dtype=float)
-             / frame["label_px_d1_open"].to_numpy(dtype=float)) >= target_ratio)
+    return ((frame[HIGH_HFQ].to_numpy(dtype=float)
+             / frame[ENTRY_HFQ].to_numpy(dtype=float)) >= target_ratio)
 
 
 def gross_returns(frame: pd.DataFrame, target_ratio: float, exit_rule: str) -> np.ndarray:
     """Per-trade gross return under the chosen exit assumption."""
-    to_close = (frame["label_px_d2_close"].to_numpy(dtype=float)
-                / frame["label_px_d1_open"].to_numpy(dtype=float)) - 1.0
+    to_close = (frame[EXIT_HFQ].to_numpy(dtype=float)
+                / frame[ENTRY_HFQ].to_numpy(dtype=float)) - 1.0
     if exit_rule == "close":
         return to_close
     return np.where(target_hit(frame, target_ratio), target_ratio - 1.0, to_close)
@@ -199,8 +213,8 @@ def run_book(scored: pd.DataFrame, hold_k: int, signal_k: int,
         # Hit rate follows `target_ratio` too, so lift describes the level being traded
         # rather than the 8% the table happens to label.
         hit = target_hit(picked, target_ratio)
-        to_close = (picked["label_px_d2_close"].to_numpy(dtype=float)
-                    / picked["label_px_d1_open"].to_numpy(dtype=float)) - 1.0
+        to_close = (picked[EXIT_HFQ].to_numpy(dtype=float)
+                    / picked[ENTRY_HFQ].to_numpy(dtype=float)) - 1.0
         rows.append({
             "date": date,
             "positions": len(picked),
@@ -263,9 +277,10 @@ def run_book(scored: pd.DataFrame, hold_k: int, signal_k: int,
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", required=True)
-    ap.add_argument("--label", default="label_d2_hit_8pct")
-    ap.add_argument("--ic-target", default="label_d2_peak_return")
-    ap.add_argument("--return-col", default="label_d2_return",
+    ap.add_argument("--lineage", required=True)
+    ap.add_argument("--label", default=BINARY_TARGET)
+    ap.add_argument("--ic-target", default=PRIMARY_TARGET)
+    ap.add_argument("--return-col", default=RETURN_HFQ,
                     help="close[D+2]/open[D+1] - 1, i.e. what the close exit earns.")
     ap.add_argument("--rank-by", default="classify",
                     choices=("classify", "regress", "regress-cs"),
@@ -309,20 +324,33 @@ def main() -> None:
     if signal_k < max(holds):
         raise SystemExit(f"--signal-k {signal_k} 小于最大持仓数 {max(holds)}，候选不够建仓")
 
-    features = feature_columns(args.input)
-    price_cols = ["label_px_d1_open", "label_px_d2_high", "label_px_d2_close"]
+    manifest = load_event_lineage(args.lineage)
+    features = numeric_feature_columns(
+        args.input,
+        [args.label, args.ic_target, args.return_col],
+        extra_excluded=tuple(audit_column_names(manifest)),
+    )
+    price_cols = [ENTRY_HFQ, HIGH_HFQ, EXIT_HFQ]
+    governed = [*features, args.label, args.ic_target, args.return_col, *price_cols]
+    import pyarrow.parquet as pq
+
+    validate_event_schema(pq.ParquetFile(args.input).schema_arrow.names, manifest, governed)
+    governed_audits = audit_column_names(
+        {field: manifest[field] for field in governed}
+    )
     needed = sorted({"trade_date", args.label, args.ic_target, args.return_col,
-                     *price_cols, *REQUIRED_COLUMNS, *features})
+                     *price_cols, *REQUIRED_COLUMNS, *features, *governed_audits})
     df = pd.read_parquet(args.input, columns=needed)
     df["trade_date"] = df["trade_date"].astype(str)
+    validate_event_fields(df, manifest, governed)
     df["unfillable"] = unfillable_mask(df)
     df = df.dropna(subset=[args.label, args.ic_target, args.return_col, *price_cols])
     print(f"features {len(features)}  rows {len(df):,}  rank-by {args.rank_by}")
 
     # The return column has to be the quantity the close exit actually earns, or ranking
     # on it optimises something else. Cheap to check, so check rather than trust the name.
-    implied = (df["label_px_d2_close"].to_numpy(dtype=float)
-               / df["label_px_d1_open"].to_numpy(dtype=float)) - 1.0
+    implied = (df[EXIT_HFQ].to_numpy(dtype=float)
+               / df[ENTRY_HFQ].to_numpy(dtype=float)) - 1.0
     if not np.allclose(implied, df[args.return_col].to_numpy(dtype=float), atol=1e-6):
         raise SystemExit(f"{args.return_col} 不等于 close[D+2]/open[D+1]-1，不能当回归目标")
 
