@@ -97,6 +97,26 @@ def test_adjustment_factor_version_is_stable_across_row_order():
     assert adjustment_factor_version(adj) == adjustment_factor_version(adj.iloc[::-1])
 
 
+def test_adjustment_version_excludes_factor_rows_outside_panel_dates_and_codes():
+    dates = np.asarray(["20240101", "20240102"])
+    codes = np.asarray(["000001.SZ"])
+    inside = _adj([1.0, 2.0])
+    outside = pd.DataFrame(
+        {
+            "trade_date": ["20240103", "20240101"],
+            "ts_code": ["000001.SZ", "000002.SZ"],
+            "adj_factor": [99.0, 88.0],
+        }
+    )
+
+    _, expected = build_adjusted_price_fields(_daily(), inside, dates, codes)
+    _, with_outside = build_adjusted_price_fields(
+        _daily(), pd.concat([inside, outside], ignore_index=True).iloc[::-1], dates, codes
+    )
+
+    assert expected["open_hfq"].adj_factor_version == with_outside["open_hfq"].adj_factor_version
+
+
 @pytest.mark.parametrize(
     ("source_date", "as_of_time"),
     [

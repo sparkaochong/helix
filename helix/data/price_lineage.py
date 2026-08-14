@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from hashlib import sha256
 
 import numpy as np
@@ -21,7 +21,7 @@ class PriceLineageError(ValueError):
     """Raised when adjusted-price provenance cannot be trusted."""
 
 
-def _parse_source_date(value: str) -> datetime.date:
+def _parse_source_date(value: str) -> date:
     text = str(value)
     try:
         if re.fullmatch(r"\d{8}", text):
@@ -33,7 +33,7 @@ def _parse_source_date(value: str) -> datetime.date:
     raise PriceLineageError(f"invalid source date {value!r}")
 
 
-def _parse_as_of_time(value: str, source_date: datetime.date) -> None:
+def _parse_as_of_time(value: str, source_date: date) -> None:
     text = str(value)
     if not _AS_OF_RE.fullmatch(text):
         raise PriceLineageError(f"invalid as_of_time {value!r}")
