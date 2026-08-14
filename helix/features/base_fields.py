@@ -34,9 +34,9 @@ def compute_base_fields(panel: Panel) -> dict[str, np.ndarray]:
     amount = panel.f64("amount")
     up_limit = panel.f64("up_limit")
 
-    ret1 = ops.div(close_h, ops.delay(close_h, 1)) - 1.0
     delayed_close_h = ops.delay(close_h, 1)
-    hl = high_h - low_h
+    ret1 = ops.div(close_h, delayed_close_h) - 1.0
+    hl_h = high_h - low_h
 
     fields: dict[str, np.ndarray] = {
         # --- returns over several horizons
@@ -46,8 +46,8 @@ def compute_base_fields(panel: Panel) -> dict[str, np.ndarray]:
         # --- intraday shape of the D0 bar
         "gap": ops.div(open_h, delayed_close_h) - 1.0,
         "intraday": ops.div(close_h, open_h) - 1.0,
-        "hl_range": ops.div(hl, delayed_close_h),
-        "close_pos": ops.div(close_h - low_h, hl),
+        "hl_range": ops.div(hl_h, delayed_close_h),
+        "close_pos": ops.div(close_h - low_h, hl_h),
         "upper_shadow": ops.div(high_h - np.maximum(open_h, close_h), delayed_close_h),
         "lower_shadow": ops.div(np.minimum(open_h, close_h) - low_h, delayed_close_h),
         # --- trend / mean reversion
