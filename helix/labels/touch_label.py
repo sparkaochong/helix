@@ -17,7 +17,7 @@ Three details decide whether this label is usable or garbage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -40,8 +40,8 @@ class LabelSet:
     entry_price: np.ndarray  # (T, N) back-adjusted D+1 open
     target_price: np.ndarray  # (T, N) entry * target_ratio
     exit_price: np.ndarray   # (T, N) back-adjusted D+2 close, for the non-touch exit
-    adjustment: AdjustmentStamp  # governed source for all adjusted label prices
     entry_valid: np.ndarray | None = None  # (T, N) bool, D+1 entry actually fillable
+    adjustment: AdjustmentStamp = field(kw_only=True)  # governed source for all adjusted label prices
 
     @property
     def executable_entry(self) -> np.ndarray:

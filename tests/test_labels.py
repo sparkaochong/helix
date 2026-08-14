@@ -13,7 +13,7 @@ from helix.data.price_lineage import (
     PriceLineageError,
     make_hfq_lineage,
 )
-from helix.labels.touch_label import build_touch_label
+from helix.labels.touch_label import LabelSet, build_touch_label
 
 TEST_ADJ_VERSION = "raw-times-same-day-adj-v1:" + "0" * 64
 
@@ -51,6 +51,40 @@ def make_panel(n_dates: int = 6, n_codes: int = 1, **overrides) -> Panel:
 @pytest.fixture
 def cfg() -> LabelConfig:
     return LabelConfig(entry_offset=1, touch_offset=2, target_ratio=1.08)
+
+
+def test_labelset_requires_adjustment_as_a_keyword_only_argument():
+    values = np.ones((1, 1))
+
+    with pytest.raises(TypeError, match=r"required keyword-only argument.*adjustment"):
+        LabelSet(values, values.astype(bool), values.astype(bool), values, values, values)
+
+
+def test_labelset_seventh_positional_entry_valid_cannot_bind_adjustment():
+    values = np.ones((1, 1))
+    entry_valid = values.astype(bool)
+
+    with pytest.raises(TypeError, match=r"required keyword-only argument.*adjustment"):
+        LabelSet(values, values.astype(bool), values.astype(bool), values, values, values, entry_valid)
+
+
+def test_labelset_preserves_seventh_positional_entry_valid_with_adjustment():
+    values = np.ones((1, 1))
+    entry_valid = values.astype(bool)
+
+    labels = LabelSet(
+        values,
+        values.astype(bool),
+        values.astype(bool),
+        values,
+        values,
+        values,
+        entry_valid,
+        adjustment=AdjustmentStamp("hfq", TEST_ADJ_VERSION),
+    )
+
+    assert labels.entry_valid is entry_valid
+    assert labels.executable_entry is entry_valid
 
 
 def test_touch_is_measured_against_the_next_open(cfg):
