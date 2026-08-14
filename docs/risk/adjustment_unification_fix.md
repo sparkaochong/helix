@@ -33,6 +33,15 @@
 
 最后两个没有完整 D+2 outcome 的 D0 被严格排除；任何 D0 数量、最后 D0 或退出日变化都会触发 fail-closed，不会自动更新基线。
 
+## Legacy outcome 重建闸门
+
+| 校验 | 原始统计值 | 要求 |
+| --- | ---: | --- |
+| event return 与 raw 重建一致 | `true` | 必须为 `true` |
+| 最大舍入误差 | 5.00000000046e-07 | 不超过 `1e-6` |
+
+该闸门只证明本次 legacy event outcome 能由指定 raw 行情缓存重建；不证明 legacy 因子特征的上游复权口径或四元血缘。
+
 ## gp_000 修复前后核心指标
 
 | 指标 | 修复前：legacy raw outcome | 修复后：点时 HFQ outcome | 变化 |
@@ -53,7 +62,9 @@
 | 正式 gp_000 因子库 | `/Users/aochong/code/helix/data/artifacts/argus/event_factors.json` | `6823a9e7d76caa4adcd21cd82e781d85e70407191aab9ef1835138934fb05391` |
 | D+2 行情缓存 | `/Users/aochong/code/helix/data/raw/d2_exit_cache` | `c0601a8626de4446703c210e8f5d27debc611dd1bd53291fdef7bba859bfb2c6` |
 | 成本与 Top4 配置 | `/Users/aochong/code/helix/.worktrees/adjustment-unification/configs/default.yaml` | `b209a5a2302089edf2a1dd0c3201e063c6ead2ff581f1bce63243ff1ee41f137` |
-| 本报告生成脚本 | `/Users/aochong/code/helix/.worktrees/adjustment-unification/scripts/adjustment_unification_baseline.py` | `d8eb7dc62066c166ece1eb358ce6438712f2639de56cdfa4fb57205735824473` |
+| 本报告生成脚本 | `/Users/aochong/code/helix/.worktrees/adjustment-unification/scripts/adjustment_unification_baseline.py` | `a16c0dcc34fd2683c602b05707866306f38c63a6f4cce68ef634dda6ca0879c3` |
+
+所有输入在计算前由同一不可变 manifest 解析并哈希；行情只从该 manifest 的文件集合加载。计算结束后脚本重新枚举缓存，并对全部消费文件重新 stat 与 SHA-256 校验；任何内容、身份或成员变化都会终止发布。
 
 CLI 标准输出同时提供严格 JSON，其中 `legacy_unverified_lineage=true`、`historical_reports_rewritten=false`、`loss_conclusion_unchanged=true`。这些标志防止把 outcome 修正误解为对 legacy 特征血缘或盈利能力的认证。
 

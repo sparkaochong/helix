@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 
 import pandas as pd
@@ -20,13 +22,20 @@ from scripts.adjustment_unification_baseline import (
     EXPECTED_RAW_IC,
     EXPECTED_RAW_NET_PER_TRADE,
     EXPECTED_RAW_SHARPE,
+    InputManifest,
     build_structured_output,
     compare_fixed_scores,
+    freeze_top_k_selection,
     publish_report,
     render_report,
+    snapshot_file,
     validate_expected_impact,
     validate_frozen_boundary,
+    validate_legacy_reconstruction,
+    validate_selection_identity,
+    verify_input_manifest,
 )
+from scripts.gp000_loss_attribution import audit_adjustment_chain, build_price_lookup
 
 
 def _compact_aligned_frame() -> pd.DataFrame:
@@ -150,12 +159,18 @@ def test_structured_output_marks_legacy_and_unchanged_loss() -> None:
             "d2_exit_end": "2024-09-04",
         },
         inputs={"event_table": {"path": "/immutable/events.parquet", "sha256": "a" * 64}},
+        legacy_reconstruction={
+            "event_returns_match_raw": True,
+            "event_return_rounding_error_max": 5e-7,
+        },
     )
 
     assert payload["legacy_unverified_lineage"] is True
     assert payload["historical_reports_rewritten"] is False
     assert payload["loss_conclusion_unchanged"] is True
     assert payload["target_mismatch_remains_dominant"] is True
+    assert payload["input_manifest_verified_after_computation"] is True
+    assert payload["legacy_reconstruction"]["event_returns_match_raw"] is True
     assert payload["comparison"][1]["net_per_trade"] == pytest.approx(
         EXPECTED_HFQ_NET_PER_TRADE
     )
@@ -173,6 +188,10 @@ def test_render_is_read_only_and_publish_only_accepts_designated_report(
             "d2_exit_end": "2024-09-04",
         },
         inputs={},
+        legacy_reconstruction={
+            "event_returns_match_raw": True,
+            "event_return_rounding_error_max": 5e-7,
+        },
     )
 
     before = set(tmp_path.iterdir())
@@ -188,6 +207,10 @@ def test_render_is_read_only_and_publish_only_accepts_designated_report(
 
     publish_report(report, output)
     assert output.read_text(encoding="utf-8") == report
+    assert stat.S_IMODE(output.stat().st_mode) == 0o644
+    output.chmod(0o640)
+    publish_report(report, output)
+    assert stat.S_IMODE(output.stat().st_mode) == 0o640
 
     historical = report_dir / "gp000_loss_attribution.md"
     historical.write_bytes(b"historical-sentinel")
@@ -198,13 +221,17 @@ def test_render_is_read_only_and_publish_only_accepts_designated_report(
         with pytest.raises(ValueError, match="designated adjustment report"):
             publish_report("should-not-write", rejected)
 
-    monkeypatch.setattr(
-        baseline_module,
-        "build_baseline_evidence",
-        lambda **_kwargs: payload,
-    )
+    audit_called = False
+
+    def forbidden_audit(**_kwargs: object) -> dict[str, object]:
+        nonlocal audit_called
+        audit_called = True
+        raise AssertionError("audit must not run for an invalid report target")
+
+    monkeypatch.setattr(baseline_module, "build_baseline_evidence", forbidden_audit)
     with pytest.raises(ValueError, match="designated adjustment report"):
         baseline_module.main(["--report", str(outside)])
+    assert audit_called is False
 
     assert historical.read_bytes() == b"historical-sentinel"
     assert not other_doc.exists()
@@ -227,3 +254,156 @@ def test_render_is_read_only_and_publish_only_accepts_designated_report(
 
     parsed = json.loads(json.dumps(payload, allow_nan=False))
     assert parsed["historical_reports_rewritten"] is False
+
+
+def test_publish_is_anchored_against_parent_symlink_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_dir = tmp_path / "worktree" / "docs" / "risk"
+    report_dir.mkdir(parents=True)
+    designated = report_dir / "adjustment_unification_fix.md"
+    moved_dir = tmp_path / "moved-risk"
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    monkeypatch.setattr(baseline_module, "DESIGNATED_REPORT", designated)
+
+    original_open = os.open
+    substituted = False
+
+    def substituting_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal substituted
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if not substituted and os.fsdecode(path) == str(report_dir):
+            report_dir.rename(moved_dir)
+            report_dir.symlink_to(outside_dir, target_is_directory=True)
+            substituted = True
+        return descriptor
+
+    monkeypatch.setattr(baseline_module.os, "open", substituting_open)
+    with pytest.raises(ValueError, match="designated adjustment report"):
+        publish_report("must-not-escape", designated)
+
+    assert substituted is True
+    assert not (outside_dir / designated.name).exists()
+    assert not (moved_dir / designated.name).exists()
+
+
+def _manifest_for_drift_test(tmp_path: Path) -> InputManifest:
+    cache = tmp_path / "cache"
+    cache.mkdir(parents=True)
+    market = cache / "20240102.parquet"
+    market.write_bytes(b"market-v1")
+    event = tmp_path / "events.parquet"
+    library = tmp_path / "library.json"
+    config = tmp_path / "config.yaml"
+    script = tmp_path / "script.py"
+    for path, content in (
+        (event, b"events-v1"),
+        (library, b"library-v1"),
+        (config, b"config-v1"),
+        (script, b"script-v1"),
+    ):
+        path.write_bytes(content)
+    return InputManifest(
+        event_table=snapshot_file(event),
+        factor_library=snapshot_file(library),
+        backtest_config=snapshot_file(config),
+        comparison_script=snapshot_file(script),
+        price_cache=cache.resolve(),
+        price_cache_listing=(market.name,),
+        market_files=(snapshot_file(market),),
+        market_calendar=("2024-01-02",),
+    )
+
+
+def test_input_manifest_detects_content_mutation_and_cache_addition(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest_for_drift_test(tmp_path)
+    Path(manifest.event_table.path).write_bytes(b"events-v2")
+    with pytest.raises(RuntimeError, match="event_table.*changed"):
+        verify_input_manifest(manifest)
+
+    stable = _manifest_for_drift_test(tmp_path / "stable")
+    (stable.price_cache / "20240103.parquet").write_bytes(b"added")
+    with pytest.raises(RuntimeError, match="price cache listing changed"):
+        verify_input_manifest(stable)
+
+
+def test_mismatched_legacy_return_label_fails_reconstruction_gate() -> None:
+    events = pd.DataFrame(
+        {
+            "trade_date": ["2024-05-10"],
+            "stock_code": ["000001.SZ"],
+            "label_px_d1_open": [10.0],
+            "label_px_d2_high": [11.0],
+            "label_px_d2_close": [10.5],
+            "label_d2_return": [0.50],
+            "label_d2_hit_8pct": [1.0],
+        }
+    )
+    market = pd.DataFrame(
+        {
+            "trade_date": ["2024-05-10", "2024-05-13", "2024-05-14"],
+            "ts_code": ["000001.SZ"] * 3,
+            "open": [9.8, 10.0, 10.4],
+            "high": [10.0, 10.2, 11.0],
+            "close": [9.9, 10.0, 10.5],
+            "adj_factor": [1.0, 1.0, 1.0],
+        }
+    )
+    prices = build_price_lookup(
+        market,
+        ["2024-05-10", "2024-05-13", "2024-05-14"],
+        ["000001.SZ"],
+    )
+    summary, _ = audit_adjustment_chain(events, prices)
+
+    with pytest.raises(AssertionError, match="legacy event returns do not match raw"):
+        validate_legacy_reconstruction(summary)
+
+
+def test_frozen_selection_handles_ties_and_detects_identity_drift() -> None:
+    frame = pd.DataFrame(
+        {
+            "trade_date": ["2024-01-02"] * 6,
+            "exit_date": ["2024-01-04"] * 6,
+            "stock_code": [f"S{index}" for index in range(6)],
+            "factor_score": [3.0, 2.0, 2.0, 2.0, 1.0, 0.0],
+            "raw_return": [0.30, -0.20, 0.10, -0.05, 0.40, -0.40],
+            "hfq_return": [-0.30, 0.20, -0.10, 0.05, -0.40, 0.40],
+        }
+    )
+    config = BacktestConfig(
+        top_k=4,
+        commission_bps=0,
+        transfer_bps=0,
+        stamp_sell_bps=0,
+        stamp_sell_bps_before_cut=0,
+        slippage_bps=0,
+    )
+    frozen = freeze_top_k_selection(frame, config)
+    assert frozen["stock_code"].tolist() == ["S0", "S1", "S2", "S3"]
+
+    raw_arm = frozen.assign(gross_return=frozen["raw_return"])
+    hfq_arm = frozen.assign(gross_return=frozen["hfq_return"])
+    raw_digest, hfq_digest = validate_selection_identity(raw_arm, hfq_arm)
+    assert raw_digest == hfq_digest
+    comparison = compare_fixed_scores(frame, config, min_ic_samples=4).set_index(
+        "price_basis"
+    )
+    assert comparison.loc["raw", "net_per_trade"] == pytest.approx(0.0375)
+    assert comparison.loc["hfq", "net_per_trade"] == pytest.approx(-0.0375)
+    assert comparison["selected_score_digest"].nunique() == 1
+
+    drifted = hfq_arm.copy()
+    drifted.loc[0, "factor_score"] = -99.0
+    with pytest.raises(AssertionError, match="frozen Top-K selection identity drifted"):
+        validate_selection_identity(raw_arm, drifted)

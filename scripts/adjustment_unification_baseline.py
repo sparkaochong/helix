@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
-import tempfile
+import secrets
+import stat
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +26,8 @@ from scripts.gp000_loss_attribution import (
     TRAIN_END,
     TRAIN_START,
     _hash_file,
-    _hash_files,
     _hash_frame,
+    _hyphenated,
     _top_k_selected_rows,
     audit_adjustment_chain,
     build_price_lookup,
@@ -32,8 +36,7 @@ from scripts.gp000_loss_attribution import (
     json_ready,
     load_audit_config,
     load_training_events,
-    load_training_market,
-    training_market_paths,
+    validate_training_calendar,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,6 +64,66 @@ EXPECTED_EXIT_END = "2024-09-04"
 ABS_TOLERANCE = 1e-12
 
 
+@dataclass(frozen=True)
+class FileSnapshot:
+    """Content and identity captured before any analytical input is consumed."""
+
+    path: str
+    size: int
+    mtime_ns: int
+    device: int
+    inode: int
+    mode: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class InputManifest:
+    """One immutable manifest shared by loading, hashing, and drift checks."""
+
+    event_table: FileSnapshot
+    factor_library: FileSnapshot
+    backtest_config: FileSnapshot
+    comparison_script: FileSnapshot
+    price_cache: Path
+    price_cache_listing: tuple[str, ...]
+    market_files: tuple[FileSnapshot, ...]
+    market_calendar: tuple[str, ...]
+
+
+_SELECTION_IDENTITY_COLUMNS = ("trade_date", "stock_code", "factor_score")
+
+
+def freeze_top_k_selection(
+    aligned: pd.DataFrame,
+    config: BacktestConfig,
+) -> pd.DataFrame:
+    """Select once from scores so neither outcome arm can change membership."""
+    frozen = _top_k_selected_rows(aligned, config).reset_index(drop=True)
+    if frozen.empty:
+        raise ValueError("fixed-score comparison produced no Top-K selections")
+    return frozen
+
+
+def _selection_digest(frame: pd.DataFrame) -> str:
+    missing = set(_SELECTION_IDENTITY_COLUMNS) - set(frame.columns)
+    if missing:
+        raise KeyError(f"selection identity is missing: {sorted(missing)}")
+    return _hash_frame(frame, _SELECTION_IDENTITY_COLUMNS)
+
+
+def validate_selection_identity(
+    raw_arm: pd.DataFrame,
+    hfq_arm: pd.DataFrame,
+) -> tuple[str, str]:
+    """Derive each consumed arm's identity independently and require equality."""
+    raw_digest = _selection_digest(raw_arm)
+    hfq_digest = _selection_digest(hfq_arm)
+    if raw_digest != hfq_digest:
+        raise AssertionError("frozen Top-K selection identity drifted between arms")
+    return raw_digest, hfq_digest
+
+
 def compare_fixed_scores(
     aligned: pd.DataFrame,
     config: BacktestConfig,
@@ -81,11 +144,13 @@ def compare_fixed_scores(
     if aligned.duplicated(["trade_date", "stock_code"]).any():
         raise ValueError("fixed-score comparison contains duplicate event keys")
 
-    selected = _top_k_selected_rows(aligned, config)
-    selection_digest = _hash_frame(
-        selected,
-        ["trade_date", "stock_code", "factor_score"],
-    )
+    frozen = freeze_top_k_selection(aligned, config)
+    arms = {
+        "raw": frozen.assign(gross_return=frozen["raw_return"]),
+        "hfq": frozen.assign(gross_return=frozen["hfq_return"]),
+    }
+    raw_digest, hfq_digest = validate_selection_identity(arms["raw"], arms["hfq"])
+    selection_digests = {"raw": raw_digest, "hfq": hfq_digest}
     rows: list[dict[str, object]] = []
     for basis, return_column in (("raw", "raw_return"), ("hfq", "hfq_return")):
         _, score, target, mask = event_grids(
@@ -97,7 +162,7 @@ def compare_fixed_scores(
             daily_ic(score, target, mask, min_samples=min_ic_samples)
         )
         metrics, _ = evaluate_top_k_book(
-            aligned.assign(gross_return=aligned[return_column]),
+            arms[basis],
             config,
             gross=False,
             overlap=2,
@@ -111,7 +176,7 @@ def compare_fixed_scores(
                 "sharpe": metrics["sharpe"],
                 "final_equity": metrics["final_equity"],
                 "n_days": int(metrics["n_days"]),
-                "selected_score_digest": selection_digest,
+                "selected_score_digest": selection_digests[basis],
             }
         )
     return pd.DataFrame(rows)
@@ -227,32 +292,182 @@ def validate_expected_impact(
         )
 
 
-def _fingerprinted_input(path: Path) -> dict[str, object]:
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+    )
+
+
+def snapshot_file(path: Path) -> FileSnapshot:
+    """Hash a regular file and reject mutation during the snapshot itself."""
+    if path.is_symlink():
+        raise RuntimeError(f"input snapshot rejects symlink: {path}")
     resolved = path.resolve(strict=True)
-    return {"path": str(resolved), "sha256": _hash_file(resolved)}
+    before = resolved.stat(follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(f"input snapshot requires a regular file: {resolved}")
+    digest = _hash_file(resolved)
+    after = resolved.stat(follow_symlinks=False)
+    if _stat_identity(before) != _stat_identity(after):
+        raise RuntimeError(f"input changed while being fingerprinted: {resolved}")
+    return FileSnapshot(
+        path=str(resolved),
+        size=int(after.st_size),
+        mtime_ns=int(after.st_mtime_ns),
+        device=int(after.st_dev),
+        inode=int(after.st_ino),
+        mode=int(after.st_mode),
+        sha256=digest,
+    )
 
 
-def collect_input_fingerprints(
+def _cache_listing(directory: Path) -> tuple[str, ...]:
+    return tuple(sorted(entry.name for entry in directory.iterdir()))
+
+
+def build_input_manifest(
     *,
     input_path: Path,
     library_path: Path,
     price_cache: Path,
     config_path: Path,
-) -> dict[str, dict[str, object]]:
-    """Fingerprint every read-only input that determines the comparison."""
-    market_paths, _ = training_market_paths(price_cache)
-    resolved_cache = price_cache.resolve(strict=True)
+) -> InputManifest:
+    """Resolve and fingerprint the only file set the audit may consume."""
+    cache = price_cache.resolve(strict=True)
+    if not cache.is_dir():
+        raise RuntimeError(f"price cache is not a directory: {cache}")
+    listing = _cache_listing(cache)
+    parquet_paths = [
+        cache / name
+        for name in listing
+        if name.endswith(".parquet") and (cache / name).is_file()
+    ]
+    training_paths = [
+        path
+        for path in parquet_paths
+        if TRAIN_START.replace("-", "") <= path.stem <= TRAIN_END.replace("-", "")
+    ]
+    training_calendar = np.asarray(
+        [_hyphenated(path.stem) for path in training_paths],
+        dtype=str,
+    )
+    validate_training_calendar(training_calendar)
+    prior_paths = [path for path in parquet_paths if path.stem < TRAIN_START.replace("-", "")]
+    market_paths = [*prior_paths[-1:], *training_paths]
+    calendar = tuple(_hyphenated(path.stem) for path in market_paths)
+    manifest = InputManifest(
+        event_table=snapshot_file(input_path),
+        factor_library=snapshot_file(library_path),
+        backtest_config=snapshot_file(config_path),
+        comparison_script=snapshot_file(Path(__file__)),
+        price_cache=cache,
+        price_cache_listing=listing,
+        market_files=tuple(snapshot_file(path) for path in market_paths),
+        market_calendar=calendar,
+    )
+    if _cache_listing(cache) != listing:
+        raise RuntimeError("price cache listing changed while manifest was built")
+    return manifest
+
+
+def _assert_snapshot_unchanged(label: str, expected: FileSnapshot) -> None:
+    try:
+        actual = snapshot_file(Path(expected.path))
+    except (FileNotFoundError, RuntimeError, OSError) as error:
+        raise RuntimeError(f"{label} changed after input snapshot") from error
+    if actual != expected:
+        raise RuntimeError(f"{label} changed after input snapshot")
+
+
+def verify_input_manifest(manifest: InputManifest) -> None:
+    """Re-stat and re-hash every consumed byte, including cache membership."""
+    if _cache_listing(manifest.price_cache) != manifest.price_cache_listing:
+        raise RuntimeError("price cache listing changed after input snapshot")
+    for label, record in (
+        ("event_table", manifest.event_table),
+        ("factor_library", manifest.factor_library),
+        ("backtest_config", manifest.backtest_config),
+        ("comparison_script", manifest.comparison_script),
+    ):
+        _assert_snapshot_unchanged(label, record)
+    for record in manifest.market_files:
+        _assert_snapshot_unchanged(f"price cache file {Path(record.path).name}", record)
+    if _cache_listing(manifest.price_cache) != manifest.price_cache_listing:
+        raise RuntimeError("price cache listing changed during post-computation verification")
+
+
+def _load_training_market_manifest(
+    manifest: InputManifest,
+    event_codes: set[str],
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """Load exactly the market files frozen in ``manifest``; never re-enumerate."""
+    columns = ["trade_date", "ts_code", "open", "high", "close", "adj_factor"]
+    frames = []
+    for record in manifest.market_files:
+        frame = pd.read_parquet(record.path, columns=columns)
+        frames.append(frame.loc[frame["ts_code"].astype(str).isin(event_codes)])
+    market = pd.concat(frames, ignore_index=True)
+    if market.empty:
+        raise ValueError("training market cache has no matching event stocks")
+    return market, np.asarray(manifest.market_calendar, dtype=str)
+
+
+def _snapshot_payload(record: FileSnapshot) -> dict[str, object]:
     return {
-        "event_table": _fingerprinted_input(input_path),
-        "factor_library": _fingerprinted_input(library_path),
-        "backtest_config": _fingerprinted_input(config_path),
-        "price_cache": {
-            "path": str(resolved_cache),
-            "sha256": _hash_files(market_paths),
-            "file_count": len(market_paths),
-        },
-        "comparison_script": _fingerprinted_input(Path(__file__)),
+        "path": record.path,
+        "sha256": record.sha256,
+        "size": record.size,
+        "mtime_ns": record.mtime_ns,
+        "device": record.device,
+        "inode": record.inode,
     }
+
+
+def collect_input_fingerprints(
+    manifest: InputManifest,
+) -> dict[str, dict[str, object]]:
+    """Render fingerprints from the pre-consumption immutable manifest only."""
+    market_digest = hashlib.sha256()
+    for record in manifest.market_files:
+        market_digest.update(Path(record.path).name.encode())
+        market_digest.update(b"\0")
+        market_digest.update(record.sha256.encode())
+        market_digest.update(b"\n")
+    listing_digest = hashlib.sha256(
+        "\n".join(manifest.price_cache_listing).encode()
+    ).hexdigest()
+    return {
+        "event_table": _snapshot_payload(manifest.event_table),
+        "factor_library": _snapshot_payload(manifest.factor_library),
+        "backtest_config": _snapshot_payload(manifest.backtest_config),
+        "price_cache": {
+            "path": str(manifest.price_cache),
+            "sha256": market_digest.hexdigest(),
+            "file_count": len(manifest.market_files),
+            "listing_sha256": listing_digest,
+            "listing_count": len(manifest.price_cache_listing),
+        },
+        "comparison_script": _snapshot_payload(manifest.comparison_script),
+    }
+
+
+def validate_legacy_reconstruction(summary: dict[str, object]) -> dict[str, object]:
+    """Require the persisted legacy return label to match reconstructed raw prices."""
+    if summary.get("event_returns_match_raw") is not True:
+        raise AssertionError("legacy event returns do not match raw price reconstruction")
+    rounding_value = summary.get("event_return_rounding_error_max")
+    if not isinstance(rounding_value, (int, float, np.integer, np.floating)):
+        raise AssertionError("legacy event return rounding error is missing or invalid")
+    rounding_error = float(rounding_value)
+    if not np.isfinite(rounding_error) or rounding_error > 1e-6:
+        raise AssertionError(
+            "legacy event return rounding error exceeds 1e-6 reconstruction tolerance"
+        )
+    return summary
 
 
 def build_structured_output(
@@ -260,6 +475,7 @@ def build_structured_output(
     *,
     boundary: dict[str, object],
     inputs: dict[str, dict[str, object]],
+    legacy_reconstruction: dict[str, object],
 ) -> dict[str, Any]:
     """Build strict JSON evidence without writing any artifact."""
     indexed = comparison.set_index("price_basis")
@@ -280,6 +496,8 @@ def build_structured_output(
             **boundary,
         },
         "inputs": inputs,
+        "input_manifest_verified_after_computation": True,
+        "legacy_reconstruction": json_ready(legacy_reconstruction),
         "legacy_unverified_lineage": True,
         "historical_reports_rewritten": False,
         "loss_conclusion_unchanged": bool(raw_net < 0 and hfq_net < 0),
@@ -300,25 +518,33 @@ def build_baseline_evidence(
     config_path: Path,
 ) -> dict[str, Any]:
     """Run the read-only legacy adapter and return validated structured evidence."""
-    config = load_audit_config(config_path)
-    library = load_factors(library_path)
-    events = load_training_events(input_path, library)
-    market, calendar = load_training_market(
-        price_cache,
-        set(events["stock_code"].astype(str)),
-    )
-    prices = build_price_lookup(market, calendar, events["stock_code"].unique())
-    _, aligned = audit_adjustment_chain(events, prices)
-    boundary = validate_frozen_boundary(aligned)
-    comparison = compare_fixed_scores(aligned, config)
-    validate_expected_impact(comparison)
-    inputs = collect_input_fingerprints(
+    manifest = build_input_manifest(
         input_path=input_path,
         library_path=library_path,
         price_cache=price_cache,
         config_path=config_path,
     )
-    return build_structured_output(comparison, boundary=boundary, inputs=inputs)
+    config = load_audit_config(Path(manifest.backtest_config.path))
+    library = load_factors(Path(manifest.factor_library.path))
+    events = load_training_events(Path(manifest.event_table.path), library)
+    market, calendar = _load_training_market_manifest(
+        manifest,
+        set(events["stock_code"].astype(str)),
+    )
+    prices = build_price_lookup(market, calendar, events["stock_code"].unique())
+    adjustment_summary, aligned = audit_adjustment_chain(events, prices)
+    validate_legacy_reconstruction(adjustment_summary)
+    boundary = validate_frozen_boundary(aligned)
+    comparison = compare_fixed_scores(aligned, config)
+    validate_expected_impact(comparison)
+    verify_input_manifest(manifest)
+    inputs = collect_input_fingerprints(manifest)
+    return build_structured_output(
+        comparison,
+        boundary=boundary,
+        inputs=inputs,
+        legacy_reconstruction=adjustment_summary,
+    )
 
 
 def _metric_rows(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -333,6 +559,7 @@ def render_report(payload: dict[str, Any]) -> str:
     hfq = rows["hfq"]
     boundary = payload["training_window"]
     inputs = payload["inputs"]
+    reconstruction = payload["legacy_reconstruction"]
     digest = str(raw["selected_score_digest"])
 
     def pct(value: float) -> str:
@@ -379,6 +606,15 @@ def render_report(payload: dict[str, Any]) -> str:
 
 最后两个没有完整 D+2 outcome 的 D0 被严格排除；任何 D0 数量、最后 D0 或退出日变化都会触发 fail-closed，不会自动更新基线。
 
+## Legacy outcome 重建闸门
+
+| 校验 | 原始统计值 | 要求 |
+| --- | ---: | --- |
+| event return 与 raw 重建一致 | `{str(reconstruction['event_returns_match_raw']).lower()}` | 必须为 `true` |
+| 最大舍入误差 | {float(reconstruction['event_return_rounding_error_max']):.12g} | 不超过 `1e-6` |
+
+该闸门只证明本次 legacy event outcome 能由指定 raw 行情缓存重建；不证明 legacy 因子特征的上游复权口径或四元血缘。
+
 ## gp_000 修复前后核心指标
 
 | 指标 | 修复前：legacy raw outcome | 修复后：点时 HFQ outcome | 变化 |
@@ -400,6 +636,8 @@ def render_report(payload: dict[str, Any]) -> str:
 {input_row('price_cache', 'D+2 行情缓存')}
 {input_row('backtest_config', '成本与 Top4 配置')}
 {input_row('comparison_script', '本报告生成脚本')}
+
+所有输入在计算前由同一不可变 manifest 解析并哈希；行情只从该 manifest 的文件集合加载。计算结束后脚本重新枚举缓存，并对全部消费文件重新 stat 与 SHA-256 校验；任何内容、身份或成员变化都会终止发布。
 
 CLI 标准输出同时提供严格 JSON，其中 `legacy_unverified_lineage=true`、`historical_reports_rewritten=false`、`loss_conclusion_unchanged=true`。这些标志防止把 outcome 修正误解为对 legacy 特征血缘或盈利能力的认证。
 
@@ -443,24 +681,79 @@ def _validated_report_target(path: Path) -> Path:
     return target
 
 
+def _assert_parent_descriptor(parent: Path, descriptor: int) -> None:
+    anchored = os.fstat(descriptor)
+    try:
+        current = os.stat(parent, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError("designated adjustment report parent changed") from error
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or current.st_dev != anchored.st_dev
+        or current.st_ino != anchored.st_ino
+    ):
+        raise ValueError("designated adjustment report parent changed")
+
+
+def _open_designated_parent(parent: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(parent, flags)
+    try:
+        _assert_parent_descriptor(parent, descriptor)
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _existing_report_mode(parent_descriptor: int, filename: str) -> int:
+    try:
+        existing = os.stat(
+            filename,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return 0o644
+    if not stat.S_ISREG(existing.st_mode):
+        raise ValueError("designated adjustment report must be a regular file")
+    return stat.S_IMODE(existing.st_mode)
+
+
 def publish_report(report: str, path: Path) -> None:
     """Atomically publish only the one designated worktree repair report."""
     target = _validated_report_target(path)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{target.name}.",
-        suffix=".tmp",
-        dir=target.parent,
-    )
-    temporary = Path(temporary_name)
+    parent_descriptor = _open_designated_parent(target.parent)
+    temporary_name = f".{target.name}.{secrets.token_hex(12)}.tmp"
+    temporary_descriptor: int | None = None
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        mode = _existing_report_mode(parent_descriptor, target.name)
+        temporary_descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        os.fchmod(temporary_descriptor, mode)
+        with os.fdopen(temporary_descriptor, "w", encoding="utf-8") as handle:
+            temporary_descriptor = None
             handle.write(report)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, target)
+        _assert_parent_descriptor(target.parent, parent_descriptor)
+        os.replace(
+            temporary_name,
+            target.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        os.fsync(parent_descriptor)
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        if temporary_descriptor is not None:
+            os.close(temporary_descriptor)
+        with suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+        os.close(parent_descriptor)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -475,6 +768,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    _validated_report_target(args.report)
     payload = build_baseline_evidence(
         input_path=args.input,
         library_path=args.library,
