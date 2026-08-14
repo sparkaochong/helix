@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -16,9 +17,11 @@ from scripts.gp000_loss_attribution import (
     OutputPaths,
     apply_cost_by_d0,
     audit_adjustment_chain,
+    audit_trace_records,
     build_daily_artifact,
     build_price_lookup,
     deduplicate_or_fail,
+    emit_audit_trace,
     evaluate_ex_right_samples,
     evaluate_horizon_decay,
     evaluate_monthly_returns,
@@ -33,6 +36,7 @@ from scripts.gp000_loss_attribution import (
     render_report,
     replay_formal_factor,
     summarize_quintile_monotonicity,
+    validate_evidence,
     validate_formal_factor,
     validate_training_calendar,
     write_outputs,
@@ -528,6 +532,7 @@ def _minimal_evidence() -> dict[str, object]:
     )
     root_contract = {
         "severity": "高",
+        "是否核心": "否",
         "主导亏损": "否",
         "修复文件/接口": "module.py/interface",
         "回归测试": "test_contract",
@@ -584,7 +589,10 @@ def _minimal_evidence() -> dict[str, object]:
             "industries_sha256": "0" * 64,
             "effective_backtest": BacktestConfig().model_dump(),
         },
-        "summary": "复权口径存在跨路径错配，但不是亏损核心原因。",
+        "summary": (
+            "复权口径问题存在，但不是核心或主导亏损原因。"
+            "目标错配是主导亏损原因。"
+        ),
         "adjustment_matrix": pd.DataFrame(
             [{"节点": "数据源层", "口径": "原始价+点时复权因子", "未来函数": "未发现"}]
         ),
@@ -615,9 +623,15 @@ def _minimal_evidence() -> dict[str, object]:
         "ex_right_top4_summary": {
             "selected_trades": 4,
             "selected_any_ex_right": 1,
+            "selected_any_ex_right_stocks": 1,
             "selected_holding_ex_right": 1,
+            "raw_book_return_sum_on_holding_ex_right": -0.01,
+            "hfq_book_return_sum_on_holding_ex_right": 0.0,
+            "hfq_minus_raw_trade_return_mean_on_holding_ex_right": 0.01,
             "hfq_minus_raw_book_return_sum": 0.0,
         },
+        "ex_right_event_sample_count": 3,
+        "ex_right_d0_unobservable_count": 1,
         "ex_right_portfolio_comparison": pd.DataFrame(
             [
                 {
@@ -705,6 +719,10 @@ def _minimal_evidence() -> dict[str, object]:
                 }
             ]
         ),
+        "style_orthogonality": {
+            "analysis_coverage_of_raw_factor": 0.95,
+            "max_abs_normalized_exposure": 1e-12,
+        },
         "root_causes": [
             {
                 "category": "因子 alpha",
@@ -734,6 +752,109 @@ def _minimal_evidence() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize(
+    "field",
+    ("event_prices_match_raw", "event_returns_match_raw"),
+)
+def test_adjustment_consistency_must_pass_before_publish(field: str) -> None:
+    evidence = _minimal_evidence()
+    evidence["adjustment_audit"][field] = False
+
+    with pytest.raises(ValueError, match="adjustment audit consistency"):
+        validate_evidence(evidence)
+
+
+def test_equal_factor_hit_flip_refuses_publish() -> None:
+    evidence = _minimal_evidence()
+    evidence["adjustment_audit"].update(
+        hit_flip_count=2,
+        adjustment_hit_flip_count=1,
+        equal_factor_hit_flip_count=1,
+    )
+
+    with pytest.raises(ValueError, match="equal-factor hit flips"):
+        validate_evidence(evidence)
+
+
+@pytest.mark.parametrize("field", ("是否核心", "主导亏损"))
+def test_each_root_cause_requires_both_loss_classifications(field: str) -> None:
+    evidence = _minimal_evidence()
+    evidence["root_causes"][0].pop(field)
+
+    with pytest.raises(ValueError, match="full remediation contract"):
+        validate_evidence(evidence)
+
+
+def test_audit_trace_records_cover_every_report_conclusion_input() -> None:
+    evidence = _minimal_evidence()
+    records = audit_trace_records(evidence)
+
+    assert set(records) == {
+        "adjustment_basis",
+        "adjustment_statistics",
+        "ex_right_counts",
+        "ex_right_factor_diagnostics",
+        "ex_right_return_errors",
+        "ex_right_top4",
+        "ex_right_portfolio",
+        "quintiles",
+        "quintile_monotonicity",
+        "cost_split",
+        "decay",
+        "monthly",
+        "style",
+        "root_causes",
+    }
+    assert records["adjustment_statistics"] == evidence[
+        "adjustment_stats"
+    ].to_dict(orient="records")
+    assert records["ex_right_counts"]["event_sample_count"] == 3
+    assert records["ex_right_counts"]["d0_unobservable_count"] == 1
+    assert records["quintile_monotonicity"]["gross_spearman"] == -1.0
+    assert records["style"]["orthogonality"] == evidence["style_orthogonality"]
+    assert records["root_causes"][0]["主导亏损"] == "否"
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "selected_any_ex_right_stocks",
+        "raw_book_return_sum_on_holding_ex_right",
+        "hfq_book_return_sum_on_holding_ex_right",
+        "hfq_minus_raw_trade_return_mean_on_holding_ex_right",
+    ),
+)
+def test_ex_right_top4_requires_each_reported_statistic(field: str) -> None:
+    evidence = _minimal_evidence()
+    evidence["ex_right_top4_summary"].pop(field)
+
+    with pytest.raises(ValueError, match="Top4 summary"):
+        validate_evidence(evidence)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("ex_right_event_sample_count", "ex_right_d0_unobservable_count"),
+)
+def test_ex_right_sample_counts_must_be_non_negative(field: str) -> None:
+    evidence = _minimal_evidence()
+    evidence[field] = -1
+
+    with pytest.raises(ValueError, match="non-negative"):
+        validate_evidence(evidence)
+
+
+def test_emit_audit_trace_logs_each_checkpoint(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    evidence = _minimal_evidence()
+    with caplog.at_level(logging.INFO, logger=audit_module.__name__):
+        emit_audit_trace(evidence)
+
+    for checkpoint in audit_trace_records(evidence):
+        assert f"checkpoint={checkpoint}" in caplog.text
+
+
 def test_root_causes_rank_engineering_before_config_before_alpha() -> None:
     causes = rank_root_causes(_minimal_evidence())
 
@@ -760,6 +881,40 @@ def test_report_contains_every_required_section() -> None:
         "复现方式",
     ):
         assert heading in report
+
+
+def test_report_distinguishes_adjustment_issue_from_dominant_loss_cause() -> None:
+    report = render_report(_minimal_evidence())
+
+    assert "复权口径问题存在，但不是核心或主导亏损原因" in report
+    assert "目标错配是主导亏损原因" in report
+    assert "是否核心" in report
+    assert "主导亏损" in report
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "复权口径问题存在，但不是核心或主导亏损原因",
+        "目标错配是主导亏损原因",
+    ),
+)
+def test_report_conclusion_contract_refuses_publish(
+    tmp_path: Path,
+    phrase: str,
+) -> None:
+    evidence = _minimal_evidence()
+    evidence["summary"] = str(evidence["summary"]).replace(phrase, "")
+    paths = OutputPaths(
+        report=tmp_path / "report.md",
+        json=tmp_path / "evidence.json",
+        daily=tmp_path / "daily.parquet",
+        equity_svg=tmp_path / "equity.svg",
+        decay_svg=tmp_path / "decay.svg",
+    )
+
+    with pytest.raises(ValueError, match="required conclusions"):
+        write_outputs(evidence, paths)
 
 
 def test_svg_and_machine_outputs_are_well_formed(tmp_path: Path) -> None:
@@ -808,6 +963,8 @@ def test_invalid_evidence_writes_no_partial_outputs(tmp_path: Path) -> None:
         "ex_right_return_errors",
         "ex_right_top4_summary",
         "ex_right_portfolio_comparison",
+        "ex_right_event_sample_count",
+        "ex_right_d0_unobservable_count",
         "quintile_monotonicity",
         "adjustment_audit",
     ],
@@ -950,7 +1107,7 @@ def test_output_publish_failure_restores_previous_artifact_set(
         original_replace(source, destination)
 
     monkeypatch.setattr(audit_module.os, "replace", fail_second_replace)
-    evidence["summary"] = "new summary"
+    evidence["summary"] = f"{evidence['summary']} new summary"
 
     with pytest.raises(OSError, match="simulated"):
         write_outputs(evidence, paths)
@@ -982,7 +1139,7 @@ def test_output_rollback_failure_retains_recovery_backup(
         original_replace(source, destination)
 
     monkeypatch.setattr(audit_module.os, "replace", fail_publish_and_restore)
-    evidence["summary"] = "new summary"
+    evidence["summary"] = f"{evidence['summary']} new summary"
 
     with pytest.raises(RuntimeError, match="backups retained"):
         write_outputs(evidence, paths)

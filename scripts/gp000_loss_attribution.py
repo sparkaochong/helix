@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -25,7 +26,10 @@ from helix.eval.backtest import _cost_rates, _net_returns, summarize_portfolio_r
 from helix.eval.ic import daily_ic, summarize_ic
 from helix.eval.style_neutralize import build_style_design, style_residualize
 from helix.gp.library import FactorLibrary, FactorSpec, compute_factors, load_factors
+from helix.logging_setup import setup_logging
 from scripts.g3_style_ablation import compute_trailing_styles
+
+log = logging.getLogger(__name__)
 
 TRAIN_START = "2022-01-04"
 TRAIN_END = "2024-09-04"
@@ -1866,12 +1870,14 @@ def build_evidence(
         },
     ]
     summary = (
-        "**结论：存在真实的复权工程 bug，但它不是 gp_000 亏损的核心原因。** "
+        "**复权口径问题存在，但不是核心或主导亏损原因。** "
         f"统一为点时后复权后，Top4 单笔净收益为 {net_metrics['mean_trade_return']:.4%}、"
         f"CAGR 为 {net_metrics['cagr']:.2%}，仍为负；复权修正只改变单笔 "
-        f"{adjustment_net_delta:.4%}。核心原因是正式库仍承载旧的 8% 触达优化目标，"
-        f"而生产验收是 D+2 收盘净收益；对应 D+2 IC={d2_return_ic:.4f}，"
-        f"风格中性 CAGR={style['style_neutral']['cagr']:.2%}，说明剥离风格后仍无可用纯 alpha。"
+        f"{adjustment_net_delta:.4%}。**目标错配是主导亏损原因。** 正式库仍承载旧的 "
+        "8% 触达优化目标，而生产验收是 D+2 收盘净收益；对应 D+2 IC="
+        f"{d2_return_ic:.4f}，风格中性 CAGR={style['style_neutral']['cagr']:.2%}，"
+        "说明剥离风格后仍无可用纯 alpha。详见"
+        "[治理台账 D10](../factor-governance.md)。"
     )
     metadata = {
         "train_start": TRAIN_START,
@@ -2270,6 +2276,60 @@ def json_ready(value: object) -> object:
     return value
 
 
+def audit_trace_records(evidence: dict[str, object]) -> dict[str, object]:
+    """Expose each report conclusion's source statistics by checkpoint."""
+
+    def frame_records(name: str) -> list[dict[str, object]]:
+        frame = evidence[name]
+        if not isinstance(frame, pd.DataFrame):
+            raise TypeError(f"audit trace section {name} must be a DataFrame")
+        return frame.to_dict(orient="records")
+
+    decay = evidence["decay"]
+    if not isinstance(decay, dict) or not isinstance(decay.get("summary"), pd.DataFrame):
+        raise TypeError("audit trace decay summary must be a DataFrame")
+    return {
+        "adjustment_basis": frame_records("adjustment_matrix"),
+        "adjustment_statistics": frame_records("adjustment_stats"),
+        "ex_right_counts": {
+            "by_stage": frame_records("ex_right_counts"),
+            "event_sample_count": evidence["ex_right_event_sample_count"],
+            "d0_unobservable_count": evidence["ex_right_d0_unobservable_count"],
+        },
+        "ex_right_factor_diagnostics": frame_records(
+            "ex_right_factor_diagnostics"
+        ),
+        "ex_right_return_errors": frame_records("ex_right_return_errors"),
+        "ex_right_top4": dict(evidence["ex_right_top4_summary"]),
+        "ex_right_portfolio": frame_records("ex_right_portfolio_comparison"),
+        "quintiles": frame_records("quintiles"),
+        "quintile_monotonicity": dict(evidence["quintile_monotonicity"]),
+        "cost_split": frame_records("cost_split"),
+        "decay": decay["summary"].to_dict(orient="records"),
+        "monthly": frame_records("monthly"),
+        "style": {
+            "metrics": frame_records("style_table"),
+            "orthogonality": dict(evidence["style_orthogonality"]),
+        },
+        "root_causes": rank_root_causes(evidence),
+    }
+
+
+def emit_audit_trace(evidence: dict[str, object]) -> None:
+    """Log raw statistics used by every narrative audit conclusion."""
+    for checkpoint, payload in audit_trace_records(evidence).items():
+        log.info(
+            "audit checkpoint=%s data=%s",
+            checkpoint,
+            json.dumps(
+                json_ready(payload),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+            ),
+        )
+
+
 def atomic_text(path: Path, content: str) -> None:
     """Write UTF-8 text atomically through a sibling temporary file."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2321,6 +2381,8 @@ def validate_evidence(evidence: dict[str, object]) -> None:
         "ex_right_return_errors",
         "ex_right_top4_summary",
         "ex_right_portfolio_comparison",
+        "ex_right_event_sample_count",
+        "ex_right_d0_unobservable_count",
         "quintiles",
         "quintile_monotonicity",
         "cost_split",
@@ -2335,6 +2397,17 @@ def validate_evidence(evidence: dict[str, object]) -> None:
     missing = required - set(evidence)
     if missing:
         raise ValueError(f"evidence is missing required sections: {sorted(missing)}")
+    for count_name in (
+        "ex_right_event_sample_count",
+        "ex_right_d0_unobservable_count",
+    ):
+        count = evidence[count_name]
+        if (
+            isinstance(count, (bool, np.bool_))
+            or not isinstance(count, (int, np.integer))
+            or count < 0
+        ):
+            raise ValueError(f"{count_name} must be a non-negative integer")
     metadata_required = {
         "train_start",
         "train_end",
@@ -2408,11 +2481,20 @@ def validate_evidence(evidence: dict[str, object]) -> None:
         np.asarray([adjustment_audit[key] for key in numeric_adjustment], dtype=float)
     ).all():
         raise ValueError("adjustment audit required metrics must be finite")
+    if not (
+        adjustment_audit["event_prices_match_raw"]
+        and adjustment_audit["event_returns_match_raw"]
+    ):
+        raise ValueError("adjustment audit consistency checks must pass")
+    if adjustment_audit["event_return_rounding_error_max"] > 1e-6:
+        raise ValueError("adjustment audit return rounding exceeds tolerance")
     if adjustment_audit["hit_flip_count"] != (
         adjustment_audit["adjustment_hit_flip_count"]
         + adjustment_audit["equal_factor_hit_flip_count"]
     ):
         raise ValueError("adjustment hit-flip classification must reconcile")
+    if adjustment_audit["equal_factor_hit_flip_count"] != 0:
+        raise ValueError("adjustment audit equal-factor hit flips must be zero")
     for name in (
         "adjustment_matrix",
         "adjustment_stats",
@@ -2519,7 +2601,11 @@ def validate_evidence(evidence: dict[str, object]) -> None:
     top4_required = {
         "selected_trades",
         "selected_any_ex_right",
+        "selected_any_ex_right_stocks",
         "selected_holding_ex_right",
+        "raw_book_return_sum_on_holding_ex_right",
+        "hfq_book_return_sum_on_holding_ex_right",
+        "hfq_minus_raw_trade_return_mean_on_holding_ex_right",
         "hfq_minus_raw_book_return_sum",
     }
     if not isinstance(top4_summary, dict) or top4_required - set(top4_summary):
@@ -2625,6 +2711,7 @@ def validate_evidence(evidence: dict[str, object]) -> None:
         "severity",
         "cause",
         "evidence",
+        "是否核心",
         "主导亏损",
         "修复文件/接口",
         "回归测试",
@@ -2663,6 +2750,14 @@ def write_outputs(evidence: dict[str, object], paths: OutputPaths) -> None:
     )
     if any(heading not in report for heading in required_headings):
         raise ValueError("rendered report is missing required sections")
+    required_conclusions = (
+        "复权口径问题存在，但不是核心或主导亏损原因",
+        "目标错配是主导亏损原因",
+        "是否核心",
+        "主导亏损",
+    )
+    if any(conclusion not in report for conclusion in required_conclusions):
+        raise ValueError("rendered report is missing required conclusions")
 
     daily_artifact = evidence["daily_artifact"]
     staged: dict[Path, Path] = {}
@@ -2727,6 +2822,7 @@ def write_outputs(evidence: dict[str, object], paths: OutputPaths) -> None:
 
 
 def main() -> None:
+    setup_logging()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--library", type=Path, default=DEFAULT_LIBRARY)
@@ -2756,6 +2852,8 @@ def main() -> None:
         equity_svg=args.equity_svg,
         decay_svg=args.decay_svg,
     )
+    validate_evidence(evidence)
+    emit_audit_trace(evidence)
     write_outputs(evidence, paths)
     summary = {
         "report": str(paths.report),
