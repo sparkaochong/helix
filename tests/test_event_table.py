@@ -350,6 +350,34 @@ def test_event_calendar_loader_reads_only_open_sessions(tmp_path):
     assert load_event_calendar(path) == ("20240102", "20240104")
 
 
+@pytest.mark.parametrize("bad_is_open", [None, "oops", 0.5, -1, 2])
+def test_event_calendar_rejects_invalid_is_open_instead_of_dropping_session(
+    tmp_path, bad_is_open
+):
+    path = tmp_path / "calendar.parquet"
+    pd.DataFrame(
+        {
+            "cal_date": ["20240102", "20240103", "20240104"],
+            "is_open": ["1", None if bad_is_open is None else str(bad_is_open), "1"],
+        }
+    ).to_parquet(path, index=False)
+
+    with pytest.raises(EventLineageError, match="is_open.*20240103"):
+        load_event_calendar(path)
+
+
+def test_row_validation_error_names_position_trade_date_and_stock(tmp_path):
+    manifest = load_event_lineage(_write_manifest(tmp_path))
+    frame = _governed_frame()
+    frame.loc[1, "feature_price_basis"] = "raw"
+
+    with pytest.raises(
+        EventLineageError,
+        match=r"feat_a.*price_basis.*row 1.*trade_date=.?20240103.*stock_code=.?000002\.SZ",
+    ):
+        validate_event_fields(frame, manifest, ["feat_a"], calendar=CALENDAR)
+
+
 def test_governed_load_packs_fields_and_labels_without_audit_columns(tmp_path):
     frame = _governed_frame()
     path = tmp_path / "events.parquet"
@@ -403,6 +431,85 @@ def test_auto_feature_discovery_excludes_shared_audit_columns(tmp_path):
     )
 
     assert panel.field_names() == ["feat_a", "feat_b"]
+
+
+def test_auto_feature_discovery_excludes_numeric_manifest_audit_sentinel(tmp_path):
+    frame = _governed_frame().assign(numeric_audit_sentinel=[101, 102])
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+    payload = _manifest_dict()
+    payload["fields"]["unused_governed_field"] = {
+        "source_date": "numeric_audit_sentinel",
+        "as_of_time": "feature_as_of_time",
+        "price_basis": "feature_price_basis",
+        "adj_factor_version": "feature_adj_factor_version",
+        "horizon": 0,
+    }
+
+    panel = load_event_panel(
+        path,
+        label_columns=["label_d2_return_hfq"],
+        lineage_path=_write_manifest(tmp_path, payload),
+        calendar_path=_write_calendar(tmp_path),
+    )
+
+    assert "numeric_audit_sentinel" not in panel.fields
+
+
+def test_streaming_audit_validation_projects_one_bounded_group_at_a_time(
+    tmp_path, monkeypatch
+):
+    group_count = 459
+    data: dict[str, list] = {
+        "trade_date": ["20240102", "20240103"],
+        "stock_code": ["000001.SZ", "000002.SZ"],
+        "label_h0": [0.0, 1.0],
+    }
+    fields: dict[str, dict] = {}
+    for group in range(group_count):
+        name = f"feat_{group:03d}"
+        data[name] = [float(group), float(group + 1)]
+        data[f"source_{group}"] = ["20240102", "20240103"]
+        data[f"asof_{group}"] = [
+            "2024-01-02T15:00:00+08:00",
+            "2024-01-03T15:00:00+08:00",
+        ]
+        data[f"basis_{group}"] = ["hfq", "hfq"]
+        data[f"version_{group}"] = [VERSION, VERSION]
+        fields[name] = {
+            "source_date": f"source_{group}",
+            "as_of_time": f"asof_{group}",
+            "price_basis": f"basis_{group}",
+            "adj_factor_version": f"version_{group}",
+            "horizon": 0,
+        }
+    fields["label_h0"] = fields["feat_000"].copy()
+    path = tmp_path / "wide-events.parquet"
+    pd.DataFrame(data).to_parquet(path, index=False)
+    manifest_path = _write_manifest(
+        tmp_path, {"schema_version": 1, "fields": fields}
+    )
+
+    import pyarrow.parquet as pq
+
+    projected: list[tuple[str, ...]] = []
+    original = pq.ParquetFile.iter_batches
+
+    def recording_iter_batches(parquet_file, *args, **kwargs):
+        projected.append(tuple(kwargs["columns"]))
+        yield from original(parquet_file, *args, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", recording_iter_batches)
+
+    open_event_source(
+        path,
+        ["label_h0"],
+        lineage_path=manifest_path,
+        feature_columns=[f"feat_{group:03d}" for group in range(group_count)],
+    )
+
+    assert len(projected) == group_count
+    assert max(map(len, projected)) <= 6
 
 
 def test_explicit_feature_columns_reject_physical_audit_columns(tmp_path):

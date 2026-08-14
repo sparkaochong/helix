@@ -23,7 +23,9 @@ import pandas as pd
 
 from ..logging_setup import get_logger
 from .event_lineage import (
+    EventAuditColumns,
     EventLineageError,
+    EventLineageValidationState,
     audit_column_names,
     load_event_calendar,
     load_event_lineage,
@@ -36,6 +38,7 @@ log = get_logger(__name__)
 
 DATE_COLUMN = "trade_date"
 CODE_COLUMN = "stock_code"
+AUDIT_VALIDATION_BATCH_SIZE = 65_536
 
 
 @dataclass
@@ -316,19 +319,59 @@ def open_event_source(
             f"feature_columns cannot include event audit columns: {leaked_audits}"
         )
     governed = list(dict.fromkeys([*(feature_columns or []), *label_columns]))
-    schema_names = set(pq.ParquetFile(path).schema_arrow.names)
+    parquet_file = pq.ParquetFile(path)
+    schema_names = set(parquet_file.schema_arrow.names)
     validate_event_schema(schema_names, manifest, governed)
-    audits = audit_column_names({field: manifest[field] for field in governed})
     needs_calendar = any(manifest[field].horizon > 0 for field in governed)
     calendar = (
         load_event_calendar(calendar_path)
         if calendar_path is not None or needs_calendar
         else None
     )
-    projected = list(dict.fromkeys([date_column, code_column, *label_columns, *sorted(audits)]))
-    keys = pq.read_table(path, columns=projected).to_pandas()
-    validate_event_fields(keys, manifest, governed, calendar=calendar)
-    keys = keys[[date_column, code_column, *label_columns]].copy()
+    key_projection = list(dict.fromkeys([date_column, code_column, *label_columns]))
+    keys = pq.read_table(path, columns=key_projection).to_pandas()
+    audit_groups: dict[EventAuditColumns, str] = {}
+    for governed_field in governed:
+        audit_groups.setdefault(manifest[governed_field], governed_field)
+    validation_state = EventLineageValidationState()
+    for audit, representative_field in audit_groups.items():
+        projection = list(
+            dict.fromkeys(
+                [
+                    audit.source_date,
+                    audit.as_of_time,
+                    audit.price_basis,
+                    audit.adj_factor_version,
+                ]
+            )
+        )
+        row_offset = 0
+        for batch in parquet_file.iter_batches(
+            batch_size=AUDIT_VALIDATION_BATCH_SIZE,
+            columns=projection,
+        ):
+            audit_frame = batch.to_pandas()
+            batch_end = row_offset + len(audit_frame)
+            audit_frame.insert(
+                0,
+                code_column,
+                keys[code_column].iloc[row_offset:batch_end].to_numpy(copy=False),
+            )
+            audit_frame.insert(
+                0,
+                date_column,
+                keys[date_column].iloc[row_offset:batch_end].to_numpy(copy=False),
+            )
+            validate_event_fields(
+                audit_frame,
+                manifest,
+                [representative_field],
+                calendar=calendar,
+                state=validation_state,
+                row_offset=row_offset,
+            )
+            row_offset = batch_end
+            del audit_frame
     keys["_row"] = np.arange(len(keys))
     keys = normalize_frame(keys, date_column, code_column)
     index = build_slot_index(keys, date_column, code_column)

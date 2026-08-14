@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +57,13 @@ class EventAuditColumns:
 
 
 EventLineageManifest = dict[str, EventAuditColumns]
+
+
+@dataclass
+class EventLineageValidationState:
+    """The sole row-independent invariant retained across bounded audit batches."""
+
+    adjustment_version: str | None = None
 
 
 def require_independent_event_calendar(
@@ -134,8 +143,25 @@ def load_event_calendar(path: Path | str | None) -> tuple[str, ...]:
                 "event trading calendar must be a parquet or CSV file"
             )
         if "is_open" in frame:
-            is_open = pd.to_numeric(frame["is_open"], errors="coerce")
-            frame = frame[is_open == 1]
+            flags: list[int] = []
+            for session, value in zip(
+                frame[date_column].tolist(), frame["is_open"].tolist(), strict=True
+            ):
+                valid_string = isinstance(value, str) and re.fullmatch(r"[01]", value)
+                valid_integer = isinstance(value, Integral) and not isinstance(value, bool)
+                valid_real = (
+                    isinstance(value, Real)
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                    and float(value).is_integer()
+                )
+                if not (valid_string or valid_integer or valid_real) or int(value) not in {0, 1}:
+                    raise EventLineageError(
+                        f"invalid event trading calendar is_open value {value!r} "
+                        f"for session {session!r}; expected 0 or 1"
+                    )
+                flags.append(int(value))
+            frame = frame[[flag == 1 for flag in flags]]
         values = frame[date_column].tolist()
     except EventLineageError:
         raise
@@ -145,7 +171,9 @@ def load_event_calendar(path: Path | str | None) -> tuple[str, ...]:
         ) from exc
 
     parsed = [
-        _parse_date(value, field="calendar", rule="session", row_date=position)
+        _parse_date(
+            value, field="calendar", rule="session", context=f"calendar row {position}"
+        )
         for position, value in enumerate(values)
     ]
     if not parsed:
@@ -196,10 +224,10 @@ def validate_event_schema(
                 )
 
 
-def _parse_date(value: Any, *, field: str, rule: str, row_date: Any) -> date:
+def _parse_date(value: Any, *, field: str, rule: str, context: Any) -> date:
     if type(value) is not str:
         raise EventLineageError(
-            f"field {field!r} {rule} must be literal YYYYMMDD or YYYY-MM-DD at row {row_date}"
+            f"field {field!r} {rule} must be literal YYYYMMDD or YYYY-MM-DD at {context}"
         )
     try:
         if re.fullmatch(r"\d{8}", value):
@@ -209,34 +237,41 @@ def _parse_date(value: Any, *, field: str, rule: str, row_date: Any) -> date:
     except ValueError:
         pass
     raise EventLineageError(
-        f"field {field!r} invalid {rule} {value!r} at row {row_date}"
+        f"field {field!r} invalid {rule} {value!r} at {context}"
     )
 
 
-def _parse_as_of(value: Any, source: date, *, field: str, row_date: Any) -> datetime:
+def _parse_as_of(value: Any, source: date, *, field: str, context: Any) -> datetime:
     if type(value) is not str or not _AS_OF_RE.fullmatch(value):
         raise EventLineageError(
-            f"field {field!r} invalid as_of_time {value!r} at row {row_date}"
+            f"field {field!r} invalid as_of_time {value!r} at {context}"
         )
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError as exc:
         raise EventLineageError(
-            f"field {field!r} invalid as_of_time {value!r} at row {row_date}"
+            f"field {field!r} invalid as_of_time {value!r} at {context}"
         ) from exc
     if parsed.utcoffset() != timedelta(hours=8):
         raise EventLineageError(
-            f"field {field!r} as_of_time must use +08:00 at row {row_date}: {value!r}"
+            f"field {field!r} as_of_time must use +08:00 at {context}: {value!r}"
         )
     if parsed.date() != source:
         raise EventLineageError(
-            f"field {field!r} as_of_time is not local to source_date at row {row_date}"
+            f"field {field!r} as_of_time is not local to source_date at {context}"
         )
     if parsed.timetz().replace(tzinfo=None) > time(15):
         raise EventLineageError(
-            f"field {field!r} as_of_time is after market close at row {row_date}: {value!r}"
+            f"field {field!r} as_of_time is after market close at {context}: {value!r}"
         )
     return parsed
+
+
+def _row_context(position: int, trade_date: Any, stock_code: Any | None) -> str:
+    context = f"row {position} trade_date={trade_date!r}"
+    if stock_code is not None:
+        context += f" stock_code={stock_code!r}"
+    return context
 
 
 def validate_event_fields(
@@ -246,6 +281,8 @@ def validate_event_fields(
     *,
     calendar: Sequence[str] | None = None,
     train_end: str | None = None,
+    state: EventLineageValidationState | None = None,
+    row_offset: int = 0,
 ) -> None:
     """Validate governed HFQ lineage for every requested field and row.
 
@@ -263,18 +300,37 @@ def validate_event_fields(
     if "trade_date" not in frame:
         raise EventLineageError("event lineage validation requires trade_date")
     row_dates_raw = frame["trade_date"].tolist()
+    stock_codes = (
+        frame["stock_code"].tolist()
+        if "stock_code" in frame
+        else [None] * len(row_dates_raw)
+    )
+    row_contexts = [
+        _row_context(row_offset + position, value, stock_codes[position])
+        for position, value in enumerate(row_dates_raw)
+    ]
     row_dates = [
-        _parse_date(value, field="trade_date", rule="trade_date", row_date=value)
-        for value in row_dates_raw
+        _parse_date(value, field="trade_date", rule="trade_date", context=row_contexts[position])
+        for position, value in enumerate(row_dates_raw)
     ]
     cutoff = (
-        _parse_date(train_end, field="train_end", rule="train_end", row_date=train_end)
+        _parse_date(
+            train_end,
+            field="train_end",
+            rule="train_end",
+            context=f"train_end={train_end!r}",
+        )
         if train_end is not None
         else None
     )
     calendar_dates = (
         [
-            _parse_date(value, field="calendar", rule="session", row_date=position)
+            _parse_date(
+                value,
+                field="calendar",
+                rule="session",
+                context=f"calendar row {position}",
+            )
             for position, value in enumerate(calendar)
         ]
         if calendar is not None
@@ -293,7 +349,7 @@ def validate_event_fields(
 
     parsed_sources: dict[str, list[date]] = {}
     parsed_audits: dict[EventAuditColumns, list[date]] = {}
-    shared_version: str | None = None
+    validation_state = state if state is not None else EventLineageValidationState()
     for field in requested:
         item = manifest.get(field)
         if item is None:
@@ -322,32 +378,32 @@ def validate_event_fields(
             strict=True,
         )
         for position, (basis, version, source_value, as_of_value) in enumerate(audit_rows):
-            row_date = row_dates_raw[position]
+            context = row_contexts[position]
             if type(basis) is not str or basis != HFQ_BASIS:
                 raise EventLineageError(
-                    f"field {field!r} price_basis must be literal 'hfq' at row {row_date}, "
+                    f"field {field!r} price_basis must be literal 'hfq' at {context}, "
                     f"got {basis!r}"
                 )
             if type(version) is not str or not _VERSION_RE.fullmatch(version):
                 raise EventLineageError(
-                    f"field {field!r} unsupported adj_factor_version at row {row_date}: "
+                    f"field {field!r} unsupported adj_factor_version at {context}: "
                     f"{version!r}"
                 )
-            if shared_version is None:
-                shared_version = version
-            elif version != shared_version:
+            if validation_state.adjustment_version is None:
+                validation_state.adjustment_version = version
+            elif version != validation_state.adjustment_version:
                 raise EventLineageError(
-                    f"field {field!r} has inconsistent adjustment version at row {row_date}: "
-                    f"{version!r} != {shared_version!r}"
+                    f"field {field!r} has inconsistent adjustment version at {context}: "
+                    f"{version!r} != {validation_state.adjustment_version!r}"
                 )
             source = _parse_date(
-                source_value, field=field, rule="source_date", row_date=row_date
+                source_value, field=field, rule="source_date", context=context
             )
-            _parse_as_of(as_of_value, source, field=field, row_date=row_date)
+            _parse_as_of(as_of_value, source, field=field, context=context)
             sources.append(source)
             if cutoff is not None and item.horizon > 0 and source > cutoff:
                 raise EventLineageError(
-                    f"field {field!r} outcome exceeds train_end {train_end!r} at row {row_date}: "
+                    f"field {field!r} outcome exceeds train_end {train_end!r} at {context}: "
                     f"source_date={source.isoformat()}"
                 )
         parsed_audits[item] = sources
@@ -358,18 +414,18 @@ def validate_event_fields(
         for position, (decision, source) in enumerate(
             zip(row_dates, parsed_sources[field], strict=True)
         ):
-            row_date = row_dates_raw[position]
+            context = row_contexts[position]
             if item.horizon == 0:
                 if source != decision:
                     raise EventLineageError(
-                        f"field {field!r} horizon=0 source_date mismatch at row {row_date}: "
+                        f"field {field!r} horizon=0 source_date mismatch at {context}: "
                         f"got {source.isoformat()}, expected {decision.isoformat()}"
                     )
                 continue
             decision_position = calendar_positions.get(decision)
             if decision_position is None:
                 raise EventLineageError(
-                    f"field {field!r} decision date {row_date} is not in the event trading calendar"
+                    f"field {field!r} decision date at {context} is not in the event trading calendar"
                 )
             expected_position = decision_position + item.horizon
             expected = (
@@ -380,6 +436,6 @@ def validate_event_fields(
             if source != expected:
                 expected_text = expected.isoformat() if expected is not None else "calendar end"
                 raise EventLineageError(
-                    f"field {field!r} horizon={item.horizon} source mismatch at row {row_date}: "
+                    f"field {field!r} horizon={item.horizon} source mismatch at {context}: "
                     f"got {source.isoformat()}, expected {expected_text}"
                 )
