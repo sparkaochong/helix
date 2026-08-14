@@ -9,24 +9,30 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import scripts.gp000_loss_attribution as audit_module
 from helix.config import BacktestConfig
 from helix.gp.library import FactorLibrary, FactorSpec
 from scripts.gp000_loss_attribution import (
     OutputPaths,
     apply_cost_by_d0,
     audit_adjustment_chain,
+    build_daily_artifact,
     build_price_lookup,
+    deduplicate_or_fail,
+    evaluate_ex_right_samples,
     evaluate_horizon_decay,
     evaluate_monthly_returns,
     evaluate_quintiles,
     evaluate_style_neutral_book,
     evaluate_top_k_book,
+    load_audit_config,
     outcome_complete_dates,
     rank_root_causes,
     render_decay_svg,
     render_equity_svg,
     render_report,
     replay_formal_factor,
+    summarize_quintile_monotonicity,
     validate_formal_factor,
     validate_training_calendar,
     write_outputs,
@@ -143,6 +149,44 @@ def test_hit_rounding_mismatch_is_separate_from_adjustment_flip() -> None:
     assert audit["event_label_to_hfq_hit_difference_count"] == 1
 
 
+def test_ex_right_diagnostics_include_robust_control_and_top4_contribution() -> None:
+    rows = []
+    for day, date in enumerate(("2024-01-02", "2024-01-03")):
+        for name in range(5):
+            rows.append(
+                {
+                    "trade_date": date,
+                    "stock_code": f"S{name}",
+                    "factor_score": float(name + day),
+                    "raw_return": name / 100.0,
+                    "hfq_return": name / 100.0 + (0.02 if day == 1 and name == 4 else 0),
+                    "return_delta": 0.02 if day == 1 and name == 4 else 0.0,
+                    "raw_hit": False,
+                    "reconstructed_raw_hit": False,
+                    "hfq_hit": day == 1 and name == 4,
+                    "d0_ex_right": day == 1 and name == 4,
+                    "entry_ex_right": False,
+                    "exit_ex_right": day == 1 and name == 4,
+                    "d0_ex_right_observable": True,
+                    "entry_ex_right_observable": True,
+                    "exit_ex_right_observable": True,
+                    "entry_date": date,
+                    "exit_date": date,
+                }
+            )
+    aligned = pd.DataFrame(rows)
+
+    result = evaluate_ex_right_samples(aligned, BacktestConfig(top_k=2))
+
+    d0_count = result["counts"].query("stage == 'D0'").iloc[0]
+    assert d0_count["n_events"] == 1
+    assert d0_count["n_stocks"] == 1
+    assert set(result["factor_diagnostics"]["sample"]) == {"D0除权", "D0非除权"}
+    assert "factor_robust_tail_rate" in result["factor_diagnostics"]
+    assert result["top4_summary"]["selected_any_ex_right"] == 1
+    assert result["top4_summary"]["hfq_minus_raw_book_return_sum"] > 0
+
+
 def _synthetic_factor_returns(days: int = 2, names: int = 10) -> pd.DataFrame:
     rows = []
     for day in range(days):
@@ -165,6 +209,20 @@ def test_quintiles_are_daily_and_ordered_low_to_high() -> None:
     assert result["quintile"].tolist() == [1, 2, 3, 4, 5]
     assert result["n"].tolist() == [4, 4, 4, 4, 4]
     assert result.loc[4, "gross_return"] > result.loc[0, "gross_return"]
+
+
+def test_quintiles_are_formed_before_future_outcome_filtering() -> None:
+    frame = _synthetic_factor_returns(days=1, names=10)
+    frame.loc[frame["factor_score"] == 9.0, "gross_return"] = np.nan
+
+    result = evaluate_quintiles(frame, BacktestConfig())
+    monotonicity = summarize_quintile_monotonicity(result)
+
+    assert result["n"].tolist() == [2, 2, 2, 2, 2]
+    assert result["n_observed"].tolist() == [2, 2, 2, 2, 1]
+    assert result.loc[4, "gross_return"] == pytest.approx(0.08)
+    assert monotonicity["q5_minus_q1_gross"] == pytest.approx(0.075)
+    assert monotonicity["gross_spearman"] == pytest.approx(1.0)
 
 
 def test_top4_missing_exit_stays_cash_without_replacement() -> None:
@@ -221,6 +279,29 @@ def test_cost_model_normalizes_dates_across_stamp_duty_cut() -> None:
     )
 
     assert result.tolist() == pytest.approx([-0.001, -0.0005])
+
+
+def test_cost_model_rejects_noncanonical_or_impossible_dates() -> None:
+    with pytest.raises(ValueError, match="YYYY-MM-DD or YYYYMMDD"):
+        apply_cost_by_d0([0.0], ["prefix-2023-08-28"], BacktestConfig())
+    with pytest.raises(ValueError, match="valid calendar dates"):
+        apply_cost_by_d0([0.0], ["2023-02-30"], BacktestConfig())
+
+
+def test_audit_loads_effective_backtest_config_from_yaml(tmp_path: Path) -> None:
+    config_path = tmp_path / "audit.yaml"
+    config_path.write_text(
+        "backtest:\n"
+        "  top_k: 7\n"
+        "  exit_rule: close\n"
+        "  commission_bps: 3.0\n",
+        encoding="utf-8",
+    )
+
+    config = load_audit_config(config_path)
+
+    assert config.top_k == 7
+    assert config.commission_bps == 3.0
 
 
 def test_horizon_decay_uses_horizon_as_overlap_and_truncates_exit() -> None:
@@ -321,6 +402,60 @@ def test_style_neutral_book_uses_common_mask_and_is_orthogonal() -> None:
     assert result["orthogonality"]["max_abs_normalized_exposure"] < 1e-10
 
 
+def test_daily_artifact_contains_each_horizon_score_and_cost_arm() -> None:
+    calendar = ["2024-08-29", "2024-08-30", "2024-09-02", "2024-09-03"]
+    market = pd.DataFrame(
+        [
+            {
+                "trade_date": date,
+                "ts_code": code,
+                "open": 10.0 + day,
+                "high": 10.2 + day,
+                "close": 10.1 + day,
+                "adj_factor": 1.0,
+            }
+            for day, date in enumerate(calendar)
+            for code in ("A", "B")
+        ]
+    )
+    prices = build_price_lookup(market, calendar, ["A", "B"])
+    events = pd.DataFrame(
+        [
+            {"trade_date": date, "stock_code": code, "factor_score": float(rank)}
+            for date in calendar
+            for rank, code in enumerate(("A", "B"), start=1)
+        ]
+    )
+    scores = events.rename(columns={"factor_score": "raw_score"}).copy()
+    scores["style_neutral_score"] = -scores["raw_score"]
+
+    artifact = build_daily_artifact(
+        events,
+        prices,
+        scores,
+        BacktestConfig(top_k=1),
+        horizons=(1, 2),
+    )
+
+    assert set(artifact["horizon"]) == {1, 2}
+    assert set(artifact["score_basis"]) == {"raw_common", "style_neutral"}
+    assert set(artifact["cost_basis"]) == {"gross", "net"}
+    assert artifact["exit_date"].max() <= "2024-09-03"
+
+
+def test_conflicting_duplicate_event_keys_fail_closed() -> None:
+    frame = pd.DataFrame(
+        {
+            "trade_date": ["2024-01-02", "2024-01-02"],
+            "stock_code": ["A", "A"],
+            "value": [1.0, 2.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="conflicting duplicate"):
+        deduplicate_or_fail(frame, ["trade_date", "stock_code"], source="event")
+
+
 def _minimal_evidence() -> dict[str, object]:
     daily = pd.DataFrame(
         {
@@ -331,12 +466,41 @@ def _minimal_evidence() -> dict[str, object]:
         }
     )
     decay_daily = pd.DataFrame(
-        {
-            "date": ["2024-01-02", "2024-01-03"] * 2,
-            "horizon": [1, 1, 2, 2],
-            "net_portfolio_return": [0.01, -0.01, 0.005, -0.005],
-        }
+        [
+            {
+                "date": date,
+                "horizon": horizon,
+                "net_portfolio_return": value,
+            }
+            for horizon in range(1, 11)
+            for date, value in (("2024-01-02", 0.005), ("2024-01-03", -0.004))
+        ]
     )
+    daily_artifact = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-02",
+                "exit_date": "2024-01-03",
+                "horizon": horizon,
+                "score_basis": score_basis,
+                "cost_basis": cost_basis,
+                "n_selected": 4,
+                "n_executed": 4,
+                "portfolio_return": 0.001,
+            }
+            for horizon in range(1, 11)
+            for score_basis in ("raw_common", "style_neutral")
+            for cost_basis in ("gross", "net")
+        ]
+    )
+    root_contract = {
+        "severity": "高",
+        "主导亏损": "否",
+        "修复文件/接口": "module.py/interface",
+        "回归测试": "test_contract",
+        "预期指标变化": "消除错配",
+        "不承诺效果": "不承诺转正",
+    }
     return {
         "metadata": {
             "command": "PYTHONPATH=. .venv/bin/python scripts/gp000_loss_attribution.py",
@@ -349,19 +513,89 @@ def _minimal_evidence() -> dict[str, object]:
         ),
         "adjustment_stats": pd.DataFrame([{"指标": "收益错配数", "值": 1}]),
         "ex_right_samples": pd.DataFrame([{"trade_date": "2024-01-03", "n": 1}]),
-        "quintiles": pd.DataFrame([{"quintile": 1, "n": 2}]),
-        "cost_split": pd.DataFrame([{"口径": "毛收益", "CAGR": -0.1}]),
+        "quintiles": pd.DataFrame(
+            [
+                {
+                    "quintile": quintile,
+                    "n": 2,
+                    "gross_return": -0.001 * quintile,
+                    "net_return": -0.002 * quintile,
+                }
+                for quintile in range(1, 6)
+            ]
+        ),
+        "cost_split": pd.DataFrame(
+            [
+                {
+                    "口径": "毛收益",
+                    "CAGR": -0.1,
+                    "夏普": -0.2,
+                    "单笔收益": -0.001,
+                    "累计净值": 0.8,
+                    "最大回撤": -0.2,
+                    "执行率": 1.0,
+                    "交易日": 2,
+                }
+            ]
+        ),
         "decay": {
-            "summary": pd.DataFrame([{"horizon": 1, "ic_mean": -0.1}]),
+            "summary": pd.DataFrame(
+                [
+                    {
+                        "horizon": horizon,
+                        "ic_mean": -0.1,
+                        "net_per_trade": -0.001,
+                        "net_cagr": -0.1,
+                        "net_sharpe": -0.2,
+                        "net_final_equity": 0.8,
+                    }
+                    for horizon in range(1, 11)
+                ]
+            ),
             "daily": decay_daily,
         },
-        "monthly": pd.DataFrame([{"month": "2024-01", "net_return": -0.01}]),
+        "monthly": pd.DataFrame(
+            [{"month": "2024-01", "gross_return": -0.008, "net_return": -0.01}]
+        ),
         "daily": daily,
-        "style_table": pd.DataFrame([{"组合": "原始", "CAGR": -0.1}]),
+        "daily_artifact": daily_artifact,
+        "style_table": pd.DataFrame(
+            [
+                {
+                    "组合": "原始",
+                    "D+2 IC": -0.1,
+                    "ICIR": -0.2,
+                    "CAGR": -0.1,
+                    "夏普": -0.2,
+                    "单笔净收益": -0.001,
+                    "累计净值": 0.8,
+                    "最大回撤": -0.2,
+                    "交易日": 2,
+                }
+            ]
+        ),
         "root_causes": [
-            {"category": "因子 alpha", "priority": 1, "cause": "弱", "evidence": "IC<0"},
-            {"category": "工程 bug", "priority": 1, "cause": "错配", "evidence": "raw/hfq"},
-            {"category": "参数配置", "priority": 1, "cause": "目标", "evidence": "hit/close"},
+            {
+                "category": "因子 alpha",
+                "priority": 1,
+                "cause": "弱",
+                "evidence": "IC<0",
+                **root_contract,
+            },
+            {
+                "category": "工程 bug",
+                "priority": 1,
+                "cause": "错配",
+                "evidence": "raw/hfq",
+                **root_contract,
+            },
+            {
+                "category": "参数配置",
+                "priority": 1,
+                "cause": "目标",
+                "evidence": "hit/close",
+                **root_contract,
+            },
         ],
         "repairs": [
             {"类别": "工程 bug", "修复路径": "统一 HFQ", "预期效果": "消除错配"}
@@ -415,7 +649,57 @@ def test_svg_and_machine_outputs_are_well_formed(tmp_path: Path) -> None:
     json.loads(paths.json.read_text(encoding="utf-8"))
     ET.parse(paths.equity_svg)
     ET.parse(paths.decay_svg)
-    assert pd.read_parquet(paths.daily).shape == evidence["daily"].shape
+    assert pd.read_parquet(paths.daily).shape == evidence["daily_artifact"].shape
+
+
+def test_invalid_evidence_writes_no_partial_outputs(tmp_path: Path) -> None:
+    evidence = _minimal_evidence()
+    evidence["daily"].loc[0, "net_portfolio_return"] = np.nan
+    paths = OutputPaths(
+        report=tmp_path / "report.md",
+        json=tmp_path / "evidence.json",
+        daily=tmp_path / "daily.parquet",
+        equity_svg=tmp_path / "equity.svg",
+        decay_svg=tmp_path / "decay.svg",
+    )
+
+    with pytest.raises(ValueError, match="finite"):
+        write_outputs(evidence, paths)
+
+    assert not any(path.exists() for path in vars(paths).values())
+
+
+def test_output_publish_failure_restores_previous_artifact_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = OutputPaths(
+        report=tmp_path / "report.md",
+        json=tmp_path / "evidence.json",
+        daily=tmp_path / "daily.parquet",
+        equity_svg=tmp_path / "equity.svg",
+        decay_svg=tmp_path / "decay.svg",
+    )
+    evidence = _minimal_evidence()
+    write_outputs(evidence, paths)
+    before = {path: path.read_bytes() for path in vars(paths).values()}
+    original_replace = audit_module.os.replace
+    calls = 0
+
+    def fail_second_replace(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated publish failure")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(audit_module.os, "replace", fail_second_replace)
+    evidence["summary"] = "new summary"
+
+    with pytest.raises(OSError, match="simulated"):
+        write_outputs(evidence, paths)
+
+    assert {path: path.read_bytes() for path in vars(paths).values()} == before
 
 
 def test_training_calendar_requires_approved_bounds_count_and_digest() -> None:

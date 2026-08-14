@@ -7,16 +7,19 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import shutil
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from html import escape
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from helix.config import BacktestConfig
+from helix.config import BacktestConfig, Config
 from helix.data.event_table import build_event_panel
 from helix.eval.backtest import _cost_rates, _net_returns, summarize_portfolio_returns
 from helix.eval.ic import daily_ic, summarize_ic
@@ -52,6 +55,7 @@ DEFAULT_LIBRARY = ROOT / "data/artifacts/argus/event_factors.json"
 DEFAULT_PRICE_CACHE = ROOT / "data/raw/d2_exit_cache"
 DEFAULT_STYLE_MARKET = ROOT / "data/artifacts/g3_style_market.parquet"
 DEFAULT_INDUSTRIES = ROOT / "data/artifacts/g3_sw2021_members.parquet"
+DEFAULT_CONFIG = ROOT / "configs/default.yaml"
 DEFAULT_REPORT = ROOT / "docs/risk/gp000_loss_attribution.md"
 DEFAULT_JSON = ROOT / "data/artifacts/gp000_loss_attribution.json"
 DEFAULT_DAILY = ROOT / "data/artifacts/gp000_loss_attribution_daily.parquet"
@@ -73,6 +77,7 @@ class PriceLookup:
     hfq_high: np.ndarray
     hfq_close: np.ndarray
     ex_right: np.ndarray
+    ex_right_observable: np.ndarray
     date_positions: dict[str, int]
     code_positions: dict[str, int]
 
@@ -88,10 +93,25 @@ class OutputPaths:
     decay_svg: Path
 
 
+def load_audit_config(path: Path) -> BacktestConfig:
+    """Load the effective backtest settings and reject unsupported execution modes."""
+    config = Config.load(path).backtest
+    if config.exit_rule != "close" or config.enable_realistic_exit:
+        raise ValueError(
+            "gp000 audit supports close exit with enable_realistic_exit=false only"
+        )
+    return config
+
+
 def _hyphenated(value: object) -> str:
-    digits = "".join(character for character in str(value) if character.isdigit())
-    if len(digits) != 8:
+    raw = str(value)
+    if not re.fullmatch(r"\d{8}|\d{4}-\d{2}-\d{2}", raw):
         raise ValueError(f"invalid date {value!r}")
+    digits = raw.replace("-", "")
+    try:
+        datetime.strptime(digits, "%Y%m%d")
+    except ValueError as error:
+        raise ValueError(f"invalid date {value!r}") from error
     return f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
 
 
@@ -220,10 +240,16 @@ def build_price_lookup(
     raw_close = pivot("close")
     adj_factor = pivot("adj_factor")
     ex_right = np.zeros(adj_factor.shape, dtype=bool)
-    ex_right[1:] = (
+    ex_right_observable = np.zeros(adj_factor.shape, dtype=bool)
+    ex_right_observable[1:] = (
         np.isfinite(adj_factor[1:])
         & np.isfinite(adj_factor[:-1])
-        & ~np.isclose(adj_factor[1:], adj_factor[:-1], rtol=0.0, atol=1e-12)
+    )
+    ex_right[1:] = ex_right_observable[1:] & ~np.isclose(
+        adj_factor[1:],
+        adj_factor[:-1],
+        rtol=0.0,
+        atol=1e-12,
     )
     return PriceLookup(
         dates=dates,
@@ -236,6 +262,7 @@ def build_price_lookup(
         hfq_high=raw_high * adj_factor,
         hfq_close=raw_close * adj_factor,
         ex_right=ex_right,
+        ex_right_observable=ex_right_observable,
         date_positions={date: index for index, date in enumerate(dates)},
         code_positions={code: index for index, code in enumerate(names)},
     )
@@ -285,6 +312,9 @@ def align_event_prices(
     work["d0_ex_right"] = prices.ex_right[d0, code]
     work["entry_ex_right"] = prices.ex_right[safe_entry, code]
     work["exit_ex_right"] = prices.ex_right[safe_exit, code]
+    work["d0_ex_right_observable"] = prices.ex_right_observable[d0, code]
+    work["entry_ex_right_observable"] = prices.ex_right_observable[safe_entry, code]
+    work["exit_ex_right_observable"] = prices.ex_right_observable[safe_exit, code]
     work["holding_ex_right"] = [
         bool(prices.ex_right[start : stop + 1, column].any())
         for start, stop, column in zip(entry, exit_, code, strict=True)
@@ -371,11 +401,15 @@ def apply_cost_by_d0(
     dates = np.asarray(d0_dates).astype(str)
     if values.shape != dates.shape:
         raise ValueError("returns and d0_dates must have the same shape")
-    compact_dates = np.asarray(
-        ["".join(character for character in date if character.isdigit()) for date in dates]
-    )
-    if np.any(np.char.str_len(compact_dates) != 8):
+    patterns = [bool(re.fullmatch(r"\d{8}|\d{4}-\d{2}-\d{2}", date)) for date in dates]
+    if not all(patterns):
         raise ValueError("d0_dates must contain valid YYYY-MM-DD or YYYYMMDD dates")
+    compact_dates = np.asarray([date.replace("-", "") for date in dates])
+    try:
+        for date in compact_dates:
+            datetime.strptime(str(date), "%Y%m%d")
+    except ValueError as error:
+        raise ValueError("d0_dates must contain valid calendar dates") from error
     buy, sell = _cost_rates(config, compact_dates)
     return _net_returns(values, buy, sell)
 
@@ -389,9 +423,7 @@ def evaluate_quintiles(
     missing = required - set(frame.columns)
     if missing:
         raise KeyError(f"quintile frame is missing: {sorted(missing)}")
-    work = frame.loc[
-        np.isfinite(frame["factor_score"]) & np.isfinite(frame["gross_return"])
-    ].copy()
+    work = frame.loc[np.isfinite(frame["factor_score"])].copy()
     work["quintile"] = work.groupby("trade_date")["factor_score"].transform(
         lambda values: pd.qcut(
             values.rank(method="first"),
@@ -407,6 +439,7 @@ def evaluate_quintiles(
     )
     aggregations: dict[str, tuple[str, str]] = {
         "n": ("factor_score", "size"),
+        "n_observed": ("gross_return", "count"),
         "n_dates": ("trade_date", "nunique"),
         "gross_return": ("gross_return", "mean"),
         "net_return": ("net_return", "mean"),
@@ -420,6 +453,36 @@ def evaluate_quintiles(
         .sort_values("quintile")
         .reset_index(drop=True)
     )
+
+
+def summarize_quintile_monotonicity(quintiles: pd.DataFrame) -> dict[str, float]:
+    """Return Q5-Q1 spreads and explicit Spearman rank monotonicity."""
+    required = {"quintile", "gross_return", "net_return"}
+    missing = required - set(quintiles.columns)
+    if missing:
+        raise KeyError(f"quintile summary is missing: {sorted(missing)}")
+    ordered = quintiles.sort_values("quintile")
+    if ordered["quintile"].tolist() != [1, 2, 3, 4, 5]:
+        raise ValueError("quintile summary must contain Q1 through Q5")
+
+    def spearman(values: pd.Series) -> float:
+        finite = np.isfinite(values)
+        if finite.sum() < 2:
+            return float("nan")
+        x_rank = ordered.loc[finite, "quintile"].rank(method="average")
+        y_rank = values.loc[finite].rank(method="average")
+        return float(np.corrcoef(x_rank, y_rank)[0, 1])
+
+    return {
+        "q5_minus_q1_gross": float(
+            ordered.iloc[-1]["gross_return"] - ordered.iloc[0]["gross_return"]
+        ),
+        "q5_minus_q1_net": float(
+            ordered.iloc[-1]["net_return"] - ordered.iloc[0]["net_return"]
+        ),
+        "gross_spearman": spearman(ordered["gross_return"]),
+        "net_spearman": spearman(ordered["net_return"]),
+    }
 
 
 def evaluate_top_k_book(
@@ -603,7 +666,10 @@ def evaluate_horizon_decay(
         summaries.append(
             {
                 "horizon": int(horizon),
+                "n_d0": int(aligned["trade_date"].nunique()),
                 "n_days": len(daily),
+                "excluded_d0": TRAIN_DATES - int(aligned["trade_date"].nunique()),
+                "excluded_rows": int(len(events) - len(aligned)),
                 "d0_start": str(aligned["trade_date"].min()),
                 "d0_end": str(aligned["trade_date"].max()),
                 "exit_end": str(aligned["exit_date"].max()),
@@ -611,6 +677,9 @@ def evaluate_horizon_decay(
                 "icir": ic_summary["icir"],
                 "ic_days": int(ic_summary["n_days"]),
                 "gross_per_trade": gross_summary["mean_trade_return"],
+                "gross_cagr": gross_summary["cagr"],
+                "gross_sharpe": gross_summary["sharpe"],
+                "gross_final_equity": gross_summary["final_equity"],
                 "net_per_trade": net_summary["mean_trade_return"],
                 "net_cagr": net_summary["cagr"],
                 "net_sharpe": net_summary["sharpe"],
@@ -731,6 +800,8 @@ def evaluate_style_neutral_book(
         & np.isfinite(continuous).all(axis=2)
         & np.isfinite(industry)
     )
+    outcome_date = np.isfinite(target).any(axis=1)
+    analysis_mask = common & outcome_date[:, None]
     levels = np.arange(len(industry_names), dtype=float)
     neutral = style_residualize(
         raw,
@@ -746,7 +817,7 @@ def evaluate_style_neutral_book(
             {
                 "factor_score": score,
                 "gross_return": target,
-                "common": common.astype(float),
+                "common": analysis_mask.astype(float),
             }
         )
         long = long[long["common"] == 1.0]
@@ -760,7 +831,7 @@ def evaluate_style_neutral_book(
             daily_ic(
                 score,
                 target,
-                common,
+                analysis_mask,
                 min_samples=min_ic_samples,
             )
         )
@@ -789,12 +860,103 @@ def evaluate_style_neutral_book(
             "industry_count": len(industry_names),
         }
     )
+    score_frame = panel.to_long(
+        {
+            "raw_score": raw,
+            "style_neutral_score": neutral,
+            "common": common.astype(float),
+        }
+    )
+    score_frame = score_frame.loc[
+        score_frame["common"] == 1.0,
+        ["trade_date", "stock_code", "raw_score", "style_neutral_score"],
+    ].reset_index(drop=True)
     return {
         **arms,
         "raw_daily": daily_frames["raw"],
         "style_neutral_daily": daily_frames["style_neutral"],
         "orthogonality": orthogonality,
+        "scores": score_frame,
     }
+
+
+def build_daily_artifact(
+    events: pd.DataFrame,
+    prices: PriceLookup,
+    scores: pd.DataFrame,
+    config: BacktestConfig,
+    horizons: Sequence[int] = tuple(range(1, 11)),
+) -> pd.DataFrame:
+    """Build all horizon × raw/neutral × gross/net daily return arms."""
+    keys = ["trade_date", "stock_code"]
+    required = {*keys, "raw_score", "style_neutral_score"}
+    missing = required - set(scores.columns)
+    if missing:
+        raise KeyError(f"daily artifact scores are missing: {sorted(missing)}")
+    if scores.duplicated(keys).any():
+        raise ValueError("daily artifact scores contain duplicate date/stock rows")
+
+    output = []
+    for horizon_value in horizons:
+        horizon = int(horizon_value)
+        aligned = align_event_prices(events, prices, horizon)
+        aligned["gross_return"] = aligned["hfq_return"]
+        common = aligned.merge(scores, on=keys, how="inner", validate="one_to_one")
+        for score_basis, score_column in (
+            ("raw_common", "raw_score"),
+            ("style_neutral", "style_neutral_score"),
+        ):
+            arm = common.assign(factor_score=common[score_column])
+            for cost_basis, gross in (("gross", True), ("net", False)):
+                _, daily = evaluate_top_k_book(
+                    arm,
+                    config,
+                    gross=gross,
+                    overlap=horizon,
+                )
+                exit_by_d0 = arm.groupby("trade_date")["exit_date"].first()
+                daily["exit_date"] = daily["date"].map(exit_by_d0)
+                daily["horizon"] = horizon
+                daily["score_basis"] = score_basis
+                daily["cost_basis"] = cost_basis
+                output.append(daily)
+    result = pd.concat(output, ignore_index=True)
+    return result[
+        [
+            "date",
+            "exit_date",
+            "horizon",
+            "score_basis",
+            "cost_basis",
+            "n_selected",
+            "n_executed",
+            "portfolio_return",
+        ]
+    ].sort_values(
+        ["horizon", "score_basis", "cost_basis", "date"],
+        kind="stable",
+        ignore_index=True,
+    )
+
+
+def deduplicate_or_fail(
+    frame: pd.DataFrame,
+    keys: Sequence[str],
+    *,
+    source: str,
+) -> pd.DataFrame:
+    """Drop byte-for-byte duplicate rows but reject conflicting duplicate keys."""
+    duplicated = frame.duplicated(list(keys), keep=False)
+    if not duplicated.any():
+        return frame
+    conflicts = (
+        frame.loc[duplicated]
+        .groupby(list(keys), dropna=False, sort=False)
+        .filter(lambda group: len(group.drop_duplicates()) > 1)
+    )
+    if not conflicts.empty:
+        raise ValueError(f"{source} contains conflicting duplicate keys")
+    return frame.drop_duplicates(list(keys), keep="first")
 
 
 def load_training_events(path: Path, library: FactorLibrary) -> pd.DataFrame:
@@ -820,7 +982,11 @@ def load_training_events(path: Path, library: FactorLibrary) -> pd.DataFrame:
         raise ValueError("formal training event table is empty")
     frame["trade_date"] = frame["trade_date"].map(_hyphenated)
     frame["stock_code"] = frame["stock_code"].astype(str)
-    frame = frame.drop_duplicates(["trade_date", "stock_code"], keep="last")
+    frame = deduplicate_or_fail(
+        frame,
+        ["trade_date", "stock_code"],
+        source="event table",
+    )
     frame = frame.sort_values(["trade_date", "stock_code"], kind="stable")
     frame = frame.reset_index(drop=True)
     validate_training_calendar(frame["trade_date"])
@@ -833,18 +999,31 @@ def load_training_events(path: Path, library: FactorLibrary) -> pd.DataFrame:
     )
 
 
+def training_market_paths(directory: Path) -> tuple[list[Path], np.ndarray]:
+    """Select the optional prior session plus the approved training cache files."""
+    all_paths = sorted(directory.glob("*.parquet"))
+    training_paths = [
+        path
+        for path in all_paths
+        if TRAIN_START.replace("-", "") <= path.stem <= TRAIN_END.replace("-", "")
+    ]
+    training_calendar = np.asarray(
+        [_hyphenated(path.stem) for path in training_paths],
+        dtype=str,
+    )
+    validate_training_calendar(training_calendar)
+    prior_paths = [path for path in all_paths if path.stem < TRAIN_START.replace("-", "")]
+    paths = [*prior_paths[-1:], *training_paths]
+    calendar = np.asarray([_hyphenated(path.stem) for path in paths], dtype=str)
+    return paths, calendar
+
+
 def load_training_market(
     directory: Path,
     event_codes: set[str],
 ) -> tuple[pd.DataFrame, np.ndarray]:
     """Load raw OHLC and date-local adjustment factors through train end only."""
-    paths = [
-        path
-        for path in sorted(directory.glob("*.parquet"))
-        if TRAIN_START.replace("-", "") <= path.stem <= TRAIN_END.replace("-", "")
-    ]
-    calendar = np.asarray([_hyphenated(path.stem) for path in paths], dtype=str)
-    validate_training_calendar(calendar)
+    paths, calendar = training_market_paths(directory)
     columns = ["trade_date", "ts_code", "open", "high", "close", "adj_factor"]
     frames = []
     for path in paths:
@@ -886,9 +1065,25 @@ def summarize_ex_right_samples(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return every event/ex-date mapping and an all-date anomaly summary."""
     work = aligned.copy()
-    daily_mean = work.groupby("trade_date")["factor_score"].transform("mean")
-    daily_std = work.groupby("trade_date")["factor_score"].transform("std")
-    work["factor_daily_z"] = (work["factor_score"] - daily_mean) / daily_std
+    groups = work.groupby("trade_date")["factor_score"]
+    work["factor_percentile"] = groups.rank(method="average", pct=True)
+    daily_median = groups.transform("median")
+    absolute_deviation = (work["factor_score"] - daily_median).abs()
+    daily_mad = absolute_deviation.groupby(work["trade_date"]).transform("median")
+    robust_scale = 1.4826 * daily_mad
+    work["factor_robust_z"] = np.divide(
+        work["factor_score"] - daily_median,
+        robust_scale,
+        out=np.full(len(work), np.nan, dtype=float),
+        where=robust_scale.to_numpy(dtype=float) > 1e-12,
+    )
+    ordered = work.sort_values(["stock_code", "trade_date"], kind="stable")
+    ordered["factor_prior_event"] = ordered.groupby("stock_code")["factor_score"].shift()
+    ordered["factor_prior_event_date"] = ordered.groupby("stock_code")["trade_date"].shift()
+    ordered["factor_prior_event_jump"] = (
+        ordered["factor_score"] - ordered["factor_prior_event"]
+    )
+    work = ordered.sort_index()
     work["hit_flip"] = work["reconstructed_raw_hit"] != work["hfq_hit"]
     work["raw_gap_removed"] = (
         work["raw_return"].abs() > 0.10
@@ -910,11 +1105,18 @@ def summarize_ex_right_samples(
             "ex_right_date",
             "stage",
             "n",
+            "n_stocks",
             "factor_mean",
-            "factor_abs_z_max",
+            "factor_percentile_median",
+            "factor_abs_robust_z_p95",
+            "factor_robust_tail_rate",
+            "factor_prior_jump_abs_median",
+            "factor_prior_jump_abs_p95",
             "raw_return_mean",
             "hfq_return_mean",
             "return_delta_mean",
+            "return_delta_median",
+            "return_delta_abs_p95",
             "return_delta_abs_max",
             "hit_flip_count",
             "raw_gap_removed_count",
@@ -924,11 +1126,33 @@ def summarize_ex_right_samples(
         detail.groupby(["ex_right_date", "stage"], sort=True)
         .agg(
             n=("factor_score", "size"),
+            n_stocks=("stock_code", "nunique"),
             factor_mean=("factor_score", "mean"),
-            factor_abs_z_max=("factor_daily_z", lambda values: values.abs().max()),
+            factor_percentile_median=("factor_percentile", "median"),
+            factor_abs_robust_z_p95=(
+                "factor_robust_z",
+                lambda values: values.abs().quantile(0.95),
+            ),
+            factor_robust_tail_rate=(
+                "factor_robust_z",
+                lambda values: float((values.dropna().abs() > 3.0).mean()),
+            ),
+            factor_prior_jump_abs_median=(
+                "factor_prior_event_jump",
+                lambda values: values.abs().median(),
+            ),
+            factor_prior_jump_abs_p95=(
+                "factor_prior_event_jump",
+                lambda values: values.abs().quantile(0.95),
+            ),
             raw_return_mean=("raw_return", "mean"),
             hfq_return_mean=("hfq_return", "mean"),
             return_delta_mean=("return_delta", "mean"),
+            return_delta_median=("return_delta", "median"),
+            return_delta_abs_p95=(
+                "return_delta",
+                lambda values: values.abs().quantile(0.95),
+            ),
             return_delta_abs_max=("return_delta", lambda values: values.abs().max()),
             hit_flip_count=("hit_flip", "sum"),
             raw_gap_removed_count=("raw_gap_removed", "sum"),
@@ -936,6 +1160,187 @@ def summarize_ex_right_samples(
         .reset_index()
     )
     return detail, summary
+
+
+def _factor_sample_diagnostics(
+    frame: pd.DataFrame,
+    sample: str,
+) -> dict[str, object]:
+    robust = frame["factor_robust_z"].dropna()
+    jumps = frame["factor_prior_event_jump"].abs()
+    return {
+        "sample": sample,
+        "n_events": len(frame),
+        "n_stocks": frame["stock_code"].nunique(),
+        "factor_percentile_median": frame["factor_percentile"].median(),
+        "factor_abs_robust_z_p95": robust.abs().quantile(0.95),
+        "factor_abs_robust_z_max": robust.abs().max(),
+        "factor_robust_tail_rate": float((robust.abs() > 3.0).mean()),
+        "prior_event_jump_abs_median": jumps.median(),
+        "prior_event_jump_abs_p95": jumps.quantile(0.95),
+    }
+
+
+def _return_error_row(frame: pd.DataFrame, sample: str) -> dict[str, object]:
+    delta = frame["return_delta"]
+    return {
+        "sample": sample,
+        "n_events": len(frame),
+        "n_stocks": frame["stock_code"].nunique(),
+        "return_delta_mean": delta.mean(),
+        "return_delta_median": delta.median(),
+        "return_delta_abs_p95": delta.abs().quantile(0.95),
+        "return_delta_abs_max": delta.abs().max(),
+        "hit_flip_count": int(
+            (frame["reconstructed_raw_hit"] != frame["hfq_hit"]).sum()
+        ),
+    }
+
+
+def _top_k_selected_rows(frame: pd.DataFrame, config: BacktestConfig) -> pd.DataFrame:
+    selected = []
+    for _, block in frame.groupby("trade_date", sort=True):
+        finite = block.loc[np.isfinite(block["factor_score"])]
+        if len(finite) < config.top_k:
+            continue
+        selected.append(
+            finite.sort_values("factor_score", ascending=False, kind="stable").head(
+                config.top_k
+            )
+        )
+    return pd.concat(selected, ignore_index=True) if selected else frame.iloc[:0].copy()
+
+
+def _adjustment_portfolio_comparison(
+    aligned: pd.DataFrame,
+    config: BacktestConfig,
+) -> pd.DataFrame:
+    rows = []
+    for price_basis, return_column in (("raw", "raw_return"), ("HFQ", "hfq_return")):
+        work = aligned.copy()
+        work["gross_return"] = work[return_column]
+        for cost_basis, gross in (("毛收益", True), ("净收益", False)):
+            metrics, _ = evaluate_top_k_book(
+                work,
+                config,
+                gross=gross,
+                overlap=2,
+            )
+            rows.append(
+                {
+                    "价格口径": price_basis,
+                    "成本口径": cost_basis,
+                    "CAGR": metrics["cagr"],
+                    "夏普": metrics["sharpe"],
+                    "单笔收益": metrics["mean_trade_return"],
+                    "累计净值": metrics["final_equity"],
+                    "最大回撤": metrics["max_drawdown"],
+                    "执行率": metrics["execution_rate"],
+                    "交易日": int(metrics["n_days"]),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def evaluate_ex_right_samples(
+    aligned: pd.DataFrame,
+    config: BacktestConfig,
+) -> dict[str, object]:
+    """Audit ex-right factor tails, return errors, and Top-K PnL contribution."""
+    detail, by_date = summarize_ex_right_samples(aligned)
+    if detail.empty:
+        raise ValueError("no ex-right event was found in the training audit")
+    # Diagnostics are about D0 factor values. Controls exclude rows whose previous
+    # adjustment factor is unavailable, including an uncached pre-window session.
+    forced_d0 = aligned.assign(
+        d0_ex_right=True,
+        entry_ex_right=False,
+        exit_ex_right=False,
+    )
+    enriched_all, _ = summarize_ex_right_samples(forced_d0)
+    enriched_all = enriched_all.loc[enriched_all["stage"] == "D0"].drop_duplicates(
+        ["trade_date", "stock_code"]
+    )
+    actual_flags = aligned[
+        ["trade_date", "stock_code", "d0_ex_right"]
+    ].rename(columns={"d0_ex_right": "actual_d0_ex_right"})
+    enriched_all = enriched_all.merge(
+        actual_flags,
+        on=["trade_date", "stock_code"],
+        how="left",
+        validate="one_to_one",
+    )
+    d0_ex_right = enriched_all.loc[enriched_all["actual_d0_ex_right"]]
+    d0_control = enriched_all.loc[
+        enriched_all["d0_ex_right_observable"]
+        & ~enriched_all["actual_d0_ex_right"]
+    ]
+    factor_diagnostics = pd.DataFrame(
+        [
+            _factor_sample_diagnostics(d0_ex_right, "D0除权"),
+            _factor_sample_diagnostics(d0_control, "D0非除权"),
+        ]
+    )
+    counts = pd.DataFrame(
+        [
+            {
+                "stage": stage,
+                "n_events": int((detail["stage"] == stage).sum()),
+                "n_stocks": detail.loc[detail["stage"] == stage, "stock_code"].nunique(),
+            }
+            for stage in ("D0", "D+1", "D+2")
+        ]
+    )
+    return_errors = pd.DataFrame(
+        [
+            _return_error_row(aligned, "全样本"),
+            _return_error_row(aligned.loc[aligned["exit_ex_right"]], "D+2除权"),
+            _return_error_row(
+                aligned.loc[
+                    aligned["exit_ex_right_observable"] & ~aligned["exit_ex_right"]
+                ],
+                "D+2非除权",
+            ),
+        ]
+    )
+    selected = _top_k_selected_rows(aligned, config)
+    selected_any = selected[
+        "d0_ex_right"] | selected["entry_ex_right"] | selected["exit_ex_right"]
+    selected_holding = selected["entry_ex_right"] | selected["exit_ex_right"]
+    top4_summary = {
+        "selected_trades": len(selected),
+        "selected_any_ex_right": int(selected_any.sum()),
+        "selected_any_ex_right_stocks": int(
+            selected.loc[selected_any, "stock_code"].nunique()
+        ),
+        "selected_holding_ex_right": int(selected_holding.sum()),
+        "raw_book_return_sum_on_holding_ex_right": float(
+            selected.loc[selected_holding, "raw_return"].fillna(0.0).sum()
+            / config.top_k
+            / 2
+        ),
+        "hfq_book_return_sum_on_holding_ex_right": float(
+            selected.loc[selected_holding, "hfq_return"].fillna(0.0).sum()
+            / config.top_k
+            / 2
+        ),
+        "hfq_minus_raw_trade_mean_on_holding_ex_right": float(
+            selected.loc[selected_holding, "return_delta"].mean()
+        ),
+        "hfq_minus_raw_book_return_sum": float(
+            selected["return_delta"].fillna(0.0).sum() / config.top_k / 2
+        ),
+    }
+    return {
+        "detail": detail,
+        "by_date": by_date,
+        "counts": counts,
+        "factor_diagnostics": factor_diagnostics,
+        "return_errors": return_errors,
+        "top4_summary": top4_summary,
+        "portfolio_comparison": _adjustment_portfolio_comparison(aligned, config),
+        "d0_unobservable_count": int((~aligned["d0_ex_right_observable"]).sum()),
+    }
 
 
 def _hash_frame(frame: pd.DataFrame, columns: Sequence[str]) -> str:
@@ -948,6 +1353,17 @@ def _hash_file(path: Path) -> str:
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _hash_files(paths: Sequence[Path]) -> str:
+    """Hash an ordered file set including each basename and content digest."""
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(path.name.encode())
+        digest.update(b"\0")
+        digest.update(_hash_file(path).encode())
+        digest.update(b"\n")
     return digest.hexdigest()
 
 
@@ -1001,8 +1417,10 @@ def build_evidence(
     price_cache: Path = DEFAULT_PRICE_CACHE,
     style_market_path: Path = DEFAULT_STYLE_MARKET,
     industries_path: Path = DEFAULT_INDUSTRIES,
+    config_path: Path = DEFAULT_CONFIG,
 ) -> dict[str, object]:
     """Run the complete training-only adjustment and loss-attribution audit."""
+    config = load_audit_config(config_path)
     library = load_factors(library_path)
     factor = validate_formal_factor(library)
     events = load_training_events(input_path, library)
@@ -1020,8 +1438,8 @@ def build_evidence(
     aligned["gross_return"] = aligned["hfq_return"]
     aligned["hit_hfq"] = aligned["hfq_hit"].astype(float)
 
-    config = BacktestConfig(top_k=4)
     quintiles = evaluate_quintiles(aligned, config)
+    quintile_monotonicity = summarize_quintile_monotonicity(quintiles)
     gross_metrics, net_metrics, daily = _paired_daily_books(aligned, config)
 
     raw_path = aligned.copy()
@@ -1046,7 +1464,19 @@ def build_evidence(
 
     styles = load_training_styles(style_market_path, training_dates)
     members = pd.read_parquet(industries_path)
-    style = evaluate_style_neutral_book(aligned, styles, members, config)
+    style_events = events.merge(
+        aligned[["trade_date", "stock_code", "gross_return"]],
+        on=["trade_date", "stock_code"],
+        how="left",
+        validate="one_to_one",
+    )
+    style = evaluate_style_neutral_book(style_events, styles, members, config)
+    daily_artifact = build_daily_artifact(
+        events,
+        prices,
+        style["scores"],
+        config,
+    )
     raw_style_daily = style["raw_daily"]
     neutral_style_daily = style["style_neutral_daily"]
     if not raw_style_daily["date"].equals(neutral_style_daily["date"]):
@@ -1066,7 +1496,7 @@ def build_evidence(
     daily["style_neutral_equity"] = (1.0 + daily["style_neutral_return"]).cumprod()
     monthly = evaluate_monthly_returns(daily)
 
-    ex_right_detail, ex_right_summary = summarize_ex_right_samples(aligned)
+    ex_right = evaluate_ex_right_samples(aligned, config)
     _, hit_score, hit_target, hit_mask = event_grids(
         aligned,
         "factor_score",
@@ -1077,17 +1507,19 @@ def build_evidence(
         decay["summary"]["horizon"] == 2,
         "ic_mean",
     ].iloc[0]
-    quintile_slope = float(
-        np.corrcoef(quintiles["quintile"], quintiles["gross_return"])[0, 1]
-    )
     adjustment_net_delta = (
         net_metrics["mean_trade_return"] - raw_adjusted_metrics["mean_trade_return"]
     )
     cost_drag = gross_metrics["mean_trade_return"] - net_metrics["mean_trade_return"]
     adjusted_still_loses = net_metrics["cagr"] < 0
-    d0_ex_right = ex_right_detail.loc[ex_right_detail["stage"] == "D0"]
-    d2_ex_right = ex_right_detail.loc[ex_right_detail["stage"] == "D+2"]
-    d0_factor_outliers = int((d0_ex_right["factor_daily_z"].abs() > 5.0).sum())
+    d0_factor_rows = ex_right["factor_diagnostics"].set_index("sample")
+    d0_ex_right_tail_rate = float(
+        d0_factor_rows.loc["D0除权", "factor_robust_tail_rate"]
+    )
+    d0_control_tail_rate = float(
+        d0_factor_rows.loc["D0非除权", "factor_robust_tail_rate"]
+    )
+    d2_ex_right = ex_right["detail"].loc[ex_right["detail"]["stage"] == "D+2"]
     raw_gaps_removed = int(d2_ex_right["raw_gap_removed"].sum())
     worst_months = monthly.nsmallest(5, "net_return")
     worst_month_text = "、".join(
@@ -1180,9 +1612,14 @@ def build_evidence(
                 "结论": "决定复权 bug 是否为核心原因",
             },
             {
-                "指标": "D0 除权因子 |z|>5",
-                "值": d0_factor_outliers,
-                "结论": "未见除权日因子系统性跳空",
+                "指标": "D0 除权因子 robust |z|>3 比例",
+                "值": d0_ex_right_tail_rate,
+                "结论": f"非除权对照组 {d0_control_tail_rate:.4%}",
+            },
+            {
+                "指标": "D0 除权状态不可观测事件",
+                "值": ex_right["d0_unobservable_count"],
+                "结论": "缺少前一交易日同股 adj_factor；不归入非除权对照",
             },
             {
                 "指标": "D+2 raw >10% 跳空被 HFQ 消除",
@@ -1200,6 +1637,8 @@ def build_evidence(
                 "单笔收益": gross_metrics["mean_trade_return"],
                 "累计净值": gross_metrics["final_equity"],
                 "最大回撤": gross_metrics["max_drawdown"],
+                "执行率": gross_metrics["execution_rate"],
+                "交易日": int(gross_metrics["n_days"]),
             },
             {
                 "口径": "净收益（生产成本）",
@@ -1208,6 +1647,8 @@ def build_evidence(
                 "单笔收益": net_metrics["mean_trade_return"],
                 "累计净值": net_metrics["final_equity"],
                 "最大回撤": net_metrics["max_drawdown"],
+                "执行率": net_metrics["execution_rate"],
+                "交易日": int(net_metrics["n_days"]),
             },
             {
                 "口径": "成本拖累（毛－净）",
@@ -1216,6 +1657,8 @@ def build_evidence(
                 "单笔收益": cost_drag,
                 "累计净值": gross_metrics["final_equity"] - net_metrics["final_equity"],
                 "最大回撤": gross_metrics["max_drawdown"] - net_metrics["max_drawdown"],
+                "执行率": gross_metrics["execution_rate"] - net_metrics["execution_rate"],
+                "交易日": int(gross_metrics["n_days"] - net_metrics["n_days"]),
             },
         ]
     )
@@ -1232,8 +1675,8 @@ def build_evidence(
         f"{adjustment['return_mismatch_count']} 个 D+2 收益样本因复权而不同，"
         f"{adjustment['hit_flip_count']} 个 8% hit 发生真实翻转，另有 "
         f"{adjustment['event_raw_hit_mismatch_count']} 个 event hit 与 raw 高价公式的"
-        f"阈值/舍入差异。全部 D0 除权样本中 |因子日内 z|>5 的数量为 "
-        f"{d0_factor_outliers}，未发现因子在除权日系统性跳空；D+2 有 "
+        f"阈值/舍入差异。D0 除权样本 robust |z|>3 比例为 "
+        f"{d0_ex_right_tail_rate:.2%}，非除权对照为 {d0_control_tail_rate:.2%}；D+2 有 "
         f"{raw_gaps_removed} 个超过 10% 的 raw 跳空被 HFQ 消除。修正后策略仍亏损，"
         "因此该 bug 必须修，但不是负收益的核心解释。"
     )
@@ -1241,8 +1684,9 @@ def build_evidence(
         f"**方向不匹配。** hit rate 从 Q1 的 {quintiles.iloc[0]['hit_rate']:.2%} "
         f"单调升至 Q5 的 {quintiles.iloc[-1]['hit_rate']:.2%}，说明因子确实预测“盘中触达”；"
         f"但 D+2 毛收益从 Q1 的 {quintiles.iloc[0]['gross_return']:.4%} 降至 "
-        f"Q5 的 {quintiles.iloc[-1]['gross_return']:.4%}，分位－收益相关为 "
-        f"{quintile_slope:.4f}。高分组对收盘收益反而最差。"
+        f"Q5 的 {quintiles.iloc[-1]['gross_return']:.4%}，Q5−Q1 为 "
+        f"{quintile_monotonicity['q5_minus_q1_gross']:.4%}，Spearman 为 "
+        f"{quintile_monotonicity['gross_spearman']:.4f}。高分组对收盘收益反而最差。"
     )
     cost_conclusion = (
         f"**成本不是由盈转亏的首因。** 零成本 Top4 单笔已为 "
@@ -1275,6 +1719,7 @@ def build_evidence(
         {
             "category": "工程 bug",
             "priority": 1,
+            "severity": "高",
             "cause": "event 标签/回测用 raw，panel 链用 HFQ，跨路径复权口径错配",
             "evidence": (
                 f"{adjustment['return_mismatch_count']} 个收益样本不同、"
@@ -1282,43 +1727,73 @@ def build_evidence(
                 f"{adjustment_net_delta:.6%}"
             ),
             "是否核心": "否" if adjusted_still_loses else "是",
+            "主导亏损": "否" if adjusted_still_loses else "是",
+            "修复文件/接口": "helix/data/labels.py；统一 point-in-time HFQ LabelSet 接口",
+            "回归测试": "除权日 raw/HFQ return 与 hit 翻转测试",
+            "预期指标变化": f"消除收益错配；本窗单笔净收益变化 {adjustment_net_delta:.6%}",
+            "不承诺效果": "修复后仍不承诺策略收益转正",
         },
         {
             "category": "工程 bug",
             "priority": 2,
+            "severity": "中",
             "cause": "4 个上游因子字段缺少 as-of 与复权血缘契约",
             "evidence": "表达式本身无未来算子，但仓库无法证明上游特征生成时的复权版本和可见时间",
             "是否核心": "未证实",
+            "主导亏损": "未证实",
+            "修复文件/接口": "上游事件特征 schema；source_date/as_of_time/price_basis",
+            "回归测试": "缺失或晚于 D0 的血缘字段 fail-closed",
+            "预期指标变化": "未来函数风险可审计；不承诺收益改善",
+            "不承诺效果": "不能据此证明历史版本无未来函数或产生正收益",
         },
         {
             "category": "参数配置",
             "priority": 1,
+            "severity": "致命",
             "cause": "正式因子按 8% 盘中触达目标筛选，却以 D+2 收盘净收益验收",
             "evidence": (
                 f"正式库 fit_gini={factor.metrics.get('fit_gini', np.nan):.6f}，"
                 f"HFQ hit IC={hit_ic['ic_mean']:.6f}，D+2 close IC={d2_return_ic:.6f}"
             ),
             "是否核心": "是",
+            "主导亏损": "是",
+            "修复文件/接口": "GP admission objective；D+2 HFQ close-return 净收益门槛",
+            "回归测试": "hit IC 正而 close IC/Top4 PnL 负时拒绝晋级",
+            "预期指标变化": "阻止目标错配候选入库；新 alpha 需独立 OOS 验证",
+            "不承诺效果": "不承诺新目标在样本外产生正收益",
         },
         {
             "category": "参数配置",
             "priority": 2,
+            "severity": "高",
             "cause": "成本门槛未阻止毛收益不足的因子进入正式库",
             "evidence": (
                 f"Top4 毛收益单笔={gross_metrics['mean_trade_return']:.6%}，"
                 f"成本拖累={cost_drag:.6%}"
             ),
             "是否核心": "次要" if gross_metrics["mean_trade_return"] < 0 else "是",
+            "主导亏损": "否" if gross_metrics["mean_trade_return"] < 0 else "是",
+            "修复文件/接口": "configs/default.yaml；helix/eval/backtest.py 成本适应度",
+            "回归测试": "2023-08-28 印花税切换与毛/净门槛测试",
+            "预期指标变化": f"前置覆盖单笔 {cost_drag:.6%} 成本拖累",
+            "不承诺效果": "成本建模不能创造原本不存在的毛 alpha",
         },
         {
             "category": "因子 alpha",
             "priority": 1,
+            "severity": "致命",
             "cause": "gp_000 对 D+2 收盘收益缺乏同方向纯 alpha",
             "evidence": (
-                f"D+2 IC={d2_return_ic:.6f}，五分位线性相关={quintile_slope:.6f}，"
+                f"D+2 IC={d2_return_ic:.6f}，五分位 Spearman="
+                f"{quintile_monotonicity['gross_spearman']:.6f}，"
                 f"风格中性 Top4 CAGR={style['style_neutral']['cagr']:.6%}"
             ),
             "是否核心": "是",
+            "主导亏损": "是",
+            "修复文件/接口": "正式因子库 gp_000；close-return alpha 重挖掘流程",
+            "回归测试": "walk-forward、风格中性、安慰剂与分位单调门槛",
+            "预期指标变化": "当前负 alpha 下线；不承诺新因子训练外收益",
+            "不承诺效果": "不承诺重挖掘结果通过独立样本",
         },
     ]
     repairs = [
@@ -1365,6 +1840,10 @@ def build_evidence(
         "d2_exit_end": str(aligned["exit_date"].max()),
         "event_rows_nominal": len(events),
         "event_rows_d2_complete": len(aligned),
+        "d2_excluded_d0_dates": sorted(
+            set(training_dates) - set(aligned["trade_date"].astype(str))
+        ),
+        "d2_excluded_event_rows": int(len(events) - len(aligned)),
         "formal_factor": FORMAL_FACTOR,
         "formal_expression": FORMAL_EXPRESSION,
         "formal_sign": factor.sign,
@@ -1374,7 +1853,16 @@ def build_evidence(
             ["trade_date", "stock_code", *FORMAL_FIELDS],
         ),
         "library_sha256": _hash_file(library_path),
-        "command": "PYTHONPATH=. .venv/bin/python scripts/gp000_loss_attribution.py",
+        "input_sha256": _hash_file(input_path),
+        "config_sha256": _hash_file(config_path),
+        "style_market_sha256": _hash_file(style_market_path),
+        "industries_sha256": _hash_file(industries_path),
+        "price_cache_sha256": _hash_files(training_market_paths(price_cache)[0]),
+        "effective_backtest": config.model_dump(),
+        "command": (
+            "PYTHONPATH=. .venv/bin/python scripts/gp000_loss_attribution.py "
+            "--config configs/default.yaml"
+        ),
     }
     return {
         "metadata": metadata,
@@ -1383,10 +1871,16 @@ def build_evidence(
         "adjustment_stats": adjustment_stats,
         "adjustment_audit": adjustment,
         "adjustment_conclusion": adjustment_conclusion,
-        "ex_right_samples": ex_right_summary,
-        "ex_right_event_sample_count": len(ex_right_detail),
+        "ex_right_samples": ex_right["by_date"],
+        "ex_right_counts": ex_right["counts"],
+        "ex_right_factor_diagnostics": ex_right["factor_diagnostics"],
+        "ex_right_return_errors": ex_right["return_errors"],
+        "ex_right_top4_summary": ex_right["top4_summary"],
+        "ex_right_portfolio_comparison": ex_right["portfolio_comparison"],
+        "ex_right_event_sample_count": len(ex_right["detail"]),
+        "ex_right_d0_unobservable_count": ex_right["d0_unobservable_count"],
         "quintiles": quintiles,
-        "quintile_direction_correlation": quintile_slope,
+        "quintile_monotonicity": quintile_monotonicity,
         "quintile_conclusion": quintile_conclusion,
         "cost_split": cost_split,
         "cost_conclusion": cost_conclusion,
@@ -1395,6 +1889,7 @@ def build_evidence(
         "monthly": monthly,
         "time_conclusion": time_conclusion,
         "daily": daily,
+        "daily_artifact": daily_artifact,
         "style_table": style_table,
         "style_orthogonality": style["orthogonality"],
         "style_conclusion": style_conclusion,
@@ -1473,12 +1968,46 @@ def render_report(evidence: dict[str, object]) -> str:
             {"校验项": "D+2 完整日", "值": metadata.get("d2_complete_dates", "—")},
             {"校验项": "D+2 最晚 D0", "值": metadata.get("d2_d0_end", "—")},
             {"校验项": "D+2 最晚出场", "值": metadata.get("d2_exit_end", "—")},
+            {
+                "校验项": "D+2 边界排除 D0",
+                "值": ", ".join(metadata.get("d2_excluded_d0_dates", [])) or "—",
+            },
+            {
+                "校验项": "D+2 边界排除事件行",
+                "值": metadata.get("d2_excluded_event_rows", "—"),
+            },
             {"校验项": "正式因子", "值": metadata.get("formal_factor", "—")},
+            {"校验项": "正式表达式", "值": metadata.get("formal_expression", "—")},
             {"校验项": "正式方向", "值": metadata.get("formal_sign", "—")},
             {"校验项": "训练日历 SHA256", "值": metadata.get("calendar_digest", "—")},
             {"校验项": "事件内容 SHA256", "值": metadata.get("event_content_digest", "—")},
             {"校验项": "因子库 SHA256", "值": metadata.get("library_sha256", "—")},
         ]
+    )
+    hash_table = pd.DataFrame(
+        [
+            {"输入": label, "SHA256": metadata.get(key, "—")}
+            for label, key in (
+                ("事件表", "input_sha256"),
+                ("正式因子库", "library_sha256"),
+                ("配置", "config_sha256"),
+                ("行情缓存集合", "price_cache_sha256"),
+                ("风格行情", "style_market_sha256"),
+                ("行业成员", "industries_sha256"),
+            )
+        ]
+    )
+    effective_config = metadata.get("effective_backtest", {})
+    config_table = pd.DataFrame(
+        [
+            {"参数": key, "生效值": value}
+            for key, value in effective_config.items()
+        ]
+    )
+    monotonicity_table = pd.DataFrame(
+        [evidence["quintile_monotonicity"]]
+        if "quintile_monotonicity" in evidence
+        else []
     )
     sections = [
         "# gp_000 亏损根因排查与复权全链路审计",
@@ -1490,6 +2019,9 @@ def render_report(evidence: dict[str, object]) -> str:
         ),
         "### 边界与复现契约",
         markdown_table(metadata_table),
+        "### 输入哈希与生效回测配置",
+        markdown_table(hash_table),
+        markdown_table(config_table),
         "## 第一部分：复权全链路审计",
         "### 四节点口径与点时性",
         markdown_table(evidence["adjustment_matrix"]),
@@ -1497,11 +2029,28 @@ def render_report(evidence: dict[str, object]) -> str:
         markdown_table(evidence["adjustment_stats"]),
         str(evidence.get("adjustment_conclusion", "")),
         "### 除权日专项校验",
-        "下表覆盖全部除权事件，并按除权发生在 D0、D+1 或 D+2 分层聚合；不是抽样展示。",
+        (
+            "以下表格覆盖全部除权事件，并按除权发生在 D0、D+1 或 D+2 "
+            "分层聚合；不是抽样展示。训练窗首个 D0 若缺少前一交易日缓存，"
+            f"明确记为不可观测（共 {evidence.get('ex_right_d0_unobservable_count', '—')} "
+            "个事件），不归入非除权对照。"
+        ),
+        markdown_table(evidence.get("ex_right_counts", pd.DataFrame())),
+        markdown_table(evidence.get("ex_right_factor_diagnostics", pd.DataFrame())),
+        markdown_table(evidence.get("ex_right_return_errors", pd.DataFrame())),
+        markdown_table(
+            pd.DataFrame([evidence["ex_right_top4_summary"]])
+            if "ex_right_top4_summary" in evidence
+            else pd.DataFrame()
+        ),
+        markdown_table(
+            evidence.get("ex_right_portfolio_comparison", pd.DataFrame())
+        ),
         markdown_table(evidence["ex_right_samples"]),
         "## 第二部分：gp_000 亏损归因",
         "### 五分位单调性",
         markdown_table(evidence["quintiles"]),
+        markdown_table(monotonicity_table),
         str(evidence.get("quintile_conclusion", "")),
         "### 成本拆分",
         markdown_table(evidence["cost_split"]),
@@ -1713,19 +2262,197 @@ def atomic_parquet(path: Path, frame: pd.DataFrame) -> None:
             temporary.unlink()
 
 
+def validate_evidence(evidence: dict[str, object]) -> None:
+    """Fail closed before publishing if required sections or metrics are invalid."""
+    required = {
+        "metadata",
+        "summary",
+        "adjustment_matrix",
+        "adjustment_stats",
+        "ex_right_samples",
+        "quintiles",
+        "cost_split",
+        "decay",
+        "monthly",
+        "daily",
+        "daily_artifact",
+        "style_table",
+        "root_causes",
+        "repairs",
+    }
+    missing = required - set(evidence)
+    if missing:
+        raise ValueError(f"evidence is missing required sections: {sorted(missing)}")
+    for name in (
+        "adjustment_matrix",
+        "adjustment_stats",
+        "ex_right_samples",
+        "quintiles",
+        "cost_split",
+        "monthly",
+        "daily",
+        "style_table",
+    ):
+        value = evidence[name]
+        if not isinstance(value, pd.DataFrame) or value.empty:
+            raise ValueError(f"evidence section {name} must be a non-empty DataFrame")
+
+    def require_finite(frame_name: str, columns: Sequence[str]) -> None:
+        frame = evidence[frame_name]
+        missing_columns = set(columns) - set(frame.columns)
+        if missing_columns:
+            raise ValueError(
+                f"{frame_name} is missing required metrics: {sorted(missing_columns)}"
+            )
+        if any(not np.isfinite(frame[column].to_numpy(dtype=float)).all() for column in columns):
+            raise ValueError(f"{frame_name} required metrics must be finite")
+
+    require_finite("quintiles", ("gross_return", "net_return"))
+    if evidence["quintiles"]["quintile"].astype(int).tolist() != [1, 2, 3, 4, 5]:
+        raise ValueError("quintile evidence must contain Q1 through Q5")
+    require_finite(
+        "cost_split",
+        ("CAGR", "夏普", "单笔收益", "累计净值", "最大回撤", "执行率", "交易日"),
+    )
+    require_finite("monthly", ("gross_return", "net_return"))
+    require_finite(
+        "style_table",
+        ("D+2 IC", "ICIR", "CAGR", "夏普", "单笔净收益", "累计净值", "最大回撤", "交易日"),
+    )
+    daily = evidence["daily"]
+    for column in (
+        "gross_portfolio_return",
+        "net_portfolio_return",
+        "style_neutral_return",
+    ):
+        if column not in daily or not np.isfinite(daily[column]).all():
+            raise ValueError(f"daily {column} must contain only finite values")
+    decay = evidence["decay"]
+    if not isinstance(decay, dict) or not {
+        "summary",
+        "daily",
+    } <= set(decay):
+        raise ValueError("decay evidence must contain summary and daily")
+    decay_daily = decay["daily"]
+    if decay_daily.empty or not np.isfinite(decay_daily["net_portfolio_return"]).all():
+        raise ValueError("decay daily returns must contain only finite values")
+    decay_summary = decay["summary"]
+    if set(decay_summary["horizon"].astype(int)) != set(range(1, 11)):
+        raise ValueError("decay summary must contain horizons D+1 through D+10")
+    for column in ("ic_mean", "net_per_trade", "net_cagr", "net_sharpe", "net_final_equity"):
+        if column not in decay_summary or not np.isfinite(decay_summary[column]).all():
+            raise ValueError(f"decay {column} must contain only finite values")
+    artifact = evidence["daily_artifact"]
+    if not isinstance(artifact, pd.DataFrame) or artifact.empty:
+        raise ValueError("daily artifact must be a non-empty DataFrame")
+    expected_horizons = set(range(1, 11))
+    if set(artifact["horizon"].astype(int)) != expected_horizons:
+        raise ValueError("daily artifact must contain horizons D+1 through D+10")
+    if set(artifact["score_basis"]) != {"raw_common", "style_neutral"}:
+        raise ValueError("daily artifact must contain raw and style-neutral arms")
+    if set(artifact["cost_basis"]) != {"gross", "net"}:
+        raise ValueError("daily artifact must contain gross and net arms")
+    if not np.isfinite(artifact["portfolio_return"]).all():
+        raise ValueError("daily artifact returns must contain only finite values")
+    if artifact["exit_date"].astype(str).max() > str(
+        evidence["metadata"]["train_end"]
+    ):
+        raise ValueError("daily artifact exits cross the training boundary")
+    if not evidence["root_causes"] or not evidence["repairs"]:
+        raise ValueError("root causes and repairs must be non-empty")
+    root_fields = {
+        "category",
+        "priority",
+        "severity",
+        "cause",
+        "evidence",
+        "主导亏损",
+        "修复文件/接口",
+        "回归测试",
+        "预期指标变化",
+        "不承诺效果",
+    }
+    if any(root_fields - set(row) for row in evidence["root_causes"]):
+        raise ValueError("each root cause must contain the full remediation contract")
+
+
 def write_outputs(evidence: dict[str, object], paths: OutputPaths) -> None:
-    """Emit every artifact from the same immutable-in-practice evidence mapping."""
+    """Validate, stage, and transactionally publish one coherent artifact set."""
+    validate_evidence(evidence)
     payload = json.dumps(
         json_ready(evidence),
         indent=2,
         ensure_ascii=False,
         allow_nan=False,
     )
-    atomic_text(paths.report, render_report(evidence))
-    atomic_text(paths.json, payload + "\n")
-    atomic_parquet(paths.daily, evidence["daily"])
-    atomic_text(paths.equity_svg, render_equity_svg(evidence["daily"]))
-    atomic_text(paths.decay_svg, render_decay_svg(evidence["decay"]))
+    rendered = {
+        paths.report: render_report(evidence),
+        paths.json: payload + "\n",
+        paths.equity_svg: render_equity_svg(evidence["daily"]),
+        paths.decay_svg: render_decay_svg(evidence["decay"]),
+    }
+    report = rendered[paths.report]
+    required_headings = (
+        "复权全链路审计",
+        "除权日专项校验",
+        "五分位单调性",
+        "成本拆分",
+        "收益衰减",
+        "时间分布",
+        "风格中性收益",
+        "根因优先级",
+    )
+    if any(heading not in report for heading in required_headings):
+        raise ValueError("rendered report is missing required sections")
+
+    daily_artifact = evidence["daily_artifact"]
+    staged: dict[Path, Path] = {}
+    backups: dict[Path, Path] = {}
+    replaced: list[Path] = []
+    targets = [*rendered, paths.daily]
+    try:
+        for target in targets:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            suffix = ".parquet" if target == paths.daily else ".tmp"
+            with tempfile.NamedTemporaryFile(
+                suffix=suffix,
+                dir=target.parent,
+                delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+            if target == paths.daily:
+                daily_artifact.to_parquet(temporary, index=False)
+            else:
+                temporary.write_text(rendered[target], encoding="utf-8")
+            staged[target] = temporary
+        for target in targets:
+            if target.exists():
+                with tempfile.NamedTemporaryFile(
+                    suffix=".bak",
+                    dir=target.parent,
+                    delete=False,
+                ) as handle:
+                    backup = Path(handle.name)
+                shutil.copy2(target, backup)
+                backups[target] = backup
+        for target in targets:
+            os.replace(staged[target], target)
+            replaced.append(target)
+    except Exception:
+        for target in reversed(replaced):
+            backup = backups.get(target)
+            if backup is not None and backup.exists():
+                os.replace(backup, target)
+            elif target.exists():
+                target.unlink()
+        raise
+    finally:
+        for temporary in staged.values():
+            if temporary.exists():
+                temporary.unlink()
+        for backup in backups.values():
+            if backup.exists():
+                backup.unlink()
 
 
 def main() -> None:
@@ -1735,6 +2462,7 @@ def main() -> None:
     parser.add_argument("--price-cache", type=Path, default=DEFAULT_PRICE_CACHE)
     parser.add_argument("--style-market", type=Path, default=DEFAULT_STYLE_MARKET)
     parser.add_argument("--industries", type=Path, default=DEFAULT_INDUSTRIES)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     parser.add_argument("--json", type=Path, default=DEFAULT_JSON)
     parser.add_argument("--daily", type=Path, default=DEFAULT_DAILY)
@@ -1748,6 +2476,7 @@ def main() -> None:
         price_cache=args.price_cache,
         style_market_path=args.style_market,
         industries_path=args.industries,
+        config_path=args.config,
     )
     paths = OutputPaths(
         report=args.report,
