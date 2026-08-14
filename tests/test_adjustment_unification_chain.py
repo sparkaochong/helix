@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,15 @@ from helix.data.price_lineage import HFQ_BASIS, PriceLineageError
 from helix.eval.backtest import run_backtest
 from helix.features.base_fields import compute_base_fields
 from helix.labels.touch_label import build_touch_label
+from scripts.adjustment_unification_baseline import (
+    EXPECTED_HFQ_IC,
+    EXPECTED_HFQ_NET_PER_TRADE,
+    EXPECTED_HFQ_SHARPE,
+    EXPECTED_NET_DELTA,
+    EXPECTED_RAW_IC,
+    EXPECTED_RAW_NET_PER_TRADE,
+    EXPECTED_RAW_SHARPE,
+)
 
 DATES = np.asarray(
     ["20240102", "20240103", "20240104", "20240105", "20240108", "20240109"]
@@ -22,7 +32,7 @@ CODES = np.asarray(["000001.SZ"])
 def _split_daily() -> pd.DataFrame:
     raw_prices = {
         "open": [10.0, 5.0, 5.0, 5.5, 5.5, 5.5],
-        "high": [10.2, 5.1, 5.6, 5.6, 5.6, 5.6],
+        "high": [10.2, 5.1, 5.5, 5.6, 5.6, 5.6],
         "low": [9.8, 4.9, 4.9, 5.4, 5.4, 5.4],
         "close": [10.0, 5.0, 5.5, 5.5, 5.5, 5.5],
         "pre_close": [10.0, 5.0, 5.0, 5.5, 5.5, 5.5],
@@ -57,8 +67,8 @@ def _build_split_panel() -> Panel:
     for field, values in adjusted.items():
         panel.add(field, values, price_lineage=lineage.get(field))
     panel.add("amount", np.full(panel.shape, 1_000_000.0))
-    panel.add("up_limit", np.asarray([11.0, 5.5, 6.05, 6.05, 6.05, 6.05])[:, None])
-    panel.add("down_limit", np.asarray([9.0, 4.5, 4.95, 4.95, 4.95, 4.95])[:, None])
+    panel.add("up_limit", np.asarray([11.0, 5.5, 5.5, 6.05, 6.05, 6.05])[:, None])
+    panel.add("down_limit", np.asarray([9.0, 4.5, 4.5, 4.95, 4.95, 4.95])[:, None])
     panel.add("limit_price_observed", np.ones(panel.shape))
     panel.add("is_trading", np.ones(panel.shape))
     return panel
@@ -115,8 +125,8 @@ def test_split_chain_uses_exact_hfq_lineage_and_keeps_raw_out_of_accounting(
     assert labels.y[0, 0] == pytest.approx(1.0)
     assert labels.exit_price[0, 0] == pytest.approx(11.0)
     assert loaded.dates[-1] == "20240109"
-    # The 2024-01-08 D0 needs 2024-01-10 for exact D+2, beyond train_end.
-    assert not labels.valid[-2:, 0].any()
+    # The 2024-01-08 D0 needs 2024-01-10, outside this observation window.
+    assert labels.valid[:, 0].tolist() == [True, True, True, True, False, False]
     assert np.isnan(labels.y[-2:, 0]).all()
 
     predictions, candidates = _one_trade_inputs(loaded)
@@ -139,8 +149,12 @@ def test_split_chain_uses_exact_hfq_lineage_and_keeps_raw_out_of_accounting(
     assert result.summary["mean_trade_return_net"] == pytest.approx(expected_net)
 
     raw_poisoned = Panel.load(cache)
+    raw_multipliers = np.asarray([3.0, 7.0, 2.0, 11.0, 5.0, 13.0])[:, None]
     for field in (*PRICE_COLUMNS, "up_limit", "down_limit"):
-        raw_poisoned.fields[field] *= 100.0
+        raw_poisoned.fields[field] *= raw_multipliers
+    assert raw_poisoned["close"][1, 0] / raw_poisoned["close"][0, 0] != pytest.approx(
+        raw_poisoned["close_hfq"][1, 0] / raw_poisoned["close_hfq"][0, 0]
+    )
     poisoned_fields = compute_base_fields(raw_poisoned)
     for field in ("ret1", "gap", "intraday", "hl_range"):
         np.testing.assert_allclose(poisoned_fields[field], fields[field], equal_nan=True)
@@ -157,8 +171,17 @@ def test_split_chain_uses_exact_hfq_lineage_and_keeps_raw_out_of_accounting(
         panel=raw_poisoned,
     )
     assert poisoned.daily["n_executed"].tolist() == result.daily["n_executed"].tolist()
+    assert len(poisoned.trades) == 1
+    assert poisoned.trades.iloc[0]["entry_price"] == pytest.approx(10.0)
+    assert poisoned.trades.iloc[0]["exit_price"] == pytest.approx(11.0)
     assert poisoned.trades.iloc[0]["realistic_gross_return"] == pytest.approx(expected_gross)
+    assert poisoned.trades.iloc[0]["realistic_gross_return"] == pytest.approx(
+        result.trades.iloc[0]["realistic_gross_return"]
+    )
     assert poisoned.summary["mean_trade_return_net"] == pytest.approx(expected_net)
+    assert poisoned.summary["mean_trade_return_net"] == pytest.approx(
+        result.summary["mean_trade_return_net"]
+    )
 
 
 def test_full_chain_fails_closed_at_first_price_node_without_lineage() -> None:
@@ -176,30 +199,59 @@ def test_d10_and_adjustment_report_keep_exact_reciprocal_evidence() -> None:
     ledger = (root / "docs/factor-governance.md").read_text(encoding="utf-8")
     report = (root / "docs/risk/adjustment_unification_fix.md").read_text(encoding="utf-8")
     historical = (root / "docs/risk/gp000_loss_attribution.md").read_text(encoding="utf-8")
-    d10 = next(line for line in ledger.splitlines() if line.startswith("| **D10**"))
+    d10_rows = [line for line in ledger.splitlines() if line.startswith("| **D10**")]
+    assert len(d10_rows) == 1
+    d10 = d10_rows[0]
+    cells = [cell.strip() for cell in d10.split("|")[1:-1]]
+    assert len(cells) == 5
+    _, gap, impact_direction, metrics, status = cells
 
-    for required in (
-        "**修复完成（2026-08-14）**",
-        "[专项报告](risk/gp000_loss_attribution.md)",
-        "[修复说明](risk/adjustment_unification_fix.md)",
-        "-0.0627748063907745",
-        "-0.062899974234733",
-        "-0.005455654320765759",
-        "-0.005233397934459387",
-        "+0.00022225638630637198",
-        "+0.022226 个百分点",
-        "-1.4420300457461805",
-        "-1.3882776746645582",
-        "647 个 D+2 完整日期",
-        "2024-09-02",
-        "2024-09-04",
-        "legacy",
-        "未经验证",
-        "不可追溯",
-        "不改写",
-        "非核心/非主导亏损",
-        "目标错配仍是主导亏损原因",
-    ):
-        assert required in d10
+    assert "原始价计算 D+1→D+2" in gap
+    assert "非核心/非主导亏损原因" in impact_direction
+    assert "目标错配仍是主导亏损原因" in impact_direction
+    assert "跨日价格因子、标签、成交计价与收益核算统一使用点时 HFQ" in status
+    assert "同日涨跌停状态特征" in status
+    assert "**修复完成（2026-08-14）**" in status
+    assert "未经验证且血缘不可追溯的 legacy 基线" in status
+    assert "不改写历史实验结论或报告数据" in status
+    assert "647 个 D+2 完整日期" in metrics
+    assert "D0 最大 2024-09-02" in metrics
+    assert "D+2 最大 2024-09-04" in metrics
+
+    ic = re.search(r"IC (-?\d+\.\d+) → (-?\d+\.\d+)", metrics)
+    net = re.search(
+        r"Top4 单笔净收益 (-?\d+\.\d+) → (-?\d+\.\d+).*?（([+-]\d+\.\d+)，",
+        metrics,
+    )
+    sharpe = re.search(r"Sharpe (-?\d+\.\d+) → (-?\d+\.\d+)", metrics)
+    assert ic is not None and net is not None and sharpe is not None
+    assert tuple(map(float, ic.groups())) == pytest.approx((EXPECTED_RAW_IC, EXPECTED_HFQ_IC))
+    raw_net, hfq_net, net_delta = map(float, net.groups())
+    assert (raw_net, hfq_net, net_delta) == pytest.approx(
+        (EXPECTED_RAW_NET_PER_TRADE, EXPECTED_HFQ_NET_PER_TRADE, EXPECTED_NET_DELTA)
+    )
+    assert hfq_net - raw_net == pytest.approx(net_delta)
+    assert tuple(map(float, sharpe.groups())) == pytest.approx(
+        (EXPECTED_RAW_SHARPE, EXPECTED_HFQ_SHARPE)
+    )
+
+    ledger_links = dict(re.findall(r"\[([^]]+)]\(([^)]+)\)", status))
+    assert ledger_links == {
+        "专项报告": "risk/gp000_loss_attribution.md",
+        "修复说明": "risk/adjustment_unification_fix.md",
+    }
     assert "[治理台账 D10](../factor-governance.md)" in report
     assert "[治理台账 D10](../factor-governance.md)" in historical
+
+    report_net = re.search(
+        r"\| Top4 单笔净收益 \| (-?\d+\.\d+)% \| (-?\d+\.\d+)% \| ([+-]?\d+\.\d+)% \|",
+        report,
+    )
+    assert report_net is not None
+    report_raw, report_hfq, report_delta = map(float, report_net.groups())
+    assert report_raw == pytest.approx(raw_net * 100.0, abs=1e-6)
+    assert report_hfq == pytest.approx(hfq_net * 100.0, abs=1e-6)
+    assert report_delta == pytest.approx(net_delta * 100.0, abs=1e-6)
+    assert report_hfq - report_raw == pytest.approx(report_delta, abs=1.5e-6)
+    assert "跨日价格因子、标签、成交计价与收益核算" in report
+    assert "同日涨跌停状态特征" in report

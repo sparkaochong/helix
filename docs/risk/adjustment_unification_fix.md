@@ -16,8 +16,8 @@
 
 ## 修复合同
 
-- 新链路中，因子计算、标签生成、成交计价与收益核算只接受带四元血缘的点时 HFQ 价格，校验失败即终止。
-- 原始 OHLC 只用于涨跌停判断和可成交性校验，不参与因子值、标签值或持仓收益核算。
+- 新链路中，跨日价格因子、标签、成交计价与收益核算只接受带四元血缘的点时 HFQ 价格，校验失败即终止。
+- 原始 OHLC 只用于同日涨跌停状态特征（涨跌停距离与计数）以及涨跌停/可成交性校验，不参与跨日价格因子、标签值或持仓收益核算。
 - 本对照是 legacy baseline adapter：只读取既有 event 特征、正式因子库和行情缓存，并复用专项审计的纯计算函数；不调用历史报告写入器。
 - 两个对照臂共享同一分数、同一 Top4 选择和同一成本/滑点配置，仅 outcome 价格口径不同。
 
@@ -62,7 +62,7 @@
 | 正式 gp_000 因子库 | `/Users/aochong/code/helix/data/artifacts/argus/event_factors.json` | `6823a9e7d76caa4adcd21cd82e781d85e70407191aab9ef1835138934fb05391` |
 | D+2 行情缓存 | `/Users/aochong/code/helix/data/raw/d2_exit_cache` | `c0601a8626de4446703c210e8f5d27debc611dd1bd53291fdef7bba859bfb2c6` |
 | 成本与 Top4 配置 | `/Users/aochong/code/helix/.worktrees/adjustment-unification/configs/default.yaml` | `b209a5a2302089edf2a1dd0c3201e063c6ead2ff581f1bce63243ff1ee41f137` |
-| 本报告生成脚本 | `/Users/aochong/code/helix/.worktrees/adjustment-unification/scripts/adjustment_unification_baseline.py` | `f4d8052fe31057278644040c3c1606db2fb93bc7fc4866ab15055cfbfd6ec6a4` |
+| 本报告生成脚本 | `/Users/aochong/code/helix/.worktrees/adjustment-unification/scripts/adjustment_unification_baseline.py` | `2187f6cf2464c5f8aa182efb1cd90d60858acc6d457e3ab9be9059aaa945d50d` |
 
 所有输入通过从可信 `/` 开始、逐组件 `O_NOFOLLOW` 的源 fd 复制到私有只读快照；SHA-256 与解析器消费的是同一份复制字节。行情只从该 manifest 的快照文件集合加载。计算结束后脚本重新枚举源缓存，并对全部源文件重新 stat 与 SHA-256 校验；任何内容、身份或成员变化都会终止发布。
 
@@ -70,11 +70,11 @@
 
 | 项目 | 值 |
 | --- | --- |
-| Git HEAD | `5b968c01d4adcb9e88374ec885ca39f41c1f92f2` |
-| Git HEAD tree | `1cedab9776ecf46b52ed7fa0a549e2d26f674516` |
+| Git HEAD | `8c5a7fd7c180b87fa9ea931ee03174e25cca6114` |
+| Git HEAD tree | `64c21fb7e0ef412889e86027a3ca316725248911` |
 | 排除生成报告后的工作树是否脏 | `true` |
-| 工作树 diff SHA-256 | `82b3bf79d28dc99985e4b903b07c670b5bf0941739d026f98ae78f340df6169f` |
-| 工作树 status SHA-256 | `d8c6ff2ff8903469980b66791a49a493f0e65e9b1a7e1147ad73683c07699234` |
+| 工作树 diff SHA-256 | `6ae0bacf37495800fb326de05dc1ed6a2a22c55af415ad20f27bc97c68b79702` |
+| 工作树 status SHA-256 | `92e3f4e3d121b29afd8a2d8800e6d298396bcfc59c0399e13c5e4c27df003f9f` |
 | Python | `3.11.15 (main, Apr 14 2026, 14:45:51) [Clang 22.1.3 ]` |
 | NumPy | `2.4.6` |
 | pandas | `3.0.5` |

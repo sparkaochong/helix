@@ -219,6 +219,10 @@ def test_render_is_read_only_and_publish_only_accepts_designated_report(
     assert set(tmp_path.iterdir()) == before
     assert "目标错配是主导亏损原因" in report
     assert "复权口径问题存在，但不是核心或主导亏损原因" in report
+    assert "跨日价格因子、标签、成交计价与收益核算" in report
+    assert "同日涨跌停状态特征" in report
+    assert "不参与跨日价格因子、标签值或持仓收益核算" in report
+    assert "不参与因子值、标签值或持仓收益核算" not in report
 
     report_dir = tmp_path / "worktree" / "docs" / "risk"
     report_dir.mkdir(parents=True)
