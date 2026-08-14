@@ -97,6 +97,58 @@ def load_event_lineage(path: Path | str | None) -> EventLineageManifest:
     return manifest
 
 
+def load_event_calendar(path: Path | str | None) -> tuple[str, ...]:
+    """Load an independently supplied, ordered exchange trading calendar."""
+    if path is None:
+        raise EventLineageError("authoritative event trading calendar is required")
+    calendar_path = Path(path)
+    try:
+        if calendar_path.suffix.lower() in {".parquet", ".pq"}:
+            import pyarrow.parquet as pq
+
+            schema = pq.ParquetFile(calendar_path).schema_arrow.names
+            date_column = "cal_date" if "cal_date" in schema else "trade_date"
+            if date_column not in schema:
+                raise EventLineageError(
+                    "event trading calendar needs a 'cal_date' or 'trade_date' column"
+                )
+            columns = [date_column] + (["is_open"] if "is_open" in schema else [])
+            frame = pd.read_parquet(calendar_path, columns=columns)
+        elif calendar_path.suffix.lower() == ".csv":
+            frame = pd.read_csv(calendar_path, dtype=str)
+            date_column = "cal_date" if "cal_date" in frame else "trade_date"
+            if date_column not in frame:
+                raise EventLineageError(
+                    "event trading calendar needs a 'cal_date' or 'trade_date' column"
+                )
+        else:
+            raise EventLineageError(
+                "event trading calendar must be a parquet or CSV file"
+            )
+        if "is_open" in frame:
+            is_open = pd.to_numeric(frame["is_open"], errors="coerce")
+            frame = frame[is_open == 1]
+        values = frame[date_column].tolist()
+    except EventLineageError:
+        raise
+    except (OSError, UnicodeError, TypeError, ValueError) as exc:
+        raise EventLineageError(
+            f"invalid event trading calendar {calendar_path}: {exc}"
+        ) from exc
+
+    parsed = [
+        _parse_date(value, field="calendar", rule="session", row_date=position)
+        for position, value in enumerate(values)
+    ]
+    if not parsed:
+        raise EventLineageError("event trading calendar is empty")
+    if any(right <= left for left, right in zip(parsed, parsed[1:], strict=False)):
+        raise EventLineageError(
+            "event trading calendar sessions must be strictly increasing and unique"
+        )
+    return tuple(values)
+
+
 def audit_column_names(manifest: Mapping[str, EventAuditColumns]) -> set[str]:
     """Return all physical audit columns, deduplicating entries shared by fields."""
     return {
@@ -184,16 +236,22 @@ def validate_event_fields(
     manifest: Mapping[str, EventAuditColumns],
     fields: Sequence[str],
     *,
+    calendar: Sequence[str] | None = None,
     train_end: str | None = None,
 ) -> None:
     """Validate governed HFQ lineage for every requested field and row.
 
-    The trading calendar is the sorted union of decision dates and the requested
-    outcome source dates. Formal callers request the default D+1 and D+2 labels
-    together, making both intervening sessions observable without treating a mere
-    chronological ``after`` relationship as sufficient.
+    Positive horizons are checked against an independently supplied authoritative
+    trading calendar. Event rows and their declared outcome dates are never allowed
+    to define that calendar themselves.
     """
     requested = list(dict.fromkeys(fields))
+    needs_calendar = any(
+        manifest.get(field) is not None and manifest[field].horizon > 0
+        for field in requested
+    )
+    if needs_calendar and calendar is None:
+        raise EventLineageError("authoritative event trading calendar is required")
     if "trade_date" not in frame:
         raise EventLineageError("event lineage validation requires trade_date")
     row_dates_raw = frame["trade_date"].tolist()
@@ -206,6 +264,24 @@ def validate_event_fields(
         if train_end is not None
         else None
     )
+    calendar_dates = (
+        [
+            _parse_date(value, field="calendar", rule="session", row_date=position)
+            for position, value in enumerate(calendar)
+        ]
+        if calendar is not None
+        else []
+    )
+    if any(
+        right <= left
+        for left, right in zip(calendar_dates, calendar_dates[1:], strict=False)
+    ):
+        raise EventLineageError(
+            "event trading calendar sessions must be strictly increasing and unique"
+        )
+    calendar_positions = {day: position for position, day in enumerate(calendar_dates)}
+    if cutoff is not None and needs_calendar and cutoff not in calendar_positions:
+        raise EventLineageError(f"train_end {train_end!r} is not an event trading session")
 
     parsed_sources: dict[str, list[date]] = {}
     parsed_audits: dict[EventAuditColumns, list[date]] = {}
@@ -269,15 +345,6 @@ def validate_event_fields(
         parsed_audits[item] = sources
         parsed_sources[field] = sources
 
-    calendar = sorted(
-        set(row_dates).union(
-            source
-            for field in requested
-            if manifest[field].horizon > 0
-            for source in parsed_sources[field]
-        )
-    )
-    positions = {day: position for position, day in enumerate(calendar)}
     for field in requested:
         item = manifest[field]
         for position, (decision, source) in enumerate(
@@ -291,8 +358,17 @@ def validate_event_fields(
                         f"got {source.isoformat()}, expected {decision.isoformat()}"
                     )
                 continue
-            expected_position = positions[decision] + item.horizon
-            expected = calendar[expected_position] if expected_position < len(calendar) else None
+            decision_position = calendar_positions.get(decision)
+            if decision_position is None:
+                raise EventLineageError(
+                    f"field {field!r} decision date {row_date} is not in the event trading calendar"
+                )
+            expected_position = decision_position + item.horizon
+            expected = (
+                calendar_dates[expected_position]
+                if expected_position < len(calendar_dates)
+                else None
+            )
             if source != expected:
                 expected_text = expected.isoformat() if expected is not None else "calendar end"
                 raise EventLineageError(

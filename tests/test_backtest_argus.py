@@ -18,6 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+import backtest_argus  # noqa: E402
 from backtest_argus import (  # noqa: E402
     COMMISSION_BPS,
     ENTRY_HFQ,
@@ -25,6 +26,7 @@ from backtest_argus import (  # noqa: E402
     HIGH_HFQ,
     STAMP_SELL_BPS,
     TRANSFER_BPS,
+    complete_training_mask,
     cost_rates,
     cross_sectional_z,
     gross_returns,
@@ -131,6 +133,22 @@ def test_fillability_still_uses_raw_open_not_hfq_entry():
     assert unfillable_mask(frame).tolist() == [True]
     frame["label_px_d1_open"] = np.nan
     assert unfillable_mask(frame).tolist() == [False]
+
+
+def test_training_rows_require_complete_d2_by_training_boundary():
+    frame = pd.DataFrame({"trade_date": ["20240102", "20240103", "20240104"]})
+    calendar = ("20240102", "20240103", "20240104", "20240105", "20240108")
+
+    mask = complete_training_mask(frame, calendar, train_end="20240104", horizon=2)
+
+    assert mask.tolist() == [True, False, False]
+
+
+def test_backtest_cli_rejects_omitted_lineage(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["backtest_argus.py", "--input", "events.parquet"])
+    with pytest.raises(SystemExit, match="2"):
+        backtest_argus.main()
+    assert "--lineage" in capsys.readouterr().err
 
 
 def _book(scores, unfillable, hit, to_close) -> pd.DataFrame:

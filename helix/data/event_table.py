@@ -23,7 +23,9 @@ import pandas as pd
 
 from ..logging_setup import get_logger
 from .event_lineage import (
+    EventLineageError,
     audit_column_names,
+    load_event_calendar,
     load_event_lineage,
     validate_event_fields,
     validate_event_schema,
@@ -196,11 +198,18 @@ def load_event_panel(
     meta_columns: tuple[str, ...] = (DATE_COLUMN, CODE_COLUMN),
     *,
     lineage_path: Path | str | None = None,
+    calendar_path: Path | str | None = None,
     train_end: str | None = None,
 ) -> EventPanel:
     """Read and govern a parquet event table before packing selected numeric fields."""
     manifest = load_event_lineage(lineage_path)
     audit_columns = audit_column_names(manifest)
+    if feature_columns is not None:
+        leaked_audits = sorted(set(feature_columns) & audit_columns)
+        if leaked_audits:
+            raise EventLineageError(
+                f"feature_columns cannot include event audit columns: {leaked_audits}"
+            )
     if feature_columns is None:
         feature_columns = numeric_feature_columns(
             path,
@@ -215,9 +224,19 @@ def load_event_panel(
     schema_names = set(pq.ParquetFile(path).schema_arrow.names)
     validate_event_schema(schema_names, manifest, requested)
     required_audits = audit_column_names({field: manifest[field] for field in requested})
+    needs_calendar = any(manifest[field].horizon > 0 for field in requested)
+    if calendar_path is not None and Path(calendar_path).resolve() == Path(path).resolve():
+        raise EventLineageError("event trading calendar must be supplied independently")
+    calendar = (
+        load_event_calendar(calendar_path)
+        if calendar_path is not None or needs_calendar
+        else None
+    )
     columns = list(dict.fromkeys([*meta_columns, *requested, *sorted(required_audits)]))
     frame = pd.read_parquet(path, columns=columns)
-    validate_event_fields(frame, manifest, requested, train_end=train_end)
+    validate_event_fields(
+        frame, manifest, requested, calendar=calendar, train_end=train_end
+    )
     return build_event_panel(frame, feature_columns, label_columns)
 
 
@@ -276,6 +295,7 @@ def open_event_source(
     code_column: str = CODE_COLUMN,
     *,
     lineage_path: Path | str | None = None,
+    calendar_path: Path | str | None = None,
     feature_columns: list[str] | None = None,
 ) -> tuple[SlotIndex, dict[str, np.ndarray], pd.DataFrame]:
     """Build the slot index and label grids, returning the key frame for streaming reads.
@@ -291,9 +311,17 @@ def open_event_source(
     schema_names = set(pq.ParquetFile(path).schema_arrow.names)
     validate_event_schema(schema_names, manifest, governed)
     audits = audit_column_names({field: manifest[field] for field in governed})
+    needs_calendar = any(manifest[field].horizon > 0 for field in governed)
+    if calendar_path is not None and Path(calendar_path).resolve() == Path(path).resolve():
+        raise EventLineageError("event trading calendar must be supplied independently")
+    calendar = (
+        load_event_calendar(calendar_path)
+        if calendar_path is not None or needs_calendar
+        else None
+    )
     projected = list(dict.fromkeys([date_column, code_column, *label_columns, *sorted(audits)]))
     keys = pq.read_table(path, columns=projected).to_pandas()
-    validate_event_fields(keys, manifest, governed)
+    validate_event_fields(keys, manifest, governed, calendar=calendar)
     keys = keys[[date_column, code_column, *label_columns]].copy()
     keys["_row"] = np.arange(len(keys))
     keys = normalize_frame(keys, date_column, code_column)

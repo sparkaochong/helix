@@ -48,7 +48,9 @@ from fill_impact import build_model, build_regressor, daily_ic
 from fillability import REQUIRED_COLUMNS, unfillable_mask
 
 from helix.data.event_lineage import (
+    EventLineageError,
     audit_column_names,
+    load_event_calendar,
     load_event_lineage,
     validate_event_fields,
     validate_event_schema,
@@ -73,6 +75,31 @@ STAMP_CUT_DATE = "20230828"
 
 def _digits(date: str) -> str:
     return "".join(ch for ch in date if ch.isdigit())
+
+
+def complete_training_mask(
+    frame: pd.DataFrame,
+    calendar: tuple[str, ...],
+    train_end: str,
+    horizon: int,
+) -> np.ndarray:
+    """Select D0 rows whose exact D+h session does not exceed ``train_end``."""
+    if type(horizon) is not int or horizon < 0:
+        raise EventLineageError("training outcome horizon must be an integer >= 0")
+    sessions = tuple(_digits(value) for value in calendar)
+    positions = {value: position for position, value in enumerate(sessions)}
+    cutoff = positions.get(_digits(train_end))
+    if cutoff is None:
+        raise EventLineageError(f"train_end {train_end!r} is not an event trading session")
+    decisions = frame["trade_date"].astype(str).map(_digits)
+    missing = next((value for value in decisions if value not in positions), None)
+    if missing is not None:
+        raise EventLineageError(
+            f"training decision date {missing!r} is not in the event trading calendar"
+        )
+    return np.asarray(
+        [positions[value] + horizon <= cutoff for value in decisions], dtype=bool
+    )
 
 #: A new book opens every day while the previous one is still held, so capital is split
 #: across this many overlapping tranches. touch_offset - entry_offset + 1 = 2.
@@ -278,6 +305,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", required=True)
     ap.add_argument("--lineage", required=True)
+    ap.add_argument("--calendar", required=True)
     ap.add_argument("--label", default=BINARY_TARGET)
     ap.add_argument("--ic-target", default=PRIMARY_TARGET)
     ap.add_argument("--return-col", default=RETURN_HFQ,
@@ -325,6 +353,7 @@ def main() -> None:
         raise SystemExit(f"--signal-k {signal_k} 小于最大持仓数 {max(holds)}，候选不够建仓")
 
     manifest = load_event_lineage(args.lineage)
+    calendar = load_event_calendar(args.calendar)
     features = numeric_feature_columns(
         args.input,
         [args.label, args.ic_target, args.return_col],
@@ -342,7 +371,7 @@ def main() -> None:
                      *price_cols, *REQUIRED_COLUMNS, *features, *governed_audits})
     df = pd.read_parquet(args.input, columns=needed)
     df["trade_date"] = df["trade_date"].astype(str)
-    validate_event_fields(df, manifest, governed)
+    validate_event_fields(df, manifest, governed, calendar=calendar)
     df["unfillable"] = unfillable_mask(df)
     df = df.dropna(subset=[args.label, args.ic_target, args.return_col, *price_cols])
     print(f"features {len(features)}  rows {len(df):,}  rank-by {args.rank_by}")
@@ -367,7 +396,14 @@ def main() -> None:
     cut = int(np.searchsorted(dates, args.split_date, "right"))
     train_end = dates[max(cut - 1, 0)]
     test_start = dates[min(cut + args.embargo_days, len(dates) - 1)]
-    train = df[df["trade_date"] <= train_end]
+    training_horizon = max(manifest[field].horizon for field in governed)
+    train_mask = complete_training_mask(
+        df, calendar, train_end=train_end, horizon=training_horizon
+    )
+    train = df[train_mask]
+    validate_event_fields(
+        train, manifest, governed, calendar=calendar, train_end=train_end
+    )
     test = df[df["trade_date"] >= test_start]
     print(f"train ~{train_end} ({len(train):,}) | test {test_start}~ ({len(test):,})")
     if _digits(test_start) < STAMP_CUT_DATE:

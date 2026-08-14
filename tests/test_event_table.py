@@ -16,6 +16,7 @@ from helix.data.event_lineage import (
     EventAuditColumns,
     EventLineageError,
     audit_column_names,
+    load_event_calendar,
     load_event_lineage,
     validate_event_fields,
 )
@@ -53,6 +54,7 @@ def frame() -> pd.DataFrame:
 
 
 VERSION = "raw-times-same-day-adj-v1:" + "a" * 64
+CALENDAR = ["20240102", "20240103", "20240104", "20240105"]
 
 
 def _governed_frame() -> pd.DataFrame:
@@ -111,6 +113,12 @@ def _write_manifest(tmp_path, payload: dict | str | None = None) -> Path:
         path.write_text(payload, encoding="utf-8")
     else:
         path.write_text(json.dumps(_manifest_dict() if payload is None else payload), encoding="utf-8")
+    return path
+
+
+def _write_calendar(tmp_path) -> Path:
+    path = tmp_path / "calendar.parquet"
+    pd.DataFrame({"cal_date": CALENDAR, "is_open": 1}).to_parquet(path, index=False)
     return path
 
 
@@ -251,22 +259,93 @@ def test_event_field_validation_fails_closed(tmp_path, mutation, message):
     manifest = load_event_lineage(_write_manifest(tmp_path))
     with pytest.raises(EventLineageError, match=message):
         validate_event_fields(
-            mutation(_governed_frame()), manifest, ["feat_a", "label_d2_return_hfq"]
+            mutation(_governed_frame()),
+            manifest,
+            ["feat_a", "label_d2_return_hfq"],
+            calendar=CALENDAR,
         )
 
 
 def test_event_field_validation_requires_manifest_entry(tmp_path):
     manifest = load_event_lineage(_write_manifest(tmp_path))
     with pytest.raises(EventLineageError, match="unknown.*manifest entry"):
-        validate_event_fields(_governed_frame(), manifest, ["unknown"])
+        validate_event_fields(_governed_frame(), manifest, ["unknown"], calendar=CALENDAR)
 
 
 def test_event_field_validation_rejects_outcomes_beyond_training_cutoff(tmp_path):
     manifest = load_event_lineage(_write_manifest(tmp_path))
     with pytest.raises(EventLineageError, match="label_d2_return_hfq.*train_end.*20240102"):
         validate_event_fields(
-            _governed_frame(), manifest, ["label_d2_return_hfq"], train_end="20240103"
+            _governed_frame(),
+            manifest,
+            ["label_d2_return_hfq"],
+            calendar=CALENDAR,
+            train_end="20240103",
         )
+
+
+def test_positive_horizon_requires_independent_trading_calendar(tmp_path):
+    manifest = load_event_lineage(_write_manifest(tmp_path))
+    with pytest.raises(EventLineageError, match="authoritative event trading calendar is required"):
+        validate_event_fields(_governed_frame(), manifest, ["label_d2_return_hfq"])
+
+
+def test_authoritative_calendar_rejects_omitted_intervening_session():
+    frame = pd.DataFrame(
+        {
+            "trade_date": ["20240102"],
+            "label_d1": [1.0],
+            "source": ["20240104"],
+            "asof": ["2024-01-04T15:00:00+08:00"],
+            "basis": ["hfq"],
+            "version": [VERSION],
+        }
+    )
+    manifest = {"label_d1": EventAuditColumns("source", "asof", "basis", "version", 1)}
+
+    with pytest.raises(EventLineageError, match="label_d1.*horizon=1.*expected 2024-01-03"):
+        validate_event_fields(
+            frame, manifest, ["label_d1"], calendar=["20240102", "20240103", "20240104"]
+        )
+
+
+def test_authoritative_calendar_accepts_exact_d1_and_d2():
+    frame = pd.DataFrame(
+        {
+            "trade_date": ["20240102"],
+            "label_d1": [1.0],
+            "label_d2": [2.0],
+            "d1_source": ["20240103"],
+            "d1_asof": ["2024-01-03T15:00:00+08:00"],
+            "d2_source": ["20240104"],
+            "d2_asof": ["2024-01-04T15:00:00+08:00"],
+            "basis": ["hfq"],
+            "version": [VERSION],
+        }
+    )
+    manifest = {
+        "label_d1": EventAuditColumns("d1_source", "d1_asof", "basis", "version", 1),
+        "label_d2": EventAuditColumns("d2_source", "d2_asof", "basis", "version", 2),
+    }
+
+    validate_event_fields(
+        frame,
+        manifest,
+        ["label_d1", "label_d2"],
+        calendar=["20240102", "20240103", "20240104"],
+    )
+
+
+def test_event_calendar_loader_reads_only_open_sessions(tmp_path):
+    path = tmp_path / "calendar.parquet"
+    pd.DataFrame(
+        {
+            "cal_date": ["20240102", "20240103", "20240104"],
+            "is_open": [1, 0, 1],
+        }
+    ).to_parquet(path, index=False)
+
+    assert load_event_calendar(path) == ("20240102", "20240104")
 
 
 def test_governed_load_packs_fields_and_labels_without_audit_columns(tmp_path):
@@ -280,6 +359,7 @@ def test_governed_load_packs_fields_and_labels_without_audit_columns(tmp_path):
         label_columns=["label_d2_return_hfq"],
         feature_columns=["feat_a", "feat_b"],
         lineage_path=lineage_path,
+        calendar_path=_write_calendar(tmp_path),
     )
 
     assert panel.field_names() == ["feat_a", "feat_b"]
@@ -294,6 +374,19 @@ def test_formal_load_rejects_legacy_table_without_manifest(tmp_path, frame):
         load_event_panel(path, label_columns=["label_hit"])
 
 
+def test_formal_load_rejects_positive_horizon_without_calendar(tmp_path):
+    path = tmp_path / "events.parquet"
+    _governed_frame().to_parquet(path, index=False)
+
+    with pytest.raises(EventLineageError, match="authoritative event trading calendar is required"):
+        load_event_panel(
+            path,
+            label_columns=["label_d2_return_hfq"],
+            feature_columns=["feat_a"],
+            lineage_path=_write_manifest(tmp_path),
+        )
+
+
 def test_auto_feature_discovery_excludes_shared_audit_columns(tmp_path):
     frame = _governed_frame()
     path = tmp_path / "events.parquet"
@@ -301,10 +394,28 @@ def test_auto_feature_discovery_excludes_shared_audit_columns(tmp_path):
     lineage_path = _write_manifest(tmp_path)
 
     panel = load_event_panel(
-        path, label_columns=["label_d2_return_hfq"], lineage_path=lineage_path
+        path,
+        label_columns=["label_d2_return_hfq"],
+        lineage_path=lineage_path,
+        calendar_path=_write_calendar(tmp_path),
     )
 
     assert panel.field_names() == ["feat_a", "feat_b"]
+
+
+def test_explicit_feature_columns_reject_physical_audit_columns(tmp_path):
+    frame = _governed_frame()
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+
+    with pytest.raises(EventLineageError, match="feature_columns.*audit.*feature_source_date"):
+        load_event_panel(
+            path,
+            label_columns=["label_d2_return_hfq"],
+            feature_columns=["feat_a", "feature_source_date"],
+            lineage_path=_write_manifest(tmp_path),
+            calendar_path=tmp_path / "calendar.parquet",
+        )
 
 
 def test_ragged_days_pack_into_slots(frame):

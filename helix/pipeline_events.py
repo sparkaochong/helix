@@ -57,10 +57,16 @@ def _search_rows(n_dates: int, fraction: float) -> slice:
 
 
 def load(
-    path: Path, lineage_path: Path, labels: tuple[str, ...] = DEFAULT_LABELS
+    path: Path,
+    lineage_path: Path,
+    calendar_path: Path,
+    labels: tuple[str, ...] = DEFAULT_LABELS,
 ) -> EventPanel:
     panel = load_event_panel(
-        Path(path), label_columns=[c for c in labels], lineage_path=Path(lineage_path)
+        Path(path),
+        label_columns=[c for c in labels],
+        lineage_path=Path(lineage_path),
+        calendar_path=Path(calendar_path),
     )
     log.info("loaded %d features, %d rows", len(panel.fields), panel.n_rows)
     return panel

@@ -49,6 +49,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", required=True)
     ap.add_argument("--lineage", required=True)
+    ap.add_argument("--calendar", required=True)
     ap.add_argument("--out", default="data/artifacts/argus")
     ap.add_argument("--config", default=None)
     ap.add_argument("--search-fraction", type=float, default=0.6)
@@ -76,6 +77,7 @@ def main() -> None:
         path,
         labels,
         lineage_path=args.lineage,
+        calendar_path=args.calendar,
         feature_columns=features,
     )
     n_dates = len(index.dates)
