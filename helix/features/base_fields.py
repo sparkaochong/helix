@@ -23,20 +23,20 @@ EPS = 1e-9
 
 def compute_base_fields(panel: Panel) -> dict[str, np.ndarray]:
     """Return ``{field_name: (T, N) float64}``, skipping fields whose inputs are absent."""
+    panel.require_adjusted_prices(
+        ("open_hfq", "high_hfq", "low_hfq", "close_hfq"), "compute_base_fields"
+    )
     close_h = panel.f64("close_hfq")
     high_h = panel.f64("high_hfq")
     low_h = panel.f64("low_hfq")
     open_h = panel.f64("open_hfq")
-    close = panel.f64("close")
-    open_ = panel.f64("open")
-    high = panel.f64("high")
-    low = panel.f64("low")
-    pre_close = panel.f64("pre_close")
+    raw_close = panel.f64("close")
     amount = panel.f64("amount")
     up_limit = panel.f64("up_limit")
 
     ret1 = ops.div(close_h, ops.delay(close_h, 1)) - 1.0
-    hl = high - low
+    delayed_close_h = ops.delay(close_h, 1)
+    hl = high_h - low_h
 
     fields: dict[str, np.ndarray] = {
         # --- returns over several horizons
@@ -44,12 +44,12 @@ def compute_base_fields(panel: Panel) -> dict[str, np.ndarray]:
         "ret5": ops.div(close_h, ops.delay(close_h, 5)) - 1.0,
         "ret20": ops.div(close_h, ops.delay(close_h, 20)) - 1.0,
         # --- intraday shape of the D0 bar
-        "gap": ops.div(open_, pre_close) - 1.0,
-        "intraday": ops.div(close, open_) - 1.0,
-        "hl_range": ops.div(hl, pre_close),
-        "close_pos": ops.div(close - low, hl),
-        "upper_shadow": ops.div(high - np.maximum(open_, close), pre_close),
-        "lower_shadow": ops.div(np.minimum(open_, close) - low, pre_close),
+        "gap": ops.div(open_h, delayed_close_h) - 1.0,
+        "intraday": ops.div(close_h, open_h) - 1.0,
+        "hl_range": ops.div(hl, delayed_close_h),
+        "close_pos": ops.div(close_h - low_h, hl),
+        "upper_shadow": ops.div(high_h - np.maximum(open_h, close_h), delayed_close_h),
+        "lower_shadow": ops.div(np.minimum(open_h, close_h) - low_h, delayed_close_h),
         # --- trend / mean reversion
         "ma_dev5": ops.div(close_h, ops.ts_mean(close_h, 5)) - 1.0,
         "ma_dev20": ops.div(close_h, ops.ts_mean(close_h, 20)) - 1.0,
@@ -64,10 +64,12 @@ def compute_base_fields(panel: Panel) -> dict[str, np.ndarray]:
         "amount_z20": ops.ts_zscore(np.log(np.maximum(amount, EPS)), 20),
         "amihud20": ops.ts_mean(ops.div(np.abs(ret1), np.maximum(amount, EPS)), 20) * 1e6,
         # --- distance to the daily price limit, which caps how far D+2 can travel
-        "to_up_limit": ops.div(up_limit - close, close),
-        "limitup_cnt20": ops.ts_sum((close >= up_limit - 0.001).astype(np.float64), 20),
+        "to_up_limit": ops.div(up_limit - raw_close, raw_close),
+        "limitup_cnt20": ops.ts_sum(
+            (raw_close >= up_limit - 0.001).astype(np.float64), 20
+        ),
         # --- overnight/open behaviour, directly relevant to a D+1-open entry
-        "open_gap_mean5": ops.ts_mean(ops.div(open_, pre_close) - 1.0, 5),
+        "open_gap_mean5": ops.ts_mean(ops.div(open_h, delayed_close_h) - 1.0, 5),
         "oc_corr20": ops.ts_corr(open_h, close_h, 20),
     }
 
@@ -80,9 +82,9 @@ def compute_base_fields(panel: Panel) -> dict[str, np.ndarray]:
     if "circ_mv" in panel:
         fields["log_circ_mv"] = np.log(np.maximum(panel.f64("circ_mv"), EPS))
     if "pb" in panel:
-        fields["bp"] = ops.div(np.ones_like(close), panel.f64("pb"))
+        fields["bp"] = ops.div(np.ones_like(close_h), panel.f64("pb"))
     if "pe_ttm" in panel:
-        fields["ep"] = ops.div(np.ones_like(close), panel.f64("pe_ttm"))
+        fields["ep"] = ops.div(np.ones_like(close_h), panel.f64("pe_ttm"))
 
     for name, arr in fields.items():
         fields[name] = np.where(np.isfinite(arr), arr, np.nan)
