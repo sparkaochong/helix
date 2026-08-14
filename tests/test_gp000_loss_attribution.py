@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -24,7 +25,9 @@ from scripts.gp000_loss_attribution import (
     render_decay_svg,
     render_equity_svg,
     render_report,
+    replay_formal_factor,
     validate_formal_factor,
+    validate_training_calendar,
     write_outputs,
 )
 
@@ -112,6 +115,31 @@ def test_ex_right_detection_uses_adj_factor_change_on_same_stock() -> None:
     )
 
     assert prices.ex_right[:, 0].tolist() == [False, False, True]
+
+
+def test_hit_rounding_mismatch_is_separate_from_adjustment_flip() -> None:
+    events = pd.DataFrame(
+        {
+            "trade_date": ["2024-05-10"],
+            "stock_code": ["000001.SZ"],
+            "label_px_d1_open": [10.0],
+            "label_px_d2_high": [9.2],
+            "label_px_d2_close": [9.0],
+            "label_d2_return": [-0.1],
+            "label_d2_hit_8pct": [1.0],
+        }
+    )
+    prices = build_price_lookup(
+        _market_for_adjustment_test(),
+        ["2024-05-10", "2024-05-13", "2024-05-14"],
+        ["000001.SZ"],
+    )
+
+    audit, _ = audit_adjustment_chain(events, prices)
+
+    assert audit["event_raw_hit_mismatch_count"] == 1
+    assert audit["hit_flip_count"] == 0
+    assert audit["event_label_to_hfq_hit_difference_count"] == 1
 
 
 def _synthetic_factor_returns(days: int = 2, names: int = 10) -> pd.DataFrame:
@@ -369,3 +397,64 @@ def test_svg_and_machine_outputs_are_well_formed(tmp_path: Path) -> None:
     ET.parse(paths.equity_svg)
     ET.parse(paths.decay_svg)
     assert pd.read_parquet(paths.daily).shape == evidence["daily"].shape
+
+
+def test_training_calendar_requires_approved_bounds_count_and_digest() -> None:
+    dates = ["2024-01-02", "2024-01-03", "2024-01-04"]
+    digest = hashlib.sha256("\n".join(dates).encode()).hexdigest()
+
+    result = validate_training_calendar(
+        dates,
+        train_start=dates[0],
+        train_end=dates[-1],
+        expected_count=3,
+        expected_digest=digest,
+    )
+
+    assert result.tolist() == dates
+    with pytest.raises(ValueError, match="approved"):
+        validate_training_calendar(
+            dates[:-1],
+            train_start=dates[0],
+            train_end=dates[-1],
+            expected_count=3,
+            expected_digest=digest,
+        )
+
+
+def test_replay_formal_factor_uses_canonical_expression() -> None:
+    library = FactorLibrary(
+        factors=[
+            FactorSpec(
+                "gp_000",
+                (
+                    "add(add(stock_intra_amp_d1d3_mean, "
+                    "div(stock_vwap_dev_d1, vol_burst_count_20d)), "
+                    "stock_intra_amp_d0)"
+                ),
+                1.0,
+            )
+        ],
+        field_names=[
+            "stock_intra_amp_d1d3_mean",
+            "stock_vwap_dev_d1",
+            "vol_burst_count_20d",
+            "stock_intra_amp_d0",
+        ],
+        windows=[],
+        kind="event",
+    )
+    events = pd.DataFrame(
+        {
+            "trade_date": ["2024-01-02", "2024-01-02"],
+            "stock_code": ["A", "B"],
+            "stock_intra_amp_d1d3_mean": [1.0, 2.0],
+            "stock_vwap_dev_d1": [2.0, 3.0],
+            "vol_burst_count_20d": [4.0, 3.0],
+            "stock_intra_amp_d0": [0.1, 0.2],
+        }
+    )
+
+    replayed = replay_formal_factor(events, library)
+
+    assert replayed["factor_score"].tolist() == pytest.approx([1.6, 3.2])
