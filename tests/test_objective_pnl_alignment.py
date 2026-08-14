@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import inspect
+import logging
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from helix.config import BacktestConfig
+from scripts import objective_pnl_alignment as alignment_audit
 from scripts.objective_pnl_alignment import (
     OBJECTIVE_D0_END,
     PRODUCTION_TOP_K,
@@ -129,6 +131,78 @@ def test_library_evaluation_uses_production_k_from_config():
         table["factor"] == "bad", "fit_net"
     ].item()
     assert set(table["top_k"]) == {4}
+
+
+def test_audit_library_validation_reuses_vectorized_alignment(monkeypatch):
+    dates = pd.bdate_range("2023-01-02", periods=130).strftime("%Y-%m-%d")
+    codes = [f"{index:06d}.SZ" for index in range(12)]
+    frame = pd.DataFrame(
+        [(date, code) for date in dates for code in codes],
+        columns=["trade_date", "stock_code"],
+    )
+    stock_rank = np.tile(np.arange(len(codes), dtype=float), len(dates))
+    day_wave = np.repeat(np.sin(np.arange(len(dates)) / 7), len(codes))
+    frame["label_d2_hit_8pct"] = (stock_rank >= 8).astype(float)
+    frame["label_d2_peak_return"] = stock_rank / 100
+    frame["label_d2_return"] = stock_rank / 1000 + day_wave / 100
+    frame["label_px_d1_open"] = 10.0
+    frame["turnover_ratio_d0"] = stock_rank + 1
+    values = {
+        "ascending": stock_rank,
+        "descending": -stock_rank,
+        "alternating": stock_rank * np.repeat(
+            np.where(np.arange(len(dates)) % 2, 1.0, -1.0), len(codes)
+        ),
+    }
+    metadata = {
+        name: {"library": "test", "old_fit_gini": 0.0, "n_nodes": 1.0}
+        for name in values
+    }
+    calls = []
+    original = alignment_audit.evaluate_library_alignment
+
+    def tracked_evaluation(**kwargs):
+        table, statistics = original(**kwargs)
+        calls.append(table.copy())
+        return table, statistics
+
+    monkeypatch.setattr(alignment_audit, "evaluate_library_alignment", tracked_evaluation)
+
+    table, _, _, _ = alignment_audit._library_validation(
+        frame,
+        values,
+        metadata,
+        BacktestConfig(
+            top_k=4,
+            commission_bps=0,
+            transfer_bps=0,
+            stamp_sell_bps=0,
+            stamp_sell_bps_before_cut=0,
+            slippage_bps=0,
+        ),
+    )
+
+    assert {call["factor"].item() for call in calls} == set(values)
+    tested = pd.concat(calls).set_index("factor").sort_index()
+    audited = table.set_index("factor").sort_index()
+    pd.testing.assert_frame_equal(
+        audited[["top_k", "fit_net", "selection_net", "fit_ir", "selection_ir"]],
+        tested[["top_k", "fit_net", "selection_net", "fit_ir", "selection_ir"]],
+    )
+
+
+def test_missing_horizon_bars_logs_explicit_degradation(tmp_path, caplog):
+    bars_path = tmp_path / "missing-bars.parquet"
+
+    with caplog.at_level(logging.WARNING, logger=alignment_audit.__name__):
+        result = alignment_audit._horizon_daily(
+            pd.DataFrame(), np.array([]), bars_path, BacktestConfig()
+        )
+
+    assert result == {}
+    assert str(bars_path) in caplog.text
+    assert "exists=False" in caplog.text
+    assert "empty horizon results" in caplog.text
 
 
 def test_report_renderer_states_scope_root_cause_and_roles():

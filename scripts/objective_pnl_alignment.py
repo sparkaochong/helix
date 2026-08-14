@@ -30,7 +30,10 @@ from helix.eval.objective import (
     summarize_objective,
 )
 from helix.gp.library import FactorLibrary, load_factors
+from helix.logging_setup import get_logger
 from helix.splits import fit_selection_windows
+
+log = get_logger(__name__)
 
 TRAIN_START = "2022-01-04"
 TRAIN_END = "2024-09-04"
@@ -507,19 +510,58 @@ def _library_validation(
     metadata: dict[str, dict[str, Any]],
     config: BacktestConfig,
 ) -> tuple[pd.DataFrame, dict[str, float], dict[str, float], pd.DataFrame]:
-    dates = frame["trade_date"].drop_duplicates().to_numpy()
+    grouped_positions = list(
+        frame.groupby("trade_date", sort=False, observed=True).indices.items()
+    )
+    dates = np.asarray([date for date, _ in grouped_positions])
+    positions = [np.asarray(position, dtype=int) for _, position in grouped_positions]
+    width = max(len(position) for position in positions)
+    candidate_mask = np.arange(width)[None, :] < np.asarray(
+        [len(position) for position in positions]
+    )[:, None]
+
+    def daily_grid(source: np.ndarray | pd.Series) -> np.ndarray:
+        source_values = np.asarray(source, dtype=np.float64)
+        grid = np.full((len(dates), width), np.nan, dtype=np.float64)
+        for row, position in enumerate(positions):
+            grid[row, : len(position)] = source_values[position]
+        return grid
+
+    gross_return = daily_grid(frame["label_d2_return"])
     fit_rows, selection_rows = fit_selection_windows(len(dates), embargo_days=5)
     rows: list[dict[str, Any]] = []
     for name, factor in values.items():
+        tested_table, _ = evaluate_library_alignment(
+            factor_values={name: daily_grid(factor)},
+            gross_return=gross_return,
+            candidate_mask=candidate_mask,
+            dates=dates,
+            config=config,
+            fit_rows=fit_rows,
+            selection_rows=selection_rows,
+        )
+        tested = tested_table.iloc[0].to_dict()
         daily, _ = _daily_diagnostics(frame, factor, config, config.top_k)
+        diagnostic_net = np.asarray(
+            [
+                daily["production_net"].iloc[fit_rows].mean(),
+                daily["production_net"].iloc[selection_rows].mean(),
+            ]
+        )
+        np.testing.assert_allclose(
+            [tested["fit_net"], tested["selection_net"]],
+            diagnostic_net,
+            rtol=0,
+            atol=1e-15,
+            equal_nan=True,
+            err_msg=f"audit alignment drifted from evaluate_library_alignment for {name}",
+        )
         rows.append(
             {
-                "factor": name,
+                **tested,
                 "library": metadata[name]["library"],
                 "old_fit_gini": metadata[name]["old_fit_gini"],
                 "fit_close_ic": float(daily["close_ic"].iloc[fit_rows].mean()),
-                "fit_net": float(daily["production_net"].iloc[fit_rows].mean()),
-                "selection_net": float(daily["production_net"].iloc[selection_rows].mean()),
                 "fit_top10_net": float(daily["top10_net"].iloc[fit_rows].mean()),
                 "selection_top10_net": float(
                     daily["top10_net"].iloc[selection_rows].mean()
@@ -544,6 +586,11 @@ def _horizon_daily(
     config: BacktestConfig,
 ) -> dict[int, pd.DataFrame]:
     if not bars_path.exists():
+        log.warning(
+            "horizon audit degraded because the bars cache is unavailable "
+            "(path=%s, exists=False); returning empty horizon results",
+            bars_path,
+        )
         return {}
     bars = pd.read_parquet(
         bars_path,
