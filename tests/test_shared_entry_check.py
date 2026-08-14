@@ -9,6 +9,7 @@ import numpy as np
 
 from helix.config import LabelConfig
 from helix.data.panel import Panel
+from helix.data.price_lineage import make_hfq_lineage
 from helix.eval import backtest as backtest_module
 from helix.eval.shared_entry_check import entry_is_fillable
 from helix.labels import touch_label as touch_label_module
@@ -16,6 +17,8 @@ from helix.labels import touch_label as touch_label_module
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import d2_limit_down_bias as report  # noqa: E402
+
+TEST_ADJ_VERSION = "raw-times-same-day-adj-v1:" + "0" * 64
 
 
 def make_panel() -> Panel:
@@ -31,10 +34,15 @@ def make_panel() -> Panel:
     }
     fields["open"][2] = [10.5, 10.5, 11.0]
     fields["limit_price_observed"][2, 1] = 0.0
+    dates = np.asarray([f"2024010{i}" for i in range(1, 6)])
     return Panel(
-        dates=np.asarray([f"2024010{i}" for i in range(1, 6)]),
+        dates=dates,
         codes=np.asarray(["A", "B", "C"]),
         fields=fields,
+        price_lineage={
+            name: make_hfq_lineage(dates, TEST_ADJ_VERSION)
+            for name in ("open_hfq", "high_hfq", "close_hfq")
+        },
     )
 
 

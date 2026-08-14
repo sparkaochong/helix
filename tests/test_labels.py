@@ -7,7 +7,15 @@ import pytest
 
 from helix.config import LabelConfig
 from helix.data.panel import Panel
+from helix.data.price_lineage import (
+    AdjustmentStamp,
+    PriceLineage,
+    PriceLineageError,
+    make_hfq_lineage,
+)
 from helix.labels.touch_label import build_touch_label
+
+TEST_ADJ_VERSION = "raw-times-same-day-adj-v1:" + "0" * 64
 
 
 def make_panel(n_dates: int = 6, n_codes: int = 1, **overrides) -> Panel:
@@ -28,10 +36,15 @@ def make_panel(n_dates: int = 6, n_codes: int = 1, **overrides) -> Panel:
         "is_trading": np.ones(shape),
     }
     fields.update(overrides)
+    dates = np.array([f"2024010{i}" for i in range(1, n_dates + 1)])
     return Panel(
-        dates=np.array([f"2024010{i}" for i in range(1, n_dates + 1)]),
+        dates=dates,
         codes=np.array([f"00000{j}.SZ" for j in range(n_codes)]),
         fields={k: np.asarray(v, dtype=np.float64) for k, v in fields.items()},
+        price_lineage={
+            name: make_hfq_lineage(dates, TEST_ADJ_VERSION)
+            for name in ("open_hfq", "high_hfq", "close_hfq")
+        },
     )
 
 
@@ -66,6 +79,48 @@ def test_last_rows_have_no_label(cfg):
     assert not labels.valid[-1, 0]
     assert not labels.valid[-2, 0]
     assert np.isnan(labels.y[-1, 0])
+    assert labels.adjustment == AdjustmentStamp("hfq", TEST_ADJ_VERSION)
+
+
+def test_label_requires_governed_hfq_lineage(cfg):
+    panel = make_panel()
+    del panel.price_lineage["high_hfq"]
+
+    with pytest.raises(PriceLineageError, match=r"build_touch_label: missing.*high_hfq"):
+        build_touch_label(panel, np.ones(panel.shape, dtype=bool), cfg)
+
+
+def test_label_rejects_raw_adjustment_basis(cfg):
+    panel = make_panel()
+    matching = panel.price_lineage["high_hfq"]
+    panel.price_lineage["high_hfq"] = PriceLineage(
+        matching.source_date,
+        matching.as_of_time,
+        "raw",
+        TEST_ADJ_VERSION,
+    )
+
+    with pytest.raises(PriceLineageError, match=r"build_touch_label: field 'high_hfq'.*basis 'raw'"):
+        build_touch_label(panel, np.ones(panel.shape, dtype=bool), cfg)
+
+
+def test_label_rejects_inconsistent_adjustment_versions(cfg):
+    panel = make_panel()
+    panel.price_lineage["close_hfq"] = make_hfq_lineage(
+        panel.dates, "raw-times-same-day-adj-v1:" + "1" * 64
+    )
+
+    with pytest.raises(PriceLineageError, match=r"build_touch_label: field 'close_hfq'.*inconsistent adjustment version"):
+        build_touch_label(panel, np.ones(panel.shape, dtype=bool), cfg)
+
+
+def test_label_carries_exact_adjustment_stamp(cfg):
+    panel = make_panel()
+    expected = AdjustmentStamp("hfq", TEST_ADJ_VERSION)
+
+    labels = build_touch_label(panel, np.ones(panel.shape, dtype=bool), cfg)
+
+    assert labels.adjustment == expected
 
 
 def test_entry_at_the_up_limit_is_dropped_not_labelled(cfg):

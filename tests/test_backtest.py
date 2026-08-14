@@ -8,9 +8,12 @@ import pytest
 
 from helix.config import BacktestConfig, LabelConfig
 from helix.data.panel import Panel
+from helix.data.price_lineage import AdjustmentStamp
 from helix.eval import backtest as backtest_module
 from helix.eval.backtest import run_backtest
 from helix.labels.touch_label import LabelSet
+
+TEST_ADJ_VERSION = "raw-times-same-day-adj-v1:" + "0" * 64
 
 
 def make_labels(
@@ -32,6 +35,7 @@ def make_labels(
         entry_price=entry,
         target_price=entry * 1.08,
         exit_price=exit_price,
+        adjustment=AdjustmentStamp("hfq", TEST_ADJ_VERSION),
         entry_valid=(
             valid.copy()
             if entry_valid is None
