@@ -4,6 +4,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from typing import Any, cast
 
 import pandas as pd
 import pytest
@@ -24,10 +25,13 @@ from scripts.adjustment_unification_baseline import (
     EXPECTED_RAW_SHARPE,
     InputManifest,
     build_structured_output,
+    collect_provenance,
     compare_fixed_scores,
     freeze_top_k_selection,
+    prevalidate_report_target,
     publish_report,
     render_report,
+    require_posix_capabilities,
     snapshot_file,
     validate_expected_impact,
     validate_frozen_boundary,
@@ -86,6 +90,20 @@ def _reference_table() -> pd.DataFrame:
             },
         ]
     )
+
+
+def _test_provenance() -> dict[str, object]:
+    return {
+        "git": {
+            "head": "a" * 40,
+            "head_tree": "b" * 40,
+            "dirty_excluding_generated_report": True,
+            "diff_sha256": "c" * 64,
+            "status_sha256": "d" * 64,
+        },
+        "source_modules": {"script.py": "e" * 64},
+        "runtime": {"python": "test", "numpy": "test", "pandas": "test"},
+    }
 
 
 def test_compare_fixed_scores_reuses_one_selection_without_mutating_input() -> None:
@@ -163,6 +181,7 @@ def test_structured_output_marks_legacy_and_unchanged_loss() -> None:
             "event_returns_match_raw": True,
             "event_return_rounding_error_max": 5e-7,
         },
+        provenance=_test_provenance(),
     )
 
     assert payload["legacy_unverified_lineage"] is True
@@ -192,6 +211,7 @@ def test_render_is_read_only_and_publish_only_accepts_designated_report(
             "event_returns_match_raw": True,
             "event_return_rounding_error_max": 5e-7,
         },
+        provenance=_test_provenance(),
     )
 
     before = set(tmp_path.iterdir())
@@ -280,19 +300,60 @@ def test_publish_is_anchored_against_parent_symlink_substitution(
     ) -> int:
         nonlocal substituted
         descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
-        if not substituted and os.fsdecode(path) == str(report_dir):
+        if not substituted and os.fsdecode(path) == report_dir.name and dir_fd is not None:
             report_dir.rename(moved_dir)
             report_dir.symlink_to(outside_dir, target_is_directory=True)
             substituted = True
         return descriptor
 
     monkeypatch.setattr(baseline_module.os, "open", substituting_open)
-    with pytest.raises(ValueError, match="designated adjustment report"):
+    with pytest.raises((ValueError, OSError), match="designated adjustment report|symlink"):
         publish_report("must-not-escape", designated)
 
     assert substituted is True
     assert not (outside_dir / designated.name).exists()
     assert not (moved_dir / designated.name).exists()
+
+
+def test_publish_rejects_docs_ancestor_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worktree = tmp_path / "worktree"
+    report_dir = worktree / "docs" / "risk"
+    report_dir.mkdir(parents=True)
+    designated = report_dir / "adjustment_unification_fix.md"
+    moved_docs = tmp_path / "moved-docs"
+    outside = tmp_path / "outside"
+    (outside / "risk").mkdir(parents=True)
+    monkeypatch.setattr(baseline_module, "DESIGNATED_REPORT", designated)
+    validated = prevalidate_report_target(designated)
+
+    original_open = os.open
+    substituted = False
+
+    def substituting_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal substituted
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if not substituted and os.fsdecode(path) == worktree.name and dir_fd is not None:
+            (worktree / "docs").rename(moved_docs)
+            (worktree / "docs").symlink_to(outside, target_is_directory=True)
+            substituted = True
+        return descriptor
+
+    monkeypatch.setattr(baseline_module.os, "open", substituting_open)
+    with pytest.raises((ValueError, OSError), match="designated adjustment report|symlink"):
+        publish_report("must-not-escape", validated)
+
+    assert substituted is True
+    assert not (outside / "risk" / designated.name).exists()
+    assert not (moved_docs / "risk" / designated.name).exists()
 
 
 def _manifest_for_drift_test(tmp_path: Path) -> InputManifest:
@@ -311,14 +372,17 @@ def _manifest_for_drift_test(tmp_path: Path) -> InputManifest:
         (script, b"script-v1"),
     ):
         path.write_bytes(content)
+    snapshot_root = tmp_path / "snapshots"
+    listing, cache_chain = baseline_module._cache_listing(cache)
     return InputManifest(
-        event_table=snapshot_file(event),
-        factor_library=snapshot_file(library),
-        backtest_config=snapshot_file(config),
-        comparison_script=snapshot_file(script),
-        price_cache=cache.resolve(),
-        price_cache_listing=(market.name,),
-        market_files=(snapshot_file(market),),
+        event_table=snapshot_file(event, snapshot_root=snapshot_root),
+        factor_library=snapshot_file(library, snapshot_root=snapshot_root),
+        backtest_config=snapshot_file(config, snapshot_root=snapshot_root),
+        comparison_script=snapshot_file(script, snapshot_root=snapshot_root),
+        price_cache=cache,
+        price_cache_listing=listing,
+        price_cache_chain=cache_chain,
+        market_files=(snapshot_file(market, snapshot_root=snapshot_root),),
         market_calendar=("2024-01-02",),
     )
 
@@ -335,6 +399,59 @@ def test_input_manifest_detects_content_mutation_and_cache_addition(
     (stable.price_cache / "20240103.parquet").write_bytes(b"added")
     with pytest.raises(RuntimeError, match="price cache listing changed"):
         verify_input_manifest(stable)
+
+
+def test_private_snapshot_binds_parsed_bytes_during_source_swap_restore(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "library.json"
+    source.write_text('{"version": 1}', encoding="utf-8")
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    record = snapshot_file(source, snapshot_root=snapshot_root)
+    assert stat.S_IMODE(Path(record.snapshot_path).stat().st_mode) == 0o400
+
+    original = tmp_path / "library.original"
+    replacement = tmp_path / "library.replacement"
+    replacement.write_text('{"version": 2}', encoding="utf-8")
+    source.rename(original)
+    replacement.rename(source)
+    parsed = json.loads(Path(record.snapshot_path).read_text(encoding="utf-8"))
+    source.rename(replacement)
+    original.rename(source)
+
+    assert parsed == {"version": 1}
+    assert json.loads(source.read_text(encoding="utf-8")) == {"version": 1}
+    listing, cache_chain = baseline_module._cache_listing(tmp_path)
+    manifest = InputManifest(
+        event_table=record,
+        factor_library=record,
+        backtest_config=record,
+        comparison_script=record,
+        price_cache=tmp_path,
+        price_cache_listing=listing,
+        price_cache_chain=cache_chain,
+        market_files=(),
+        market_calendar=(),
+    )
+    verify_input_manifest(manifest)
+
+
+def test_posix_capability_gate_and_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    require_posix_capabilities()
+    provenance = cast(dict[str, Any], collect_provenance())
+    assert provenance["git"]["head"]
+    assert len(provenance["git"]["diff_sha256"]) == 64
+    assert len(provenance["source_modules"]) >= 5
+    assert provenance["runtime"]["python"]
+    assert provenance["runtime"]["numpy"] == baseline_module.np.__version__
+    assert provenance["runtime"]["pandas"] == pd.__version__
+
+    monkeypatch.setattr(baseline_module.os, "name", "nt")
+    with pytest.raises(RuntimeError, match="POSIX"):
+        require_posix_capabilities()
 
 
 def test_mismatched_legacy_return_label_fails_reconstruction_gate() -> None:

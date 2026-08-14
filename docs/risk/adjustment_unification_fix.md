@@ -62,9 +62,24 @@
 | 正式 gp_000 因子库 | `/Users/aochong/code/helix/data/artifacts/argus/event_factors.json` | `6823a9e7d76caa4adcd21cd82e781d85e70407191aab9ef1835138934fb05391` |
 | D+2 行情缓存 | `/Users/aochong/code/helix/data/raw/d2_exit_cache` | `c0601a8626de4446703c210e8f5d27debc611dd1bd53291fdef7bba859bfb2c6` |
 | 成本与 Top4 配置 | `/Users/aochong/code/helix/.worktrees/adjustment-unification/configs/default.yaml` | `b209a5a2302089edf2a1dd0c3201e063c6ead2ff581f1bce63243ff1ee41f137` |
-| 本报告生成脚本 | `/Users/aochong/code/helix/.worktrees/adjustment-unification/scripts/adjustment_unification_baseline.py` | `a16c0dcc34fd2683c602b05707866306f38c63a6f4cce68ef634dda6ca0879c3` |
+| 本报告生成脚本 | `/Users/aochong/code/helix/.worktrees/adjustment-unification/scripts/adjustment_unification_baseline.py` | `f4d8052fe31057278644040c3c1606db2fb93bc7fc4866ab15055cfbfd6ec6a4` |
 
-所有输入在计算前由同一不可变 manifest 解析并哈希；行情只从该 manifest 的文件集合加载。计算结束后脚本重新枚举缓存，并对全部消费文件重新 stat 与 SHA-256 校验；任何内容、身份或成员变化都会终止发布。
+所有输入通过从可信 `/` 开始、逐组件 `O_NOFOLLOW` 的源 fd 复制到私有只读快照；SHA-256 与解析器消费的是同一份复制字节。行情只从该 manifest 的快照文件集合加载。计算结束后脚本重新枚举源缓存，并对全部源文件重新 stat 与 SHA-256 校验；任何内容、身份或成员变化都会终止发布。
+
+## 运行来源
+
+| 项目 | 值 |
+| --- | --- |
+| Git HEAD | `5b968c01d4adcb9e88374ec885ca39f41c1f92f2` |
+| Git HEAD tree | `1cedab9776ecf46b52ed7fa0a549e2d26f674516` |
+| 排除生成报告后的工作树是否脏 | `true` |
+| 工作树 diff SHA-256 | `82b3bf79d28dc99985e4b903b07c670b5bf0941739d026f98ae78f340df6169f` |
+| 工作树 status SHA-256 | `d8c6ff2ff8903469980b66791a49a493f0e65e9b1a7e1147ad73683c07699234` |
+| Python | `3.11.15 (main, Apr 14 2026, 14:45:51) [Clang 22.1.3 ]` |
+| NumPy | `2.4.6` |
+| pandas | `3.0.5` |
+
+严格 JSON 还记录了比较脚本、专项审计、配置、回测、IC 与因子库模块的逐文件 SHA-256。
 
 CLI 标准输出同时提供严格 JSON，其中 `legacy_unverified_lineage=true`、`historical_reports_rewritten=false`、`loss_conclusion_unchanged=true`。这些标志防止把 outcome 修正误解为对 legacy 特征血缘或盈利能力的认证。
 
@@ -74,3 +89,4 @@ CLI 标准输出同时提供严格 JSON，其中 `legacy_unverified_lineage=true
 - 本次没有重新训练、调参或改变正式因子方向；分数由冻结的正式表达式和既有成品特征确定，两个对照臂不重新选股。
 - 本报告不替代、不覆盖 `docs/risk/gp000_loss_attribution.md`，也不修改历史 artifacts。
 - 新一代 GP 因子不得通过 legacy adapter 进入正式训练；必须使用新的 HFQ 血缘强契约链路。
+- 报告发布与输入完整性实现依赖 POSIX `dir_fd`、`O_DIRECTORY`、`O_NOFOLLOW` 和 descriptor-relative rename；不具备这些能力的平台会在读取或写入前明确终止。

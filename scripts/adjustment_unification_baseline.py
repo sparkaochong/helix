@@ -5,10 +5,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import secrets
 import stat
+import subprocess
+import sys
+import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,16 +69,42 @@ ABS_TOLERANCE = 1e-12
 
 
 @dataclass(frozen=True)
+class DirectoryIdentity:
+    device: int
+    inode: int
+    mode: int
+
+
+@dataclass(frozen=True)
+class DirectoryChain:
+    path: str
+    components: tuple[str, ...]
+    identities: tuple[DirectoryIdentity, ...]
+
+
+@dataclass(frozen=True)
+class ReportTarget:
+    path: Path
+    parent_chain: DirectoryChain
+
+
+@dataclass(frozen=True)
 class FileSnapshot:
     """Content and identity captured before any analytical input is consumed."""
 
     path: str
+    snapshot_path: str
     size: int
     mtime_ns: int
     device: int
     inode: int
     mode: int
     sha256: str
+    source_chain: DirectoryChain
+
+    @property
+    def source_parent_identity(self) -> DirectoryIdentity:
+        return self.source_chain.identities[-1]
 
 
 @dataclass(frozen=True)
@@ -87,8 +117,87 @@ class InputManifest:
     comparison_script: FileSnapshot
     price_cache: Path
     price_cache_listing: tuple[str, ...]
+    price_cache_chain: DirectoryChain
     market_files: tuple[FileSnapshot, ...]
     market_calendar: tuple[str, ...]
+
+
+def require_posix_capabilities() -> None:
+    """Fail clearly when no-follow descriptor-relative integrity is unavailable."""
+    required_constants = ("O_DIRECTORY", "O_NOFOLLOW")
+    missing = [name for name in required_constants if not hasattr(os, name)]
+    replace_parameters = inspect.signature(os.replace).parameters
+    replace_dir_fd = {"src_dir_fd", "dst_dir_fd"} <= set(replace_parameters)
+    open_dir_fd = "dir_fd" in inspect.signature(os.open).parameters
+    stat_parameters = inspect.signature(os.stat).parameters
+    stat_dir_fd = "dir_fd" in stat_parameters and "follow_symlinks" in stat_parameters
+    unlink_dir_fd = "dir_fd" in inspect.signature(os.unlink).parameters
+    if (
+        os.name != "posix"
+        or missing
+        or not replace_dir_fd
+        or not open_dir_fd
+        or not stat_dir_fd
+        or not unlink_dir_fd
+        or not hasattr(os, "fchmod")
+    ):
+        detail = f"missing constants={missing}, replace_dir_fd={replace_dir_fd}"
+        raise RuntimeError(
+            "adjustment baseline integrity requires POSIX dir_fd/O_NOFOLLOW " + detail
+        )
+
+
+def _absolute_lexical(path: Path) -> Path:
+    expanded = path.expanduser()
+    if ".." in expanded.parts:
+        raise ValueError(f"absolute anchored path rejects traversal: {path}")
+    if not expanded.is_absolute():
+        expanded = Path.cwd() / expanded
+    return Path(os.path.abspath(expanded))
+
+
+def _directory_identity(descriptor: int) -> DirectoryIdentity:
+    value = os.fstat(descriptor)
+    if not stat.S_ISDIR(value.st_mode):
+        raise ValueError("anchored path component is not a directory")
+    return DirectoryIdentity(int(value.st_dev), int(value.st_ino), int(value.st_mode))
+
+
+def _open_absolute_directory(
+    path: Path,
+    *,
+    expected: DirectoryChain | None = None,
+) -> tuple[int, DirectoryChain]:
+    """Open every absolute path component from trusted ``/`` without symlinks."""
+    require_posix_capabilities()
+    absolute = _absolute_lexical(path)
+    components = tuple(absolute.parts[1:])
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    identities = [_directory_identity(descriptor)]
+    try:
+        for component in components:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+            identities.append(_directory_identity(descriptor))
+        chain = DirectoryChain(str(absolute), components, tuple(identities))
+        if expected is not None and chain != expected:
+            raise ValueError("anchored directory identity changed")
+        return descriptor, chain
+    except OSError as error:
+        os.close(descriptor)
+        raise ValueError(
+            "anchored path component cannot be opened without following a symlink"
+        ) from error
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _verify_directory_chain(expected: DirectoryChain) -> None:
+    descriptor, _ = _open_absolute_directory(Path(expected.path), expected=expected)
+    os.close(descriptor)
 
 
 _SELECTION_IDENTITY_COLUMNS = ("trade_date", "stock_code", "factor_score")
@@ -302,31 +411,107 @@ def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
-def snapshot_file(path: Path) -> FileSnapshot:
-    """Hash a regular file and reject mutation during the snapshot itself."""
-    if path.is_symlink():
-        raise RuntimeError(f"input snapshot rejects symlink: {path}")
-    resolved = path.resolve(strict=True)
-    before = resolved.stat(follow_symlinks=False)
+def _open_source_file(
+    path: Path,
+    *,
+    expected_chain: DirectoryChain | None = None,
+) -> tuple[int, Path, DirectoryChain, os.stat_result]:
+    absolute = _absolute_lexical(path)
+    parent_descriptor, chain = _open_absolute_directory(
+        absolute.parent,
+        expected=expected_chain,
+    )
+    try:
+        descriptor = os.open(
+            absolute.name,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+    finally:
+        os.close(parent_descriptor)
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
+        raise RuntimeError(f"input snapshot requires a regular file: {absolute}")
+    return descriptor, absolute, chain, metadata
+
+
+def _write_all(descriptor: int, value: bytes) -> None:
+    remaining = memoryview(value)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OSError("private snapshot write made no progress")
+        remaining = remaining[written:]
+
+
+def snapshot_file(path: Path, *, snapshot_root: Path) -> FileSnapshot:
+    """Copy and hash the exact bytes read from one anchored source descriptor."""
+    source, absolute, chain, before = _open_source_file(path)
+    snapshot_path: Path | None = None
+    destination: int | None = None
+    digest = hashlib.sha256()
+    try:
+        snapshot_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        snapshot_path = snapshot_root / (
+            f"{len(tuple(snapshot_root.iterdir())):04d}-{absolute.name}-"
+            f"{secrets.token_hex(6)}"
+        )
+        destination = os.open(
+            snapshot_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        while True:
+            chunk = os.read(source, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            _write_all(destination, chunk)
+        os.fsync(destination)
+        os.fchmod(destination, 0o400)
+        after = os.fstat(source)
+    except Exception:
+        if snapshot_path is not None:
+            with suppress(FileNotFoundError):
+                snapshot_path.unlink()
+        raise
+    finally:
+        if destination is not None:
+            os.close(destination)
+        os.close(source)
+    if snapshot_path is None:
+        raise RuntimeError("private input snapshot path was not created")
     if not stat.S_ISREG(before.st_mode):
-        raise RuntimeError(f"input snapshot requires a regular file: {resolved}")
-    digest = _hash_file(resolved)
-    after = resolved.stat(follow_symlinks=False)
+        with suppress(FileNotFoundError):
+            snapshot_path.unlink()
+        raise RuntimeError(f"input snapshot requires a regular file: {absolute}")
     if _stat_identity(before) != _stat_identity(after):
-        raise RuntimeError(f"input changed while being fingerprinted: {resolved}")
+        snapshot_path.unlink()
+        raise RuntimeError(f"input changed while being snapshotted: {absolute}")
     return FileSnapshot(
-        path=str(resolved),
+        path=str(absolute),
+        snapshot_path=str(snapshot_path),
         size=int(after.st_size),
         mtime_ns=int(after.st_mtime_ns),
         device=int(after.st_dev),
         inode=int(after.st_ino),
         mode=int(after.st_mode),
-        sha256=digest,
+        sha256=digest.hexdigest(),
+        source_chain=chain,
     )
 
 
-def _cache_listing(directory: Path) -> tuple[str, ...]:
-    return tuple(sorted(entry.name for entry in directory.iterdir()))
+def _cache_listing(
+    directory: Path,
+    *,
+    expected_chain: DirectoryChain | None = None,
+) -> tuple[tuple[str, ...], DirectoryChain]:
+    descriptor, chain = _open_absolute_directory(directory, expected=expected_chain)
+    try:
+        return tuple(sorted(os.listdir(descriptor))), chain
+    finally:
+        os.close(descriptor)
 
 
 def build_input_manifest(
@@ -335,16 +520,15 @@ def build_input_manifest(
     library_path: Path,
     price_cache: Path,
     config_path: Path,
+    snapshot_root: Path,
 ) -> InputManifest:
     """Resolve and fingerprint the only file set the audit may consume."""
-    cache = price_cache.resolve(strict=True)
-    if not cache.is_dir():
-        raise RuntimeError(f"price cache is not a directory: {cache}")
-    listing = _cache_listing(cache)
+    cache = _absolute_lexical(price_cache)
+    listing, cache_chain = _cache_listing(cache)
     parquet_paths = [
         cache / name
         for name in listing
-        if name.endswith(".parquet") and (cache / name).is_file()
+        if name.endswith(".parquet")
     ]
     training_paths = [
         path
@@ -360,32 +544,60 @@ def build_input_manifest(
     market_paths = [*prior_paths[-1:], *training_paths]
     calendar = tuple(_hyphenated(path.stem) for path in market_paths)
     manifest = InputManifest(
-        event_table=snapshot_file(input_path),
-        factor_library=snapshot_file(library_path),
-        backtest_config=snapshot_file(config_path),
-        comparison_script=snapshot_file(Path(__file__)),
+        event_table=snapshot_file(input_path, snapshot_root=snapshot_root),
+        factor_library=snapshot_file(library_path, snapshot_root=snapshot_root),
+        backtest_config=snapshot_file(config_path, snapshot_root=snapshot_root),
+        comparison_script=snapshot_file(Path(__file__), snapshot_root=snapshot_root),
         price_cache=cache,
         price_cache_listing=listing,
-        market_files=tuple(snapshot_file(path) for path in market_paths),
+        price_cache_chain=cache_chain,
+        market_files=tuple(
+            snapshot_file(path, snapshot_root=snapshot_root) for path in market_paths
+        ),
         market_calendar=calendar,
     )
-    if _cache_listing(cache) != listing:
+    final_listing, _ = _cache_listing(cache, expected_chain=cache_chain)
+    if final_listing != listing:
         raise RuntimeError("price cache listing changed while manifest was built")
     return manifest
 
 
 def _assert_snapshot_unchanged(label: str, expected: FileSnapshot) -> None:
     try:
-        actual = snapshot_file(Path(expected.path))
+        descriptor, _, _, metadata = _open_source_file(
+            Path(expected.path),
+            expected_chain=expected.source_chain,
+        )
+        digest = hashlib.sha256()
+        try:
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        finally:
+            os.close(descriptor)
     except (FileNotFoundError, RuntimeError, OSError) as error:
         raise RuntimeError(f"{label} changed after input snapshot") from error
-    if actual != expected:
+    actual_identity = _stat_identity(metadata)
+    expected_identity = (
+        expected.size,
+        expected.mtime_ns,
+        expected.device,
+        expected.inode,
+        expected.mode,
+    )
+    if actual_identity != expected_identity or digest.hexdigest() != expected.sha256:
         raise RuntimeError(f"{label} changed after input snapshot")
 
 
 def verify_input_manifest(manifest: InputManifest) -> None:
     """Re-stat and re-hash every consumed byte, including cache membership."""
-    if _cache_listing(manifest.price_cache) != manifest.price_cache_listing:
+    initial_listing, _ = _cache_listing(
+        manifest.price_cache,
+        expected_chain=manifest.price_cache_chain,
+    )
+    if initial_listing != manifest.price_cache_listing:
         raise RuntimeError("price cache listing changed after input snapshot")
     for label, record in (
         ("event_table", manifest.event_table),
@@ -396,7 +608,11 @@ def verify_input_manifest(manifest: InputManifest) -> None:
         _assert_snapshot_unchanged(label, record)
     for record in manifest.market_files:
         _assert_snapshot_unchanged(f"price cache file {Path(record.path).name}", record)
-    if _cache_listing(manifest.price_cache) != manifest.price_cache_listing:
+    final_listing, _ = _cache_listing(
+        manifest.price_cache,
+        expected_chain=manifest.price_cache_chain,
+    )
+    if final_listing != manifest.price_cache_listing:
         raise RuntimeError("price cache listing changed during post-computation verification")
 
 
@@ -408,7 +624,7 @@ def _load_training_market_manifest(
     columns = ["trade_date", "ts_code", "open", "high", "close", "adj_factor"]
     frames = []
     for record in manifest.market_files:
-        frame = pd.read_parquet(record.path, columns=columns)
+        frame = pd.read_parquet(record.snapshot_path, columns=columns)
         frames.append(frame.loc[frame["ts_code"].astype(str).isin(event_codes)])
     market = pd.concat(frames, ignore_index=True)
     if market.empty:
@@ -470,12 +686,70 @@ def validate_legacy_reconstruction(summary: dict[str, object]) -> dict[str, obje
     return summary
 
 
+def _git_output(*arguments: str) -> bytes:
+    result = subprocess.run(
+        ["git", *arguments],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    )
+    return result.stdout
+
+
+def collect_provenance() -> dict[str, object]:
+    """Record executable source, repository state, and numerical runtime versions."""
+    report_relative = DESIGNATED_REPORT.relative_to(ROOT).as_posix()
+    head = _git_output("rev-parse", "HEAD").decode().strip()
+    head_tree = _git_output("rev-parse", "HEAD^{tree}").decode().strip()
+    diff = _git_output(
+        "diff",
+        "--binary",
+        "HEAD",
+        "--",
+        ".",
+        f":(exclude){report_relative}",
+    )
+    status_lines = _git_output(
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    ).decode().splitlines()
+    status_lines = [line for line in status_lines if report_relative not in line]
+    status = "\n".join(status_lines).encode()
+    source_paths = (
+        Path(__file__),
+        ROOT / "scripts/gp000_loss_attribution.py",
+        ROOT / "helix/config.py",
+        ROOT / "helix/eval/backtest.py",
+        ROOT / "helix/eval/ic.py",
+        ROOT / "helix/gp/library.py",
+    )
+    return {
+        "git": {
+            "head": head,
+            "head_tree": head_tree,
+            "dirty_excluding_generated_report": bool(status_lines),
+            "diff_sha256": hashlib.sha256(diff).hexdigest(),
+            "status_sha256": hashlib.sha256(status).hexdigest(),
+        },
+        "source_modules": {
+            str(path.relative_to(ROOT)): _hash_file(path) for path in source_paths
+        },
+        "runtime": {
+            "python": sys.version,
+            "numpy": np.__version__,
+            "pandas": pd.__version__,
+        },
+    }
+
+
 def build_structured_output(
     comparison: pd.DataFrame,
     *,
     boundary: dict[str, object],
     inputs: dict[str, dict[str, object]],
     legacy_reconstruction: dict[str, object],
+    provenance: dict[str, object],
 ) -> dict[str, Any]:
     """Build strict JSON evidence without writing any artifact."""
     indexed = comparison.set_index("price_basis")
@@ -497,6 +771,7 @@ def build_structured_output(
         },
         "inputs": inputs,
         "input_manifest_verified_after_computation": True,
+        "provenance": provenance,
         "legacy_reconstruction": json_ready(legacy_reconstruction),
         "legacy_unverified_lineage": True,
         "historical_reports_rewritten": False,
@@ -518,33 +793,36 @@ def build_baseline_evidence(
     config_path: Path,
 ) -> dict[str, Any]:
     """Run the read-only legacy adapter and return validated structured evidence."""
-    manifest = build_input_manifest(
-        input_path=input_path,
-        library_path=library_path,
-        price_cache=price_cache,
-        config_path=config_path,
-    )
-    config = load_audit_config(Path(manifest.backtest_config.path))
-    library = load_factors(Path(manifest.factor_library.path))
-    events = load_training_events(Path(manifest.event_table.path), library)
-    market, calendar = _load_training_market_manifest(
-        manifest,
-        set(events["stock_code"].astype(str)),
-    )
-    prices = build_price_lookup(market, calendar, events["stock_code"].unique())
-    adjustment_summary, aligned = audit_adjustment_chain(events, prices)
-    validate_legacy_reconstruction(adjustment_summary)
-    boundary = validate_frozen_boundary(aligned)
-    comparison = compare_fixed_scores(aligned, config)
-    validate_expected_impact(comparison)
-    verify_input_manifest(manifest)
-    inputs = collect_input_fingerprints(manifest)
-    return build_structured_output(
-        comparison,
-        boundary=boundary,
-        inputs=inputs,
-        legacy_reconstruction=adjustment_summary,
-    )
+    with tempfile.TemporaryDirectory(prefix="helix-adjustment-snapshot-") as temporary:
+        manifest = build_input_manifest(
+            input_path=input_path,
+            library_path=library_path,
+            price_cache=price_cache,
+            config_path=config_path,
+            snapshot_root=Path(temporary),
+        )
+        config = load_audit_config(Path(manifest.backtest_config.snapshot_path))
+        library = load_factors(Path(manifest.factor_library.snapshot_path))
+        events = load_training_events(Path(manifest.event_table.snapshot_path), library)
+        market, calendar = _load_training_market_manifest(
+            manifest,
+            set(events["stock_code"].astype(str)),
+        )
+        prices = build_price_lookup(market, calendar, events["stock_code"].unique())
+        adjustment_summary, aligned = audit_adjustment_chain(events, prices)
+        validate_legacy_reconstruction(adjustment_summary)
+        boundary = validate_frozen_boundary(aligned)
+        comparison = compare_fixed_scores(aligned, config)
+        validate_expected_impact(comparison)
+        verify_input_manifest(manifest)
+        inputs = collect_input_fingerprints(manifest)
+        return build_structured_output(
+            comparison,
+            boundary=boundary,
+            inputs=inputs,
+            legacy_reconstruction=adjustment_summary,
+            provenance=collect_provenance(),
+        )
 
 
 def _metric_rows(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -560,6 +838,9 @@ def render_report(payload: dict[str, Any]) -> str:
     boundary = payload["training_window"]
     inputs = payload["inputs"]
     reconstruction = payload["legacy_reconstruction"]
+    provenance = payload["provenance"]
+    git_provenance = provenance["git"]
+    runtime = provenance["runtime"]
     digest = str(raw["selected_score_digest"])
 
     def pct(value: float) -> str:
@@ -637,7 +918,22 @@ def render_report(payload: dict[str, Any]) -> str:
 {input_row('backtest_config', '成本与 Top4 配置')}
 {input_row('comparison_script', '本报告生成脚本')}
 
-所有输入在计算前由同一不可变 manifest 解析并哈希；行情只从该 manifest 的文件集合加载。计算结束后脚本重新枚举缓存，并对全部消费文件重新 stat 与 SHA-256 校验；任何内容、身份或成员变化都会终止发布。
+所有输入通过从可信 `/` 开始、逐组件 `O_NOFOLLOW` 的源 fd 复制到私有只读快照；SHA-256 与解析器消费的是同一份复制字节。行情只从该 manifest 的快照文件集合加载。计算结束后脚本重新枚举源缓存，并对全部源文件重新 stat 与 SHA-256 校验；任何内容、身份或成员变化都会终止发布。
+
+## 运行来源
+
+| 项目 | 值 |
+| --- | --- |
+| Git HEAD | `{git_provenance['head']}` |
+| Git HEAD tree | `{git_provenance['head_tree']}` |
+| 排除生成报告后的工作树是否脏 | `{str(git_provenance['dirty_excluding_generated_report']).lower()}` |
+| 工作树 diff SHA-256 | `{git_provenance['diff_sha256']}` |
+| 工作树 status SHA-256 | `{git_provenance['status_sha256']}` |
+| Python | `{runtime['python']}` |
+| NumPy | `{runtime['numpy']}` |
+| pandas | `{runtime['pandas']}` |
+
+严格 JSON 还记录了比较脚本、专项审计、配置、回测、IC 与因子库模块的逐文件 SHA-256。
 
 CLI 标准输出同时提供严格 JSON，其中 `legacy_unverified_lineage=true`、`historical_reports_rewritten=false`、`loss_conclusion_unchanged=true`。这些标志防止把 outcome 修正误解为对 legacy 特征血缘或盈利能力的认证。
 
@@ -647,63 +943,36 @@ CLI 标准输出同时提供严格 JSON，其中 `legacy_unverified_lineage=true
 - 本次没有重新训练、调参或改变正式因子方向；分数由冻结的正式表达式和既有成品特征确定，两个对照臂不重新选股。
 - 本报告不替代、不覆盖 `docs/risk/gp000_loss_attribution.md`，也不修改历史 artifacts。
 - 新一代 GP 因子不得通过 legacy adapter 进入正式训练；必须使用新的 HFQ 血缘强契约链路。
+- 报告发布与输入完整性实现依赖 POSIX `dir_fd`、`O_DIRECTORY`、`O_NOFOLLOW` 和 descriptor-relative rename；不具备这些能力的平台会在读取或写入前明确终止。
 """
     return report
 
 
-def _contains_symlink(path: Path) -> bool:
-    current = Path(path.anchor)
-    for part in path.parts[1:]:
-        current /= part
-        if current.is_symlink():
-            return True
-    return False
-
-
-def _validated_report_target(path: Path) -> Path:
-    supplied = path.expanduser()
-    if ".." in supplied.parts:
+def prevalidate_report_target(path: Path) -> ReportTarget:
+    """Bind the only allowed report path to a no-follow ancestor identity chain."""
+    if ".." in path.expanduser().parts:
         raise ValueError(
             "report output must be the designated adjustment report without traversal"
         )
-    if not supplied.is_absolute():
-        supplied = Path.cwd() / supplied
-    target = Path(os.path.abspath(supplied))
-    designated = Path(os.path.abspath(DESIGNATED_REPORT))
+    target = _absolute_lexical(path)
+    designated = _absolute_lexical(DESIGNATED_REPORT)
     if target != designated:
         raise ValueError("report output must be the designated adjustment report")
-    if _contains_symlink(target) or target.resolve(strict=False) != designated:
-        raise ValueError(
-            "report output must be the designated adjustment report without symlinks"
-        )
-    if not target.parent.is_dir():
-        raise ValueError("designated adjustment report parent directory is missing")
-    return target
-
-
-def _assert_parent_descriptor(parent: Path, descriptor: int) -> None:
-    anchored = os.fstat(descriptor)
+    parent_descriptor, parent_chain = _open_absolute_directory(target.parent)
     try:
-        current = os.stat(parent, follow_symlinks=False)
-    except OSError as error:
-        raise ValueError("designated adjustment report parent changed") from error
-    if (
-        not stat.S_ISDIR(current.st_mode)
-        or current.st_dev != anchored.st_dev
-        or current.st_ino != anchored.st_ino
-    ):
-        raise ValueError("designated adjustment report parent changed")
-
-
-def _open_designated_parent(parent: Path) -> int:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    descriptor = os.open(parent, flags)
-    try:
-        _assert_parent_descriptor(parent, descriptor)
-    except Exception:
-        os.close(descriptor)
-        raise
-    return descriptor
+        try:
+            existing = os.stat(
+                target.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and not stat.S_ISREG(existing.st_mode):
+            raise ValueError("designated adjustment report must be a regular file")
+    finally:
+        os.close(parent_descriptor)
+    return ReportTarget(target, parent_chain)
 
 
 def _existing_report_mode(parent_descriptor: int, filename: str) -> int:
@@ -720,10 +989,14 @@ def _existing_report_mode(parent_descriptor: int, filename: str) -> int:
     return stat.S_IMODE(existing.st_mode)
 
 
-def publish_report(report: str, path: Path) -> None:
+def publish_report(report: str, path: Path | ReportTarget) -> None:
     """Atomically publish only the one designated worktree repair report."""
-    target = _validated_report_target(path)
-    parent_descriptor = _open_designated_parent(target.parent)
+    validated = path if isinstance(path, ReportTarget) else prevalidate_report_target(path)
+    target = validated.path
+    parent_descriptor, _ = _open_absolute_directory(
+        target.parent,
+        expected=validated.parent_chain,
+    )
     temporary_name = f".{target.name}.{secrets.token_hex(12)}.tmp"
     temporary_descriptor: int | None = None
     try:
@@ -740,7 +1013,7 @@ def publish_report(report: str, path: Path) -> None:
             handle.write(report)
             handle.flush()
             os.fsync(handle.fileno())
-        _assert_parent_descriptor(target.parent, parent_descriptor)
+        _verify_directory_chain(validated.parent_chain)
         os.replace(
             temporary_name,
             target.name,
@@ -768,14 +1041,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    _validated_report_target(args.report)
+    report_target = prevalidate_report_target(args.report)
     payload = build_baseline_evidence(
         input_path=args.input,
         library_path=args.library,
         price_cache=args.price_cache,
         config_path=args.config,
     )
-    publish_report(render_report(payload), args.report)
+    publish_report(render_report(payload), report_target)
     print(
         json.dumps(
             payload,
