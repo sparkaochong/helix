@@ -29,6 +29,7 @@ from helix.data.event_table import (
     numeric_feature_columns,
     open_event_source,
     stream_feature_grids,
+    validate_event_parquet_fields,
 )
 from helix.eval.ic import daily_ic, summarize_ic
 from helix.gp.event_primitives import (
@@ -510,6 +511,114 @@ def test_streaming_audit_validation_projects_one_bounded_group_at_a_time(
 
     assert len(projected) == group_count
     assert max(map(len, projected)) <= 6
+
+
+def test_global_adjustment_version_mismatch_across_record_batches_has_row_context(
+    tmp_path, monkeypatch
+):
+    frame = _governed_frame()
+    frame.loc[1, "feature_adj_factor_version"] = VERSION[:-1] + "b"
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+    manifest = load_event_lineage(_write_manifest(tmp_path))
+    monkeypatch.setattr("helix.data.event_table.AUDIT_VALIDATION_BATCH_SIZE", 1)
+
+    with pytest.raises(
+        EventLineageError,
+        match=r"feat_a.*inconsistent adjustment version.*row 1.*20240103.*000002\.SZ",
+    ):
+        validate_event_parquet_fields(path, manifest, ["feat_a"], calendar=CALENDAR)
+
+
+def test_global_adjustment_version_mismatch_across_audit_groups_has_row_context(tmp_path):
+    frame = _governed_frame()
+    frame["other_source"] = frame["feature_source_date"]
+    frame["other_asof"] = frame["feature_as_of_time"]
+    frame["other_basis"] = "hfq"
+    frame["other_version"] = VERSION[:-1] + "b"
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+    payload = _manifest_dict()
+    payload["fields"]["feat_b"] = {
+        "source_date": "other_source",
+        "as_of_time": "other_asof",
+        "price_basis": "other_basis",
+        "adj_factor_version": "other_version",
+        "horizon": 0,
+    }
+    manifest = load_event_lineage(_write_manifest(tmp_path, payload))
+
+    with pytest.raises(
+        EventLineageError,
+        match=r"feat_b.*inconsistent adjustment version.*row 0.*20240102.*000001\.SZ",
+    ):
+        validate_event_parquet_fields(
+            path, manifest, ["feat_a", "feat_b"], calendar=CALENDAR
+        )
+
+
+def test_governed_panel_final_read_excludes_all_numeric_audit_groups(tmp_path, monkeypatch):
+    group_count = 459
+    data: dict[str, list] = {
+        "trade_date": ["20240102"],
+        "stock_code": ["000001.SZ"],
+        "label_h0": [1.0],
+    }
+    fields: dict[str, dict] = {}
+    audit_columns: set[str] = set()
+    feature_names: list[str] = []
+    for group in range(group_count):
+        name = f"feat_{group:03d}"
+        feature_names.append(name)
+        data[name] = [float(group)]
+        audit = {
+            "source_date": f"source_{group}",
+            "as_of_time": f"asof_{group}",
+            "price_basis": f"basis_{group}",
+            "adj_factor_version": f"version_{group}",
+            "horizon": 0,
+        }
+        fields[name] = audit
+        audit_columns.update(value for key, value in audit.items() if key != "horizon")
+        data[audit["source_date"]] = ["20240102"]
+        data[audit["as_of_time"]] = ["2024-01-02T15:00:00+08:00"]
+        data[audit["price_basis"]] = ["hfq"]
+        data[audit["adj_factor_version"]] = [VERSION]
+    fields["label_h0"] = fields["feat_000"].copy()
+    path = tmp_path / "wide-events.parquet"
+    pd.DataFrame(data).to_parquet(path, index=False)
+    lineage_path = _write_manifest(
+        tmp_path, {"schema_version": 1, "fields": fields}
+    )
+
+    validated: list[str] = []
+
+    def fake_validate(path, manifest, governed, **kwargs):
+        validated.extend(governed)
+
+    monkeypatch.setattr("helix.data.event_table.validate_event_parquet_fields", fake_validate)
+    original_read = pd.read_parquet
+    event_projections: list[set[str]] = []
+
+    def recording_read(path_arg, *args, **kwargs):
+        if Path(path_arg) == path:
+            event_projections.append(set(kwargs["columns"]))
+        return original_read(path_arg, *args, **kwargs)
+
+    monkeypatch.setattr(pd, "read_parquet", recording_read)
+
+    panel = load_event_panel(
+        path,
+        label_columns=["label_h0"],
+        feature_columns=feature_names,
+        lineage_path=lineage_path,
+    )
+
+    assert len(validated) == group_count + 1
+    assert event_projections
+    assert all(not (projection & audit_columns) for projection in event_projections)
+    assert panel.n_rows == 1
+    assert panel.field_names() == feature_names
 
 
 def test_explicit_feature_columns_reject_physical_audit_columns(tmp_path):

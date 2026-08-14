@@ -283,6 +283,7 @@ def validate_event_fields(
     train_end: str | None = None,
     state: EventLineageValidationState | None = None,
     row_offset: int = 0,
+    row_positions: Sequence[int] | None = None,
 ) -> None:
     """Validate governed HFQ lineage for every requested field and row.
 
@@ -305,8 +306,14 @@ def validate_event_fields(
         if "stock_code" in frame
         else [None] * len(row_dates_raw)
     )
+    if row_positions is not None and len(row_positions) != len(row_dates_raw):
+        raise EventLineageError("event lineage row_positions length does not match frame")
     row_contexts = [
-        _row_context(row_offset + position, value, stock_codes[position])
+        _row_context(
+            row_positions[position] if row_positions is not None else row_offset + position,
+            value,
+            stock_codes[position],
+        )
         for position, value in enumerate(row_dates_raw)
     ]
     row_dates = [

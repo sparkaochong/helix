@@ -9,6 +9,7 @@ move taken out of it.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from backtest_argus import (  # noqa: E402
     cost_rates,
     cross_sectional_z,
     gross_returns,
+    load_backtest_frame,
     net_return,
     run_book,
     target_hit,
@@ -38,6 +40,8 @@ from backtest_argus import (  # noqa: E402
 from fillability import unfillable_mask  # noqa: E402
 
 from helix.data.event_lineage import EventLineageError  # noqa: E402
+
+VERSION = "raw-times-same-day-adj-v1:" + "a" * 64
 
 
 def test_stamp_duty_is_charged_on_the_sell_side_only():
@@ -181,6 +185,92 @@ def test_backtest_rejects_event_file_as_its_own_calendar(monkeypatch):
     )
     with pytest.raises(EventLineageError, match="calendar.*independently"):
         backtest_argus.main()
+
+
+def test_backtest_final_read_excludes_all_numeric_audit_groups(tmp_path, monkeypatch):
+    group_count = 459
+    data: dict[str, list] = {
+        "trade_date": ["20240102"],
+        "stock_code": ["000001.SZ"],
+        "label_d2_hit_8pct_hfq": [1.0],
+        "label_d2_peak_return_hfq": [0.1],
+        "label_d2_return_hfq": [0.05],
+        ENTRY_HFQ: [10.0],
+        HIGH_HFQ: [11.0],
+        EXIT_HFQ: [10.5],
+        "label_px_d1_open": [10.0],
+        "label_open_gap": [0.0],
+    }
+    fields: dict[str, dict] = {}
+    audits: set[str] = set()
+    feature_names: list[str] = []
+    for group in range(group_count):
+        feature = f"feat_{group:03d}"
+        feature_names.append(feature)
+        data[feature] = [float(group)]
+        audit = {
+            "source_date": f"source_{group}",
+            "as_of_time": f"asof_{group}",
+            "price_basis": f"basis_{group}",
+            "adj_factor_version": f"version_{group}",
+            "horizon": 0,
+        }
+        fields[feature] = audit
+        audits.update(value for key, value in audit.items() if key != "horizon")
+        data[audit["source_date"]] = ["20240102"]
+        data[audit["as_of_time"]] = ["2024-01-02T15:00:00+08:00"]
+        data[audit["price_basis"]] = ["hfq"]
+        data[audit["adj_factor_version"]] = [VERSION]
+    for outcome in (
+        "label_d2_hit_8pct_hfq",
+        "label_d2_peak_return_hfq",
+        "label_d2_return_hfq",
+        ENTRY_HFQ,
+        HIGH_HFQ,
+        EXIT_HFQ,
+    ):
+        fields[outcome] = fields["feat_000"].copy()
+    event_path = tmp_path / "wide-events.parquet"
+    pd.DataFrame(data).to_parquet(event_path, index=False)
+    lineage_path = tmp_path / "lineage.json"
+    lineage_path.write_text(
+        json.dumps({"schema_version": 1, "fields": fields}), encoding="utf-8"
+    )
+    calendar_path = tmp_path / "calendar.parquet"
+    pd.DataFrame({"cal_date": ["20240102"], "is_open": [1]}).to_parquet(
+        calendar_path, index=False
+    )
+
+    validated: list[str] = []
+
+    def fake_validate(path, manifest, governed, **kwargs):
+        validated.extend(governed)
+
+    monkeypatch.setattr(backtest_argus, "validate_event_parquet_fields", fake_validate)
+    original_read = pd.read_parquet
+    event_projections: list[set[str]] = []
+
+    def recording_read(path_arg, *args, **kwargs):
+        if Path(path_arg) == event_path:
+            event_projections.append(set(kwargs["columns"]))
+        return original_read(path_arg, *args, **kwargs)
+
+    monkeypatch.setattr(pd, "read_parquet", recording_read)
+
+    frame, features, *_ = load_backtest_frame(
+        event_path,
+        lineage_path,
+        calendar_path,
+        "label_d2_hit_8pct_hfq",
+        "label_d2_peak_return_hfq",
+        "label_d2_return_hfq",
+    )
+
+    assert len(validated) == group_count + 6
+    assert features == feature_names
+    assert event_projections
+    assert all(not (projection & audits) for projection in event_projections)
+    assert frame["unfillable"].tolist() == [False]
 
 
 def _book(scores, unfillable, hit, to_close) -> pd.DataFrame:

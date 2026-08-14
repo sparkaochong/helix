@@ -53,10 +53,8 @@ from helix.data.event_lineage import (
     load_event_calendar,
     load_event_lineage,
     require_independent_event_calendar,
-    validate_event_fields,
-    validate_event_schema,
 )
-from helix.data.event_table import numeric_feature_columns
+from helix.data.event_table import numeric_feature_columns, validate_event_parquet_fields
 from helix.pipeline_events import BINARY_TARGET, PRIMARY_TARGET, RETURN_TARGET
 
 ENTRY_HFQ = "label_px_d1_open_hfq"
@@ -302,6 +300,64 @@ def run_book(scored: pd.DataFrame, hold_k: int, signal_k: int,
     return summary, daily[["date", "positions", "portfolio_return", "equity"]]
 
 
+def load_backtest_frame(
+    input_path: str,
+    lineage_path: str,
+    calendar_path: str,
+    label: str,
+    ic_target: str,
+    return_col: str,
+) -> tuple[
+    pd.DataFrame,
+    list[str],
+    dict,
+    tuple[str, ...],
+    list[str],
+    np.ndarray,
+    int,
+]:
+    """Govern the source, then retain only functional backtest columns."""
+    require_independent_event_calendar(input_path, calendar_path)
+    manifest = load_event_lineage(lineage_path)
+    calendar = load_event_calendar(calendar_path)
+    features = numeric_feature_columns(
+        input_path,
+        [label, ic_target, return_col],
+        extra_excluded=tuple(audit_column_names(manifest)),
+    )
+    price_columns = [ENTRY_HFQ, HIGH_HFQ, EXIT_HFQ]
+    governed = [*features, label, ic_target, return_col, *price_columns]
+    validate_event_parquet_fields(
+        input_path, manifest, governed, calendar=calendar
+    )
+    needed = sorted(
+        {
+            "trade_date",
+            label,
+            ic_target,
+            return_col,
+            *price_columns,
+            *REQUIRED_COLUMNS,
+            *features,
+        }
+    )
+    frame = pd.read_parquet(input_path, columns=needed)
+    source_row_count = len(frame)
+    source_positions = np.arange(source_row_count)
+    frame["trade_date"] = frame["trade_date"].astype(str)
+    frame["unfillable"] = unfillable_mask(frame)
+    complete = frame[[label, ic_target, return_col, *price_columns]].notna().all(axis=1)
+    return (
+        frame.loc[complete],
+        features,
+        manifest,
+        calendar,
+        governed,
+        source_positions[complete.to_numpy()],
+        source_row_count,
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", required=True)
@@ -354,28 +410,23 @@ def main() -> None:
     if signal_k < max(holds):
         raise SystemExit(f"--signal-k {signal_k} 小于最大持仓数 {max(holds)}，候选不够建仓")
 
-    manifest = load_event_lineage(args.lineage)
-    calendar = load_event_calendar(args.calendar)
-    features = numeric_feature_columns(
+    (
+        df,
+        features,
+        manifest,
+        calendar,
+        governed,
+        source_positions,
+        source_row_count,
+    ) = load_backtest_frame(
         args.input,
-        [args.label, args.ic_target, args.return_col],
-        extra_excluded=tuple(audit_column_names(manifest)),
+        args.lineage,
+        args.calendar,
+        args.label,
+        args.ic_target,
+        args.return_col,
     )
     price_cols = [ENTRY_HFQ, HIGH_HFQ, EXIT_HFQ]
-    governed = [*features, args.label, args.ic_target, args.return_col, *price_cols]
-    import pyarrow.parquet as pq
-
-    validate_event_schema(pq.ParquetFile(args.input).schema_arrow.names, manifest, governed)
-    governed_audits = audit_column_names(
-        {field: manifest[field] for field in governed}
-    )
-    needed = sorted({"trade_date", args.label, args.ic_target, args.return_col,
-                     *price_cols, *REQUIRED_COLUMNS, *features, *governed_audits})
-    df = pd.read_parquet(args.input, columns=needed)
-    df["trade_date"] = df["trade_date"].astype(str)
-    validate_event_fields(df, manifest, governed, calendar=calendar)
-    df["unfillable"] = unfillable_mask(df)
-    df = df.dropna(subset=[args.label, args.ic_target, args.return_col, *price_cols])
     print(f"features {len(features)}  rows {len(df):,}  rank-by {args.rank_by}")
 
     # The return column has to be the quantity the close exit actually earns, or ranking
@@ -403,8 +454,15 @@ def main() -> None:
         df, calendar, train_end=train_end, horizon=training_horizon
     )
     train = df[train_mask]
-    validate_event_fields(
-        train, manifest, governed, calendar=calendar, train_end=train_end
+    governed_training_rows = np.zeros(source_row_count, dtype=bool)
+    governed_training_rows[source_positions[train_mask]] = True
+    validate_event_parquet_fields(
+        args.input,
+        manifest,
+        governed,
+        calendar=calendar,
+        train_end=train_end,
+        row_mask=governed_training_rows,
     )
     test = df[df["trade_date"] >= test_start]
     print(f"train ~{train_end} ({len(train):,}) | test {test_start}~ ({len(test):,})")

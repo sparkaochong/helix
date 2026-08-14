@@ -15,6 +15,7 @@ include windowed operators for exactly this reason.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -196,6 +197,79 @@ def build_event_panel(
     )
 
 
+def validate_event_parquet_fields(
+    path: Path,
+    manifest: Mapping[str, EventAuditColumns],
+    fields: Sequence[str],
+    *,
+    calendar: Sequence[str] | None = None,
+    train_end: str | None = None,
+    date_column: str = DATE_COLUMN,
+    code_column: str = CODE_COLUMN,
+    row_mask: np.ndarray | None = None,
+) -> None:
+    """Validate governed parquet audits in bounded groups without retaining them."""
+    import pyarrow.parquet as pq
+
+    governed = list(dict.fromkeys(fields))
+    parquet_file = pq.ParquetFile(path)
+    validate_event_schema(parquet_file.schema_arrow.names, manifest, governed)
+    keys = pq.read_table(path, columns=[date_column, code_column]).to_pandas()
+    if row_mask is not None:
+        selected_rows = np.asarray(row_mask)
+        if selected_rows.dtype != bool or selected_rows.ndim != 1 or len(selected_rows) != len(keys):
+            raise EventLineageError(
+                "event lineage row_mask must be one-dimensional bool with one value per row"
+            )
+    else:
+        selected_rows = np.ones(len(keys), dtype=bool)
+
+    audit_groups: dict[EventAuditColumns, str] = {}
+    for governed_field in governed:
+        audit_groups.setdefault(manifest[governed_field], governed_field)
+    validation_state = EventLineageValidationState()
+    for audit, representative_field in audit_groups.items():
+        projection = list(
+            dict.fromkeys(
+                [
+                    audit.source_date,
+                    audit.as_of_time,
+                    audit.price_basis,
+                    audit.adj_factor_version,
+                ]
+            )
+        )
+        row_offset = 0
+        for batch in parquet_file.iter_batches(
+            batch_size=AUDIT_VALIDATION_BATCH_SIZE,
+            columns=projection,
+        ):
+            audit_frame = batch.to_pandas()
+            batch_end = row_offset + len(audit_frame)
+            batch_mask = selected_rows[row_offset:batch_end]
+            row_positions = np.flatnonzero(batch_mask) + row_offset
+            if row_positions.size:
+                audit_frame = audit_frame.loc[batch_mask].reset_index(drop=True)
+                key_rows = keys.iloc[row_positions]
+                audit_frame.insert(
+                    0, code_column, key_rows[code_column].to_numpy(copy=False)
+                )
+                audit_frame.insert(
+                    0, date_column, key_rows[date_column].to_numpy(copy=False)
+                )
+                validate_event_fields(
+                    audit_frame,
+                    manifest,
+                    [representative_field],
+                    calendar=calendar,
+                    train_end=train_end,
+                    state=validation_state,
+                    row_positions=row_positions,
+                )
+            row_offset = batch_end
+            del audit_frame
+
+
 def load_event_panel(
     path: Path,
     label_columns: list[str],
@@ -227,20 +301,18 @@ def load_event_panel(
     requested = list(dict.fromkeys([*feature_columns, *label_columns]))
     import pyarrow.parquet as pq
 
-    schema_names = set(pq.ParquetFile(path).schema_arrow.names)
-    validate_event_schema(schema_names, manifest, requested)
-    required_audits = audit_column_names({field: manifest[field] for field in requested})
+    validate_event_schema(pq.ParquetFile(path).schema_arrow.names, manifest, requested)
     needs_calendar = any(manifest[field].horizon > 0 for field in requested)
     calendar = (
         load_event_calendar(calendar_path)
         if calendar_path is not None or needs_calendar
         else None
     )
-    columns = list(dict.fromkeys([*meta_columns, *requested, *sorted(required_audits)]))
-    frame = pd.read_parquet(path, columns=columns)
-    validate_event_fields(
-        frame, manifest, requested, calendar=calendar, train_end=train_end
+    validate_event_parquet_fields(
+        path, manifest, requested, calendar=calendar, train_end=train_end
     )
+    columns = list(dict.fromkeys([*meta_columns, *requested]))
+    frame = pd.read_parquet(path, columns=columns)
     return build_event_panel(frame, feature_columns, label_columns)
 
 
@@ -319,59 +391,23 @@ def open_event_source(
             f"feature_columns cannot include event audit columns: {leaked_audits}"
         )
     governed = list(dict.fromkeys([*(feature_columns or []), *label_columns]))
-    parquet_file = pq.ParquetFile(path)
-    schema_names = set(parquet_file.schema_arrow.names)
-    validate_event_schema(schema_names, manifest, governed)
+    validate_event_schema(pq.ParquetFile(path).schema_arrow.names, manifest, governed)
     needs_calendar = any(manifest[field].horizon > 0 for field in governed)
     calendar = (
         load_event_calendar(calendar_path)
         if calendar_path is not None or needs_calendar
         else None
     )
+    validate_event_parquet_fields(
+        path,
+        manifest,
+        governed,
+        calendar=calendar,
+        date_column=date_column,
+        code_column=code_column,
+    )
     key_projection = list(dict.fromkeys([date_column, code_column, *label_columns]))
     keys = pq.read_table(path, columns=key_projection).to_pandas()
-    audit_groups: dict[EventAuditColumns, str] = {}
-    for governed_field in governed:
-        audit_groups.setdefault(manifest[governed_field], governed_field)
-    validation_state = EventLineageValidationState()
-    for audit, representative_field in audit_groups.items():
-        projection = list(
-            dict.fromkeys(
-                [
-                    audit.source_date,
-                    audit.as_of_time,
-                    audit.price_basis,
-                    audit.adj_factor_version,
-                ]
-            )
-        )
-        row_offset = 0
-        for batch in parquet_file.iter_batches(
-            batch_size=AUDIT_VALIDATION_BATCH_SIZE,
-            columns=projection,
-        ):
-            audit_frame = batch.to_pandas()
-            batch_end = row_offset + len(audit_frame)
-            audit_frame.insert(
-                0,
-                code_column,
-                keys[code_column].iloc[row_offset:batch_end].to_numpy(copy=False),
-            )
-            audit_frame.insert(
-                0,
-                date_column,
-                keys[date_column].iloc[row_offset:batch_end].to_numpy(copy=False),
-            )
-            validate_event_fields(
-                audit_frame,
-                manifest,
-                [representative_field],
-                calendar=calendar,
-                state=validation_state,
-                row_offset=row_offset,
-            )
-            row_offset = batch_end
-            del audit_frame
     keys["_row"] = np.arange(len(keys))
     keys = normalize_frame(keys, date_column, code_column)
     index = build_slot_index(keys, date_column, code_column)
