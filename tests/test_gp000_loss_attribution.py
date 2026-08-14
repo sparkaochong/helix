@@ -9,8 +9,10 @@ from helix.gp.library import FactorLibrary, FactorSpec
 from scripts.gp000_loss_attribution import (
     audit_adjustment_chain,
     build_price_lookup,
+    evaluate_horizon_decay,
     evaluate_monthly_returns,
     evaluate_quintiles,
+    evaluate_style_neutral_book,
     evaluate_top_k_book,
     outcome_complete_dates,
     validate_formal_factor,
@@ -162,3 +164,101 @@ def test_monthly_returns_compound_daily_returns() -> None:
 
     assert monthly.loc[0, "gross_return"] == pytest.approx(1.1 * 0.9 - 1.0)
     assert monthly.loc[1, "net_return"] == pytest.approx(0.18)
+
+
+def test_horizon_decay_uses_horizon_as_overlap_and_truncates_exit() -> None:
+    calendar = [
+        "2024-08-29",
+        "2024-08-30",
+        "2024-09-02",
+        "2024-09-03",
+        "2024-09-04",
+    ]
+    market = pd.DataFrame(
+        [
+            {
+                "trade_date": date,
+                "ts_code": code,
+                "open": 10.0 + day,
+                "high": 10.2 + day,
+                "close": 10.1 + day,
+                "adj_factor": 1.0,
+            }
+            for day, date in enumerate(calendar)
+            for code in ("A", "B")
+        ]
+    )
+    prices = build_price_lookup(market, calendar, ["A", "B"])
+    events = pd.DataFrame(
+        [
+            {"trade_date": date, "stock_code": code, "factor_score": score}
+            for date in calendar
+            for score, code in enumerate(("A", "B"), start=1)
+        ]
+    )
+
+    evidence = evaluate_horizon_decay(
+        events,
+        prices,
+        BacktestConfig(top_k=2),
+        horizons=range(1, 4),
+        min_ic_samples=2,
+    )
+
+    assert evidence["summary"]["horizon"].tolist() == [1, 2, 3]
+    assert evidence["summary"].loc[2, "d0_end"] == "2024-08-30"
+    assert evidence["daily"].query("horizon == 3")["exit_date"].max() <= "2024-09-04"
+    assert evidence["daily"].query("horizon == 3")["overlap"].eq(3).all()
+
+
+def _style_test_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    events = []
+    styles = []
+    members = []
+    for name in range(10):
+        code = f"S{name:02d}"
+        industry = "I1" if name < 5 else "I2"
+        members.append(
+            {
+                "index_code": industry,
+                "industry_name": industry,
+                "stock_code": code,
+                "in_date": "2020-01-01",
+                "out_date": np.nan,
+            }
+        )
+        for day, date in enumerate(("2024-01-02", "2024-01-03")):
+            events.append(
+                {
+                    "trade_date": date,
+                    "stock_code": code,
+                    "factor_score": float((name - 4.5) ** 2 + day * name),
+                    "gross_return": name / 100.0,
+                }
+            )
+            styles.append(
+                {
+                    "trade_date": date,
+                    "stock_code": code,
+                    "log_total_mv": float(name),
+                    "momentum_20d": float(name % 3),
+                    "volatility_20d": float(name % 4),
+                    "turnover_mean_20d": float(name % 5),
+                }
+            )
+    return pd.DataFrame(events), pd.DataFrame(styles), pd.DataFrame(members)
+
+
+def test_style_neutral_book_uses_common_mask_and_is_orthogonal() -> None:
+    events, styles, members = _style_test_inputs()
+
+    result = evaluate_style_neutral_book(
+        events,
+        styles,
+        members,
+        BacktestConfig(top_k=2),
+        min_ic_samples=2,
+    )
+
+    assert result["raw"]["n_days"] == result["style_neutral"]["n_days"]
+    assert result["orthogonality"]["max_abs_normalized_exposure"] < 1e-10

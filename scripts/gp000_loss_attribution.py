@@ -10,7 +10,10 @@ import numpy as np
 import pandas as pd
 
 from helix.config import BacktestConfig
+from helix.data.event_table import build_event_panel
 from helix.eval.backtest import _cost_rates, _net_returns, summarize_portfolio_returns
+from helix.eval.ic import daily_ic, summarize_ic
+from helix.eval.style_neutralize import build_style_design, style_residualize
 from helix.gp.library import FactorLibrary, FactorSpec
 
 TRAIN_START = "2022-01-04"
@@ -20,6 +23,12 @@ FORMAL_FACTOR = "gp_000"
 FORMAL_EXPRESSION = (
     "add(add(stock_intra_amp_d1d3_mean, "
     "div(stock_vwap_dev_d1, vol_burst_count_20d)), stock_intra_amp_d0)"
+)
+STYLE_COLUMNS = (
+    "log_total_mv",
+    "momentum_20d",
+    "volatility_20d",
+    "turnover_mean_20d",
 )
 
 
@@ -402,3 +411,282 @@ def evaluate_monthly_returns(daily: pd.DataFrame) -> pd.DataFrame:
     result["gross_equity"] = (1.0 + result["gross_return"]).cumprod()
     result["net_equity"] = (1.0 + result["net_return"]).cumprod()
     return result
+
+
+def event_grids(
+    frame: pd.DataFrame,
+    score_column: str,
+    target_column: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Pivot a long event table into aligned date-by-stock IC grids."""
+    required = {"trade_date", "stock_code", score_column, target_column}
+    missing = required - set(frame.columns)
+    if missing:
+        raise KeyError(f"event grid frame is missing: {sorted(missing)}")
+    if frame.duplicated(["trade_date", "stock_code"]).any():
+        raise ValueError("event grid contains duplicate date/stock rows")
+    dates = np.asarray(sorted(frame["trade_date"].astype(str).unique()), dtype=str)
+    codes = np.asarray(sorted(frame["stock_code"].astype(str).unique()), dtype=str)
+
+    def pivot(column: str) -> np.ndarray:
+        return (
+            frame.pivot(index="trade_date", columns="stock_code", values=column)
+            .reindex(index=dates, columns=codes)
+            .to_numpy(dtype=float)
+        )
+
+    score = pivot(score_column)
+    target = pivot(target_column)
+    mask = np.isfinite(score) & np.isfinite(target)
+    return dates, score, target, mask
+
+
+def evaluate_horizon_decay(
+    events: pd.DataFrame,
+    prices: PriceLookup,
+    config: BacktestConfig,
+    horizons: Sequence[int] = tuple(range(1, 11)),
+    *,
+    min_ic_samples: int = 30,
+) -> dict[str, pd.DataFrame]:
+    """Evaluate IC and Top-K close-return decay for D+1 through D+h."""
+    summaries: list[dict[str, object]] = []
+    daily_frames: list[pd.DataFrame] = []
+    for horizon in horizons:
+        aligned = align_event_prices(events, prices, int(horizon))
+        if aligned.empty:
+            raise ValueError(f"no outcome-complete events for D+{horizon}")
+        aligned["gross_return"] = aligned["hfq_return"]
+        _, score, target, mask = event_grids(
+            aligned,
+            "factor_score",
+            "gross_return",
+        )
+        ic_summary = summarize_ic(
+            daily_ic(score, target, mask, min_samples=min_ic_samples)
+        )
+        gross_summary, gross_daily = evaluate_top_k_book(
+            aligned,
+            config,
+            gross=True,
+            overlap=int(horizon),
+        )
+        net_summary, net_daily = evaluate_top_k_book(
+            aligned,
+            config,
+            gross=False,
+            overlap=int(horizon),
+        )
+        daily = gross_daily.rename(
+            columns={
+                "n_executed": "n_executed_gross",
+                "portfolio_return": "gross_portfolio_return",
+            }
+        ).drop(columns="n_selected")
+        net = net_daily.rename(
+            columns={
+                "n_executed": "n_executed_net",
+                "portfolio_return": "net_portfolio_return",
+            }
+        )
+        daily = daily.merge(net, on="date", validate="one_to_one")
+        exit_by_d0 = aligned.groupby("trade_date")["exit_date"].first()
+        daily["exit_date"] = daily["date"].map(exit_by_d0)
+        daily["horizon"] = int(horizon)
+        daily["overlap"] = int(horizon)
+        daily_frames.append(daily)
+        summaries.append(
+            {
+                "horizon": int(horizon),
+                "n_days": len(daily),
+                "d0_start": str(aligned["trade_date"].min()),
+                "d0_end": str(aligned["trade_date"].max()),
+                "exit_end": str(aligned["exit_date"].max()),
+                "ic_mean": ic_summary["ic_mean"],
+                "icir": ic_summary["icir"],
+                "ic_days": int(ic_summary["n_days"]),
+                "gross_per_trade": gross_summary["mean_trade_return"],
+                "net_per_trade": net_summary["mean_trade_return"],
+                "net_cagr": net_summary["cagr"],
+                "net_sharpe": net_summary["sharpe"],
+                "net_final_equity": net_summary["final_equity"],
+            }
+        )
+    return {
+        "summary": pd.DataFrame(summaries),
+        "daily": pd.concat(daily_frames, ignore_index=True),
+    }
+
+
+def align_industries(
+    keys: pd.DataFrame,
+    members: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[int, str]]:
+    """Point-in-time align SW2021 membership intervals to event rows."""
+    required = {"index_code", "industry_name", "stock_code", "in_date", "out_date"}
+    missing = required - set(members.columns)
+    if missing:
+        raise KeyError(f"industry cache is missing: {sorted(missing)}")
+    taxonomy = (
+        members[["index_code", "industry_name"]]
+        .drop_duplicates()
+        .sort_values("index_code")
+        .reset_index(drop=True)
+    )
+    taxonomy["industry_code"] = np.arange(len(taxonomy), dtype=int)
+    intervals = members.merge(taxonomy, on=["index_code", "industry_name"], how="left")
+    joined = keys.reset_index(names="_event_row").merge(
+        intervals,
+        on="stock_code",
+        how="left",
+        sort=False,
+    )
+    date = joined["trade_date"].astype(str)
+    active = (joined["in_date"].astype(str) <= date) & (
+        joined["out_date"].isna() | (date <= joined["out_date"].astype(str))
+    )
+    active_rows = joined.loc[active, ["_event_row", "industry_code"]]
+    if active_rows.duplicated("_event_row").any():
+        raise ValueError("overlapping industry memberships found for an event row")
+    aligned = keys.reset_index(drop=True).copy()
+    aligned["industry_code"] = np.nan
+    aligned.loc[
+        active_rows["_event_row"].to_numpy(dtype=int),
+        "industry_code",
+    ] = active_rows["industry_code"].to_numpy(dtype=float)
+    names = dict(
+        zip(
+            taxonomy["industry_code"].astype(int),
+            taxonomy["industry_name"].astype(str),
+            strict=True,
+        )
+    )
+    return aligned, names
+
+
+def _style_orthogonality(
+    neutral: np.ndarray,
+    continuous: np.ndarray,
+    industry: np.ndarray,
+    mask: np.ndarray,
+    levels: np.ndarray,
+) -> dict[str, float]:
+    design, valid = build_style_design(
+        continuous,
+        industry,
+        mask & np.isfinite(neutral),
+        industry_levels=levels,
+    )
+    residual = np.nan_to_num(neutral)
+    exposure = np.matmul(design.transpose(0, 2, 1), residual[..., None])[:, :, 0]
+    design_norm = np.sqrt(np.einsum("tnk,tnk->tk", design, design))
+    residual_norm = np.sqrt(np.einsum("tn,tn->t", residual, residual))
+    denominator = design_norm * residual_norm[:, None]
+    normalized = np.divide(
+        exposure,
+        denominator,
+        out=np.zeros_like(exposure),
+        where=denominator > 0,
+    )
+    counts = np.maximum(valid.sum(axis=1), 1)[:, None]
+    covariance = exposure / counts
+    return {
+        "max_abs_normalized_exposure": float(np.max(np.abs(normalized))),
+        "max_abs_covariance": float(np.max(np.abs(covariance))),
+    }
+
+
+def evaluate_style_neutral_book(
+    events: pd.DataFrame,
+    styles: pd.DataFrame,
+    members: pd.DataFrame,
+    config: BacktestConfig,
+    *,
+    min_ic_samples: int = 30,
+) -> dict[str, object]:
+    """Compare raw and date-local style-neutral scores on one common universe."""
+    style_keys = ["trade_date", "stock_code"]
+    if styles.duplicated(style_keys).any():
+        raise ValueError("style cache contains duplicate date/stock rows")
+    aligned = events.merge(styles, on=style_keys, how="left", validate="many_to_one")
+    industries, industry_names = align_industries(aligned[style_keys], members)
+    aligned["industry_code"] = industries["industry_code"].to_numpy()
+    panel = build_event_panel(
+        aligned,
+        ["factor_score", *STYLE_COLUMNS, "industry_code"],
+        ["gross_return"],
+    )
+    raw = panel.f64("factor_score")
+    target = panel.f64("gross_return")
+    continuous = np.stack([panel.f64(name) for name in STYLE_COLUMNS], axis=2)
+    industry = panel.f64("industry_code")
+    common = (
+        panel.occupied
+        & np.isfinite(raw)
+        & np.isfinite(continuous).all(axis=2)
+        & np.isfinite(industry)
+    )
+    levels = np.arange(len(industry_names), dtype=float)
+    neutral = style_residualize(
+        raw,
+        continuous,
+        industry,
+        common,
+        industry_levels=levels,
+    )
+    arms: dict[str, dict[str, float]] = {}
+    daily_frames: dict[str, pd.DataFrame] = {}
+    for name, score in {"raw": raw, "style_neutral": neutral}.items():
+        long = panel.to_long(
+            {
+                "factor_score": score,
+                "gross_return": target,
+                "common": common.astype(float),
+            }
+        )
+        long = long[long["common"] == 1.0]
+        metrics, daily = evaluate_top_k_book(
+            long,
+            config,
+            gross=False,
+            overlap=2,
+        )
+        ic = summarize_ic(
+            daily_ic(
+                score,
+                target,
+                common,
+                min_samples=min_ic_samples,
+            )
+        )
+        metrics.update(
+            {
+                "ic_mean": ic["ic_mean"],
+                "icir": ic["icir"],
+                "ic_days": ic["n_days"],
+            }
+        )
+        arms[name] = metrics
+        daily_frames[name] = daily
+    orthogonality = _style_orthogonality(
+        neutral,
+        continuous,
+        industry,
+        common,
+        levels,
+    )
+    raw_rows = panel.occupied & np.isfinite(raw)
+    orthogonality.update(
+        {
+            "style_complete_rows": int(common.sum()),
+            "raw_factor_rows": int(raw_rows.sum()),
+            "analysis_coverage_of_raw_factor": float(common.sum() / raw_rows.sum()),
+            "industry_count": len(industry_names),
+        }
+    )
+    return {
+        **arms,
+        "raw_daily": daily_frames["raw"],
+        "style_neutral_daily": daily_frames["style_neutral"],
+        "orthogonality": orthogonality,
+    }
