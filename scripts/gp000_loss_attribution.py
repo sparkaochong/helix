@@ -371,7 +371,12 @@ def apply_cost_by_d0(
     dates = np.asarray(d0_dates).astype(str)
     if values.shape != dates.shape:
         raise ValueError("returns and d0_dates must have the same shape")
-    buy, sell = _cost_rates(config, dates)
+    compact_dates = np.asarray(
+        ["".join(character for character in date if character.isdigit()) for date in dates]
+    )
+    if np.any(np.char.str_len(compact_dates) != 8):
+        raise ValueError("d0_dates must contain valid YYYY-MM-DD or YYYYMMDD dates")
+    buy, sell = _cost_rates(config, compact_dates)
     return _net_returns(values, buy, sell)
 
 

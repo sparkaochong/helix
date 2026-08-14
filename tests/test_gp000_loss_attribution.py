@@ -13,6 +13,7 @@ from helix.config import BacktestConfig
 from helix.gp.library import FactorLibrary, FactorSpec
 from scripts.gp000_loss_attribution import (
     OutputPaths,
+    apply_cost_by_d0,
     audit_adjustment_chain,
     build_price_lookup,
     evaluate_horizon_decay,
@@ -202,6 +203,24 @@ def test_monthly_returns_compound_daily_returns() -> None:
 
     assert monthly.loc[0, "gross_return"] == pytest.approx(1.1 * 0.9 - 1.0)
     assert monthly.loc[1, "net_return"] == pytest.approx(0.18)
+
+
+def test_cost_model_normalizes_dates_across_stamp_duty_cut() -> None:
+    config = BacktestConfig(
+        commission_bps=0.0,
+        transfer_bps=0.0,
+        slippage_bps=0.0,
+        stamp_sell_bps=5.0,
+        stamp_sell_bps_before_cut=10.0,
+    )
+
+    result = apply_cost_by_d0(
+        np.zeros(2),
+        np.array(["2023-08-25", "2023-08-28"]),
+        config,
+    )
+
+    assert result.tolist() == pytest.approx([-0.001, -0.0005])
 
 
 def test_horizon_decay_uses_horizon_as_overlap_and_truncates_exit() -> None:
