@@ -209,6 +209,7 @@ def test_market_panel_keeps_suspensions_and_actual_limits():
 
     assert panel["down_limit"][0].tolist() == pytest.approx([9.0, 18.0])
     assert panel["open_hfq"][0].tolist() == pytest.approx([18.0, 57.0])
+    assert panel["high_hfq"][0].tolist() == pytest.approx([18.0, 58.5])
     assert panel["is_trading"][1].tolist() == pytest.approx([1.0, 0.0])
     assert panel["limit_price_observed"][1].tolist() == pytest.approx([1.0, 0.0])
 

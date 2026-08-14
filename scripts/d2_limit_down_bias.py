@@ -228,6 +228,7 @@ def build_exit_panel(
         "high": raw_high,
         "close": raw_close,
         "open_hfq": raw_open * adj_factor,
+        "high_hfq": raw_high * adj_factor,
         "close_hfq": raw_close * adj_factor,
         "up_limit": up_limit,
         "down_limit": down_limit,
