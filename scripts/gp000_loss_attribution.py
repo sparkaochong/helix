@@ -9,6 +9,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from helix.config import BacktestConfig
+from helix.eval.backtest import _cost_rates, _net_returns, summarize_portfolio_returns
 from helix.gp.library import FactorLibrary, FactorSpec
 
 TRAIN_START = "2022-01-04"
@@ -248,3 +250,155 @@ def audit_adjustment_chain(
         "max_abs_return_delta": float(aligned["return_delta"].abs().max()),
     }
     return summary, aligned
+
+
+def apply_cost_by_d0(
+    returns: Sequence[float] | np.ndarray,
+    d0_dates: Sequence[str] | np.ndarray,
+    config: BacktestConfig,
+) -> np.ndarray:
+    """Apply the canonical date-sensitive, two-sided cost model per trade."""
+    values = np.asarray(returns, dtype=np.float64)
+    dates = np.asarray(d0_dates).astype(str)
+    if values.shape != dates.shape:
+        raise ValueError("returns and d0_dates must have the same shape")
+    buy, sell = _cost_rates(config, dates)
+    return _net_returns(values, buy, sell)
+
+
+def evaluate_quintiles(
+    frame: pd.DataFrame,
+    config: BacktestConfig,
+) -> pd.DataFrame:
+    """Calculate equal-count daily factor quintiles, Q1 low through Q5 high."""
+    required = {"trade_date", "factor_score", "gross_return"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise KeyError(f"quintile frame is missing: {sorted(missing)}")
+    work = frame.loc[
+        np.isfinite(frame["factor_score"]) & np.isfinite(frame["gross_return"])
+    ].copy()
+    work["quintile"] = work.groupby("trade_date")["factor_score"].transform(
+        lambda values: pd.qcut(
+            values.rank(method="first"),
+            5,
+            labels=False,
+        )
+        + 1
+    )
+    work["net_return"] = apply_cost_by_d0(
+        work["gross_return"].to_numpy(dtype=float),
+        work["trade_date"].to_numpy(dtype=str),
+        config,
+    )
+    aggregations: dict[str, tuple[str, str]] = {
+        "n": ("factor_score", "size"),
+        "n_dates": ("trade_date", "nunique"),
+        "gross_return": ("gross_return", "mean"),
+        "net_return": ("net_return", "mean"),
+    }
+    if "hit_hfq" in work:
+        aggregations["hit_rate"] = ("hit_hfq", "mean")
+    return (
+        work.groupby("quintile", observed=True)
+        .agg(**aggregations)
+        .reset_index()
+        .sort_values("quintile")
+        .reset_index(drop=True)
+    )
+
+
+def evaluate_top_k_book(
+    frame: pd.DataFrame,
+    config: BacktestConfig,
+    *,
+    gross: bool,
+    overlap: int,
+) -> tuple[dict[str, float], pd.DataFrame]:
+    """Evaluate a fixed-selection Top-K book with missing outcomes held as cash."""
+    if overlap < 1:
+        raise ValueError("overlap must be positive")
+    required = {"trade_date", "factor_score", "gross_return"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise KeyError(f"Top-K frame is missing: {sorted(missing)}")
+
+    rows: list[dict[str, object]] = []
+    executed_trades: list[float] = []
+    for date, block in frame.groupby("trade_date", sort=True):
+        scores = block["factor_score"].to_numpy(dtype=float)
+        eligible = np.flatnonzero(np.isfinite(scores))
+        if eligible.size < config.top_k:
+            continue
+        order = eligible[np.argsort(-scores[eligible], kind="stable")]
+        picked = block.iloc[order[: config.top_k]]
+        values = picked["gross_return"].to_numpy(dtype=float)
+        if not gross:
+            values = apply_cost_by_d0(
+                values,
+                np.repeat(str(date), len(values)),
+                config,
+            )
+        finite = values[np.isfinite(values)]
+        executed_trades.extend(finite.tolist())
+        rows.append(
+            {
+                "date": str(date),
+                "n_selected": config.top_k,
+                "n_executed": int(finite.size),
+                "portfolio_return": float(finite.sum() / config.top_k / overlap),
+            }
+        )
+
+    daily = pd.DataFrame(
+        rows,
+        columns=["date", "n_selected", "n_executed", "portfolio_return"],
+    )
+    performance = summarize_portfolio_returns(
+        daily["portfolio_return"].to_numpy(dtype=float)
+    )
+    performance["mean_trade_return"] = (
+        float(np.mean(executed_trades)) if executed_trades else float("nan")
+    )
+    performance["n_days"] = float(len(daily))
+    performance["n_trades"] = float(len(executed_trades))
+    total_selected = float(daily["n_selected"].sum())
+    performance["execution_rate"] = (
+        float(daily["n_executed"].sum() / total_selected)
+        if total_selected
+        else float("nan")
+    )
+    return performance, daily
+
+
+def evaluate_monthly_returns(daily: pd.DataFrame) -> pd.DataFrame:
+    """Compound paired gross/net daily series into a calendar-month table."""
+    required = {"date", "gross_portfolio_return", "net_portfolio_return"}
+    missing = required - set(daily.columns)
+    if missing:
+        raise KeyError(f"daily frame is missing: {sorted(missing)}")
+    if daily["date"].duplicated().any():
+        raise ValueError("daily frame contains duplicate dates")
+    work = daily.copy()
+    work["month"] = work["date"].astype(str).str[:7]
+    rows = []
+    for month, block in work.groupby("month", sort=True):
+        rows.append(
+            {
+                "month": month,
+                "n_days": len(block),
+                "gross_return": float(
+                    np.prod(1.0 + block["gross_portfolio_return"]) - 1.0
+                ),
+                "net_return": float(
+                    np.prod(1.0 + block["net_portfolio_return"]) - 1.0
+                ),
+                "day_win_rate": float((block["net_portfolio_return"] > 0).mean()),
+            }
+        )
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result.assign(gross_equity=[], net_equity=[])
+    result["gross_equity"] = (1.0 + result["gross_return"]).cumprod()
+    result["net_equity"] = (1.0 + result["net_return"]).cumprod()
+    return result

@@ -4,10 +4,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from helix.config import BacktestConfig
 from helix.gp.library import FactorLibrary, FactorSpec
 from scripts.gp000_loss_attribution import (
     audit_adjustment_chain,
     build_price_lookup,
+    evaluate_monthly_returns,
+    evaluate_quintiles,
+    evaluate_top_k_book,
     outcome_complete_dates,
     validate_formal_factor,
 )
@@ -96,3 +100,65 @@ def test_ex_right_detection_uses_adj_factor_change_on_same_stock() -> None:
     )
 
     assert prices.ex_right[:, 0].tolist() == [False, False, True]
+
+
+def _synthetic_factor_returns(days: int = 2, names: int = 10) -> pd.DataFrame:
+    rows = []
+    for day in range(days):
+        for name in range(names):
+            rows.append(
+                {
+                    "trade_date": f"2024-01-{day + 2:02d}",
+                    "stock_code": f"S{name:02d}",
+                    "factor_score": float(name),
+                    "gross_return": name / 100.0,
+                    "hit_hfq": float(name >= 8),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_quintiles_are_daily_and_ordered_low_to_high() -> None:
+    result = evaluate_quintiles(_synthetic_factor_returns(), BacktestConfig())
+
+    assert result["quintile"].tolist() == [1, 2, 3, 4, 5]
+    assert result["n"].tolist() == [4, 4, 4, 4, 4]
+    assert result.loc[4, "gross_return"] > result.loc[0, "gross_return"]
+
+
+def test_top4_missing_exit_stays_cash_without_replacement() -> None:
+    frame = pd.DataFrame(
+        {
+            "trade_date": ["2024-01-02"] * 5,
+            "stock_code": list("ABCDE"),
+            "factor_score": [5, 4, 3, 2, 1],
+            "gross_return": [0.1, np.nan, 0.03, 0.02, 9.0],
+        }
+    )
+
+    _, daily = evaluate_top_k_book(
+        frame,
+        BacktestConfig(top_k=4),
+        gross=True,
+        overlap=2,
+    )
+
+    assert daily.loc[0, "n_executed"] == 3
+    assert daily.loc[0, "portfolio_return"] == pytest.approx(
+        (0.1 + 0.03 + 0.02) / 4 / 2
+    )
+
+
+def test_monthly_returns_compound_daily_returns() -> None:
+    daily = pd.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-03", "2024-02-01"],
+            "gross_portfolio_return": [0.1, -0.1, 0.2],
+            "net_portfolio_return": [0.08, -0.12, 0.18],
+        }
+    )
+
+    monthly = evaluate_monthly_returns(daily)
+
+    assert monthly.loc[0, "gross_return"] == pytest.approx(1.1 * 0.9 - 1.0)
+    assert monthly.loc[1, "net_return"] == pytest.approx(0.18)
