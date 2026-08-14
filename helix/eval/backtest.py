@@ -36,6 +36,7 @@ import pandas as pd
 
 from ..config import BacktestConfig, LabelConfig
 from ..data.panel import Panel
+from ..data.price_lineage import PriceLineageError, require_hfq_adjustment_stamp
 from ..labels.touch_label import LabelSet
 from ..logging_setup import get_logger
 from .shared_entry_check import entry_is_fillable
@@ -328,6 +329,7 @@ def run_backtest(
     cfg: BacktestConfig,
     panel: Panel | None = None,
 ) -> BacktestResult:
+    require_hfq_adjustment_stamp(labels.adjustment, "run_backtest")
     if cfg.enable_realistic_exit:
         if cfg.exit_rule != "close":
             raise ValueError("enable_realistic_exit requires exit_rule='close'")
@@ -448,6 +450,15 @@ def _run_realistic_backtest(
         raise ValueError("realistic exit panel must align with predictions")
     if not np.array_equal(np.asarray(dates).astype(str), panel.dates.astype(str)):
         raise ValueError("realistic exit panel dates must align with backtest dates")
+    panel_adjustment = panel.require_adjusted_prices(
+        ("open_hfq", "close_hfq"), "run_backtest.realistic_exit"
+    )
+    if panel_adjustment != labels.adjustment:
+        raise PriceLineageError(
+            "run_backtest.realistic_exit: panel adj_factor_version "
+            f"{panel_adjustment.adj_factor_version!r} does not match label adj_factor_version "
+            f"{labels.adjustment.adj_factor_version!r}"
+        )
 
     candidates = candidate_mask & np.isfinite(predictions)
     scores = np.where(candidates, predictions, -np.inf)

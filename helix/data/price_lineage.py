@@ -55,6 +55,18 @@ class AdjustmentStamp:
     adj_factor_version: str
 
 
+def require_hfq_adjustment_stamp(stamp: AdjustmentStamp, purpose: str) -> AdjustmentStamp:
+    """Fail closed unless a stamp names the supported governed HFQ adjustment."""
+    price_basis = str(stamp.price_basis)
+    version = str(stamp.adj_factor_version)
+    if price_basis != HFQ_BASIS or not _VERSION_RE.fullmatch(version):
+        raise PriceLineageError(
+            f"{purpose}: unsupported adjustment stamp "
+            f"price_basis={price_basis!r}, adj_factor_version={version!r}"
+        )
+    return AdjustmentStamp(price_basis, version)
+
+
 @dataclass(frozen=True, eq=False)
 class PriceLineage:
     source_date: np.ndarray

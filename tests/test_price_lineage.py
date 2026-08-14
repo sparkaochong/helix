@@ -7,10 +7,12 @@ import pytest
 from helix.data.panel import PRICE_COLUMNS, Panel, build_adjusted_price_fields
 from helix.data.price_lineage import (
     HFQ_BASIS,
+    AdjustmentStamp,
     PriceLineage,
     PriceLineageError,
     adjustment_factor_version,
     make_hfq_lineage,
+    require_hfq_adjustment_stamp,
 )
 
 VERSION = "raw-times-same-day-adj-v1:" + "0" * 64
@@ -152,6 +154,25 @@ def test_price_lineage_rejects_malformed_or_non_point_in_time_dates(source_date,
 def test_price_lineage_rejects_unsupported_adjustment_versions(version):
     with pytest.raises(PriceLineageError):
         make_hfq_lineage(np.asarray(["20240101"]), version)
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        AdjustmentStamp("raw", VERSION),
+        AdjustmentStamp(HFQ_BASIS, ""),
+        AdjustmentStamp(HFQ_BASIS, "raw-times-same-day-adj-v1:ABC"),
+    ],
+)
+def test_adjustment_stamp_guard_rejects_ungoverned_or_invalid_stamps(stamp):
+    with pytest.raises(PriceLineageError, match=r"backtest:.*adj_factor_version"):
+        require_hfq_adjustment_stamp(stamp, "backtest")
+
+
+def test_adjustment_stamp_guard_accepts_a_governed_hfq_stamp():
+    stamp = AdjustmentStamp(HFQ_BASIS, VERSION)
+
+    assert require_hfq_adjustment_stamp(stamp, "backtest") == stamp
 
 
 def test_price_lineage_arrays_are_copied_and_immutable():
