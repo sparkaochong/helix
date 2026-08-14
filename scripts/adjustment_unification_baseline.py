@@ -41,7 +41,8 @@ DEFAULT_INPUT = ROOT / "data/raw/argus_quant_working.parquet"
 DEFAULT_LIBRARY = ROOT / "data/artifacts/argus/event_factors.json"
 DEFAULT_PRICE_CACHE = ROOT / "data/raw/d2_exit_cache"
 DEFAULT_CONFIG = ROOT / "configs/default.yaml"
-DEFAULT_REPORT = ROOT / "docs/risk/adjustment_unification_fix.md"
+DESIGNATED_REPORT = ROOT / "docs/risk/adjustment_unification_fix.md"
+DEFAULT_REPORT = DESIGNATED_REPORT
 
 EXPECTED_RAW_IC = -0.0627748063907745
 EXPECTED_HFQ_IC = -0.062899974234733
@@ -412,12 +413,39 @@ CLI 标准输出同时提供严格 JSON，其中 `legacy_unverified_lineage=true
     return report
 
 
+def _contains_symlink(path: Path) -> bool:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _validated_report_target(path: Path) -> Path:
+    supplied = path.expanduser()
+    if ".." in supplied.parts:
+        raise ValueError(
+            "report output must be the designated adjustment report without traversal"
+        )
+    if not supplied.is_absolute():
+        supplied = Path.cwd() / supplied
+    target = Path(os.path.abspath(supplied))
+    designated = Path(os.path.abspath(DESIGNATED_REPORT))
+    if target != designated:
+        raise ValueError("report output must be the designated adjustment report")
+    if _contains_symlink(target) or target.resolve(strict=False) != designated:
+        raise ValueError(
+            "report output must be the designated adjustment report without symlinks"
+        )
+    if not target.parent.is_dir():
+        raise ValueError("designated adjustment report parent directory is missing")
+    return target
+
+
 def publish_report(report: str, path: Path) -> None:
-    """Atomically publish only the new report and protect the historical report."""
-    target = path.resolve()
-    if target.name == "gp000_loss_attribution.md":
-        raise ValueError("refusing to overwrite the historical gp_000 report")
-    target.parent.mkdir(parents=True, exist_ok=True)
+    """Atomically publish only the one designated worktree repair report."""
+    target = _validated_report_target(path)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{target.name}.",
         suffix=".tmp",

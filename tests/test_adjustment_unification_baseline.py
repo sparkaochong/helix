@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+import scripts.adjustment_unification_baseline as baseline_module
 from helix.config import BacktestConfig
 from scripts.adjustment_unification_baseline import (
     EXPECTED_D0_DATES,
@@ -160,7 +161,10 @@ def test_structured_output_marks_legacy_and_unchanged_loss() -> None:
     )
 
 
-def test_render_is_read_only_and_publish_refuses_legacy_report(tmp_path: Path) -> None:
+def test_render_is_read_only_and_publish_only_accepts_designated_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     payload = build_structured_output(
         _reference_table(),
         boundary={
@@ -177,11 +181,49 @@ def test_render_is_read_only_and_publish_refuses_legacy_report(tmp_path: Path) -
     assert "目标错配是主导亏损原因" in report
     assert "复权口径问题存在，但不是核心或主导亏损原因" in report
 
-    output = tmp_path / "adjustment_unification_fix.md"
+    report_dir = tmp_path / "worktree" / "docs" / "risk"
+    report_dir.mkdir(parents=True)
+    output = report_dir / "adjustment_unification_fix.md"
+    monkeypatch.setattr(baseline_module, "DESIGNATED_REPORT", output)
+
     publish_report(report, output)
     assert output.read_text(encoding="utf-8") == report
-    with pytest.raises(ValueError, match="historical gp_000 report"):
-        publish_report(report, tmp_path / "gp000_loss_attribution.md")
+
+    historical = report_dir / "gp000_loss_attribution.md"
+    historical.write_bytes(b"historical-sentinel")
+    other_doc = report_dir / "other.md"
+    outside = tmp_path / "main-data" / "artifact.md"
+    traversal = report_dir / ".." / "risk" / output.name
+    for rejected in (other_doc, outside, historical, traversal):
+        with pytest.raises(ValueError, match="designated adjustment report"):
+            publish_report("should-not-write", rejected)
+
+    monkeypatch.setattr(
+        baseline_module,
+        "build_baseline_evidence",
+        lambda **_kwargs: payload,
+    )
+    with pytest.raises(ValueError, match="designated adjustment report"):
+        baseline_module.main(["--report", str(outside)])
+
+    assert historical.read_bytes() == b"historical-sentinel"
+    assert not other_doc.exists()
+    assert not outside.exists()
+    assert output.read_text(encoding="utf-8") == report
+
+    alias = tmp_path / "worktree" / "risk-link"
+    alias.symlink_to(report_dir, target_is_directory=True)
+    with pytest.raises(ValueError, match="designated adjustment report"):
+        publish_report("should-not-write", alias / output.name)
+    assert output.read_text(encoding="utf-8") == report
+
+    output.unlink()
+    escaped = tmp_path / "escaped-report.md"
+    escaped.write_bytes(b"outside-sentinel")
+    output.symlink_to(escaped)
+    with pytest.raises(ValueError, match="designated adjustment report"):
+        publish_report("should-not-write", output)
+    assert escaped.read_bytes() == b"outside-sentinel"
 
     parsed = json.loads(json.dumps(payload, allow_nan=False))
     assert parsed["historical_reports_rewritten"] is False

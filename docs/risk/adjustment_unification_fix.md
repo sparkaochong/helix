@@ -53,7 +53,7 @@
 | 正式 gp_000 因子库 | `/Users/aochong/code/helix/data/artifacts/argus/event_factors.json` | `6823a9e7d76caa4adcd21cd82e781d85e70407191aab9ef1835138934fb05391` |
 | D+2 行情缓存 | `/Users/aochong/code/helix/data/raw/d2_exit_cache` | `c0601a8626de4446703c210e8f5d27debc611dd1bd53291fdef7bba859bfb2c6` |
 | 成本与 Top4 配置 | `/Users/aochong/code/helix/.worktrees/adjustment-unification/configs/default.yaml` | `b209a5a2302089edf2a1dd0c3201e063c6ead2ff581f1bce63243ff1ee41f137` |
-| 本报告生成脚本 | `/Users/aochong/code/helix/.worktrees/adjustment-unification/scripts/adjustment_unification_baseline.py` | `8af6c0dcf5c2bc42370317e010e4a9144871248ec19ffafa5f722392fcbc675a` |
+| 本报告生成脚本 | `/Users/aochong/code/helix/.worktrees/adjustment-unification/scripts/adjustment_unification_baseline.py` | `d8eb7dc62066c166ece1eb358ce6438712f2639de56cdfa4fb57205735824473` |
 
 CLI 标准输出同时提供严格 JSON，其中 `legacy_unverified_lineage=true`、`historical_reports_rewritten=false`、`loss_conclusion_unchanged=true`。这些标志防止把 outcome 修正误解为对 legacy 特征血缘或盈利能力的认证。
 
