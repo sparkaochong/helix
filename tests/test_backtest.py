@@ -228,6 +228,22 @@ def test_realistic_exit_validates_labels_before_reporting_missing_panel(cfg):
         )
 
 
+def test_realistic_exit_rejects_invalid_labels_before_reporting_missing_panel(cfg):
+    labels = make_labels(
+        [[1.0]], [[10.0]], [[11.0]], adjustment=AdjustmentStamp("raw", TEST_ADJ_VERSION)
+    )
+
+    with pytest.raises(PriceLineageError, match=r"run_backtest.*raw.*adj_factor_version"):
+        run_backtest(
+            np.array([[1.0]]),
+            labels,
+            np.ones((1, 1), dtype=bool),
+            np.array(["20240101"]),
+            cfg,
+            free(top_k=1, enable_realistic_exit=True),
+        )
+
+
 def test_realistic_exit_rejects_panel_without_adjusted_price_lineage(cfg):
     panel = make_exit_panel(n_dates=5)
     panel.price_lineage.pop("close_hfq")
@@ -320,10 +336,19 @@ def test_realistic_exit_uses_hfq_prices_not_raw_ohlc_for_returns(cfg):
         panel=changed_raw,
     )
 
-    assert changed_raw_result.trades["exit_session"].tolist() == ["d2_close"]
-    assert changed_raw_result.trades["realistic_gross_return"].tolist() == pytest.approx(
-        baseline_result.trades["realistic_gross_return"].tolist()
-    )
+    baseline_trade = baseline_result.trades.iloc[0]
+    changed_raw_trade = changed_raw_result.trades.iloc[0]
+    assert baseline_result.daily["n_executed"].tolist() == [1]
+    assert changed_raw_result.daily["n_executed"].tolist() == [1]
+    assert baseline_trade["exit_session"] == changed_raw_trade["exit_session"] == "d2_close"
+    for field in (
+        "exit_index",
+        "entry_price",
+        "exit_price",
+        "realistic_gross_return",
+        "realistic_net_return",
+    ):
+        assert changed_raw_trade[field] == pytest.approx(baseline_trade[field])
 
 
 def test_realistic_mode_uses_deferred_price_and_records_trade(cfg):

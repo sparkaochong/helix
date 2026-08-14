@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -173,6 +175,23 @@ def test_adjustment_stamp_guard_accepts_a_governed_hfq_stamp():
     stamp = AdjustmentStamp(HFQ_BASIS, VERSION)
 
     assert require_hfq_adjustment_stamp(stamp, "backtest") == stamp
+
+
+def test_adjustment_stamp_guard_rejects_non_strings_that_look_valid_when_coerced():
+    class ValidLookingValue:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def __str__(self) -> str:
+            return self.value
+
+    stamp = AdjustmentStamp(
+        cast(str, ValidLookingValue(HFQ_BASIS)),
+        cast(str, ValidLookingValue(VERSION)),
+    )
+
+    with pytest.raises(PriceLineageError, match=r"backtest:.*adj_factor_version"):
+        require_hfq_adjustment_stamp(stamp, "backtest")
 
 
 def test_price_lineage_arrays_are_copied_and_immutable():
