@@ -74,18 +74,25 @@ def adjustment_factor_version(frame: pd.DataFrame) -> str:
     return f"{ADJUSTMENT_ALGORITHM}:{digest.hexdigest()}"
 
 
+def _local_date(value: str) -> str:
+    return "".join(char for char in str(value)[:10] if char.isdigit())
+
+
+def _canonical_date(value: str) -> str:
+    date = _local_date(value)
+    if len(date) != 8:
+        raise PriceLineageError(f"invalid source date {value!r}")
+    return f"{date[:4]}-{date[4:6]}-{date[6:]}"
+
+
 def make_hfq_lineage(dates: Sequence[str] | np.ndarray, version: str) -> PriceLineage:
     source_date = np.asarray(dates).astype(str)
     return PriceLineage(
         source_date=source_date,
-        as_of_time=np.asarray([f"{date}T15:00:00+08:00" for date in source_date]),
+        as_of_time=np.asarray([f"{_canonical_date(date)}T15:00:00+08:00" for date in source_date]),
         price_basis=HFQ_BASIS,
         adj_factor_version=version,
     )
-
-
-def _local_date(value: str) -> str:
-    return "".join(char for char in str(value)[:10] if char.isdigit())
 
 
 def require_hfq_lineage(

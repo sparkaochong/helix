@@ -16,9 +16,18 @@ def test_prepare_rebuilds_a_legacy_panel_without_required_provenance(monkeypatch
     shape = (2, 1)
     dates = np.asarray(["20240101", "20240102"])
     codes = np.asarray(["000001.SZ"])
-    legacy = Panel(dates=dates, codes=codes, fields={"open": np.ones(shape)})
+    legacy = Panel(
+        dates=dates,
+        codes=codes,
+        fields={
+            "open": np.ones(shape),
+            **{field: np.ones(shape) for field in pipeline.PANEL_CACHE_REQUIRED_FIELDS},
+            **{field: np.ones(shape) for field in pipeline.PANEL_CACHE_REQUIRED_ADJUSTED_FIELDS},
+        },
+    )
     panel_path = tmp_path / "cache" / "panel.npz"
     legacy.save(panel_path)
+    np.savez_compressed(panel_path.parent / "base_fields.npz", stale=np.zeros(shape))
 
     upgraded = Panel(
         dates=dates,
@@ -29,17 +38,19 @@ def test_prepare_rebuilds_a_legacy_panel_without_required_provenance(monkeypatch
     for field in ("open_hfq", "high_hfq", "low_hfq", "close_hfq"):
         upgraded.add(field, np.ones(shape), price_lineage=lineage)
     rebuilds: list[bool] = []
+    base_field_builds: list[bool] = []
 
     def fake_build_panel(*args, **kwargs):
         rebuilds.append(True)
         return upgraded
 
     monkeypatch.setattr(pipeline, "build_panel", fake_build_panel)
-    monkeypatch.setattr(
-        pipeline,
-        "compute_base_fields",
-        lambda panel: {"signal": np.ones(panel.shape)},
-    )
+
+    def fake_compute_base_fields(panel):
+        base_field_builds.append(True)
+        return {"fresh": np.ones(panel.shape)}
+
+    monkeypatch.setattr(pipeline, "compute_base_fields", fake_compute_base_fields)
     monkeypatch.setattr(
         pipeline,
         "build_universe",
@@ -54,6 +65,10 @@ def test_prepare_rebuilds_a_legacy_panel_without_required_provenance(monkeypatch
     prepared = pipeline.prepare(Config(data=DataConfig(root=tmp_path)))
 
     assert rebuilds == [True]
+    assert base_field_builds == [True]
+    assert set(prepared.fields) == {"fresh"}
     assert "limit_price_observed" in prepared.panel
     assert "limit_price_observed" in Panel.load(panel_path)
     assert Panel.load(panel_path).price_lineage["open_hfq"] == lineage
+    with np.load(panel_path.parent / "base_fields.npz", allow_pickle=False) as cached_fields:
+        assert set(cached_fields.files) == {"fresh"}

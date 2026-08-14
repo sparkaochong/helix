@@ -42,8 +42,8 @@ def test_build_adjusted_prices_uses_same_trade_date_factor_and_lineage():
     np.testing.assert_allclose(fields["open_hfq"], [[10.0], [10.0]])
     assert lineage["open_hfq"].source_date.tolist() == ["20240101", "20240102"]
     assert lineage["open_hfq"].as_of_time.tolist() == [
-        "20240101T15:00:00+08:00",
-        "20240102T15:00:00+08:00",
+        "2024-01-01T15:00:00+08:00",
+        "2024-01-02T15:00:00+08:00",
     ]
     assert lineage["open_hfq"].price_basis == HFQ_BASIS
 
@@ -110,3 +110,19 @@ def test_panel_cache_round_trips_lineage_and_subsets_it(tmp_path):
         "20240102"
     ]
     assert loaded.select_codes(np.asarray([1])).price_lineage["open_hfq"] == lineage
+
+
+def test_generated_lineage_passes_adjusted_price_guard_after_cache_round_trip(tmp_path):
+    dates = np.asarray(["20240101", "20240102"])
+    codes = np.asarray(["000001.SZ"])
+    lineage = make_hfq_lineage(dates, "raw-times-same-day-adj-v1:abc")
+    panel = Panel(dates, codes)
+    for field in ("open_hfq", "high_hfq", "low_hfq", "close_hfq"):
+        panel.add(field, np.ones((2, 1), dtype=np.float32), price_lineage=lineage)
+    path = tmp_path / "panel.npz"
+    panel.save(path)
+
+    panel.require_adjusted_prices(("open_hfq", "high_hfq", "low_hfq", "close_hfq"), "test")
+    Panel.load(path).require_adjusted_prices(
+        ("open_hfq", "high_hfq", "low_hfq", "close_hfq"), "cached test"
+    )
