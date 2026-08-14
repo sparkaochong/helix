@@ -169,6 +169,64 @@ def test_mine_cli_rejects_omitted_lineage(monkeypatch, capsys):
     assert "--lineage" in capsys.readouterr().err
 
 
+def test_mine_rejects_positive_horizon_field_discovered_as_feature(tmp_path, monkeypatch):
+    labels = list(mine_argus.DEFAULT_LABELS)
+    frame = pd.DataFrame(
+        {
+            "trade_date": ["20240102"],
+            "stock_code": ["000001.SZ"],
+            "feat_future": [1.0],
+            **{label: [0.0] for label in labels},
+            "outcome_source": ["20240104"],
+            "outcome_asof": ["2024-01-04T15:00:00+08:00"],
+            "basis": ["hfq"],
+            "version": [VERSION],
+        }
+    )
+    event_path = tmp_path / "events.parquet"
+    frame.to_parquet(event_path, index=False)
+    audit = {
+        "source_date": "outcome_source",
+        "as_of_time": "outcome_asof",
+        "price_basis": "basis",
+        "adj_factor_version": "version",
+        "horizon": 2,
+    }
+    lineage_path = tmp_path / "lineage.json"
+    lineage_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "fields": {"feat_future": audit, **{label: audit for label in labels}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    calendar_path = tmp_path / "calendar.parquet"
+    pd.DataFrame(
+        {"cal_date": ["20240102", "20240103", "20240104"], "is_open": 1}
+    ).to_parquet(calendar_path, index=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mine_argus.py",
+            "--input",
+            str(event_path),
+            "--lineage",
+            str(lineage_path),
+            "--calendar",
+            str(calendar_path),
+        ],
+    )
+    monkeypatch.setattr(
+        mine_argus, "numeric_feature_columns", lambda *args, **kwargs: ["feat_future"]
+    )
+
+    with pytest.raises(EventLineageError, match="feature.*feat_future.*horizon=0"):
+        mine_argus.main()
+
+
 def test_backtest_rejects_event_file_as_its_own_calendar(monkeypatch):
     monkeypatch.setattr(
         sys,
@@ -245,6 +303,7 @@ def test_backtest_final_read_excludes_all_numeric_audit_groups(tmp_path, monkeyp
 
     def fake_validate(path, manifest, governed, **kwargs):
         validated.extend(governed)
+        validated.extend(kwargs.get("outcome_fields", ()))
 
     monkeypatch.setattr(backtest_argus, "validate_event_parquet_fields", fake_validate)
     original_read = pd.read_parquet

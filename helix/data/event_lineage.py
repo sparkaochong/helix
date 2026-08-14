@@ -267,23 +267,33 @@ def _parse_as_of(value: Any, source: date, *, field: str, context: Any) -> datet
     return parsed
 
 
-def _row_context(position: int, trade_date: Any, stock_code: Any | None) -> str:
-    context = f"row {position} trade_date={trade_date!r}"
+def _row_context(
+    position: int,
+    trade_date: Any,
+    stock_code: Any | None,
+    *,
+    date_column: str,
+    code_column: str,
+) -> str:
+    context = f"row {position} {date_column}={trade_date!r}"
     if stock_code is not None:
-        context += f" stock_code={stock_code!r}"
+        context += f" {code_column}={stock_code!r}"
     return context
 
 
 def validate_event_fields(
     frame: pd.DataFrame,
     manifest: Mapping[str, EventAuditColumns],
-    fields: Sequence[str],
+    feature_fields: Sequence[str],
     *,
+    outcome_fields: Sequence[str] = (),
     calendar: Sequence[str] | None = None,
     train_end: str | None = None,
     state: EventLineageValidationState | None = None,
     row_offset: int = 0,
     row_positions: Sequence[int] | None = None,
+    date_column: str = "trade_date",
+    code_column: str = "stock_code",
 ) -> None:
     """Validate governed HFQ lineage for every requested field and row.
 
@@ -291,19 +301,32 @@ def validate_event_fields(
     trading calendar. Event rows and their declared outcome dates are never allowed
     to define that calendar themselves.
     """
-    requested = list(dict.fromkeys(fields))
+    features = list(dict.fromkeys(feature_fields))
+    outcomes = list(dict.fromkeys(outcome_fields))
+    overlap = sorted(set(features) & set(outcomes))
+    if overlap:
+        raise EventLineageError(
+            f"event fields cannot be both feature and outcome: {overlap}"
+        )
+    for field in features:
+        item = manifest.get(field)
+        if item is not None and item.horizon != 0:
+            raise EventLineageError(
+                f"feature field {field!r} must declare horizon=0, got {item.horizon}"
+            )
+    requested = [*features, *outcomes]
     needs_calendar = any(
         manifest.get(field) is not None and manifest[field].horizon > 0
-        for field in requested
+        for field in outcomes
     )
     if needs_calendar and calendar is None:
         raise EventLineageError("authoritative event trading calendar is required")
-    if "trade_date" not in frame:
-        raise EventLineageError("event lineage validation requires trade_date")
-    row_dates_raw = frame["trade_date"].tolist()
+    if date_column not in frame:
+        raise EventLineageError(f"event lineage validation requires {date_column}")
+    row_dates_raw = frame[date_column].tolist()
     stock_codes = (
-        frame["stock_code"].tolist()
-        if "stock_code" in frame
+        frame[code_column].tolist()
+        if code_column in frame
         else [None] * len(row_dates_raw)
     )
     if row_positions is not None and len(row_positions) != len(row_dates_raw):
@@ -313,11 +336,18 @@ def validate_event_fields(
             row_positions[position] if row_positions is not None else row_offset + position,
             value,
             stock_codes[position],
+            date_column=date_column,
+            code_column=code_column,
         )
         for position, value in enumerate(row_dates_raw)
     ]
     row_dates = [
-        _parse_date(value, field="trade_date", rule="trade_date", context=row_contexts[position])
+        _parse_date(
+            value,
+            field=date_column,
+            rule=date_column,
+            context=row_contexts[position],
+        )
         for position, value in enumerate(row_dates_raw)
     ]
     cutoff = (

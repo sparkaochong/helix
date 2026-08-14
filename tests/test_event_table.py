@@ -264,7 +264,8 @@ def test_event_field_validation_fails_closed(tmp_path, mutation, message):
         validate_event_fields(
             mutation(_governed_frame()),
             manifest,
-            ["feat_a", "label_d2_return_hfq"],
+            ["feat_a"],
+            outcome_fields=["label_d2_return_hfq"],
             calendar=CALENDAR,
         )
 
@@ -281,7 +282,8 @@ def test_event_field_validation_rejects_outcomes_beyond_training_cutoff(tmp_path
         validate_event_fields(
             _governed_frame(),
             manifest,
-            ["label_d2_return_hfq"],
+            [],
+            outcome_fields=["label_d2_return_hfq"],
             calendar=CALENDAR,
             train_end="20240103",
         )
@@ -290,7 +292,9 @@ def test_event_field_validation_rejects_outcomes_beyond_training_cutoff(tmp_path
 def test_positive_horizon_requires_independent_trading_calendar(tmp_path):
     manifest = load_event_lineage(_write_manifest(tmp_path))
     with pytest.raises(EventLineageError, match="authoritative event trading calendar is required"):
-        validate_event_fields(_governed_frame(), manifest, ["label_d2_return_hfq"])
+        validate_event_fields(
+            _governed_frame(), manifest, [], outcome_fields=["label_d2_return_hfq"]
+        )
 
 
 def test_authoritative_calendar_rejects_omitted_intervening_session():
@@ -308,7 +312,11 @@ def test_authoritative_calendar_rejects_omitted_intervening_session():
 
     with pytest.raises(EventLineageError, match="label_d1.*horizon=1.*expected 2024-01-03"):
         validate_event_fields(
-            frame, manifest, ["label_d1"], calendar=["20240102", "20240103", "20240104"]
+            frame,
+            manifest,
+            [],
+            outcome_fields=["label_d1"],
+            calendar=["20240102", "20240103", "20240104"],
         )
 
 
@@ -334,7 +342,8 @@ def test_authoritative_calendar_accepts_exact_d1_and_d2():
     validate_event_fields(
         frame,
         manifest,
-        ["label_d1", "label_d2"],
+        [],
+        outcome_fields=["label_d1", "label_d2"],
         calendar=["20240102", "20240103", "20240104"],
     )
 
@@ -457,7 +466,7 @@ def test_auto_feature_discovery_excludes_numeric_manifest_audit_sentinel(tmp_pat
     assert "numeric_audit_sentinel" not in panel.fields
 
 
-def test_streaming_audit_validation_projects_one_bounded_group_at_a_time(
+def test_streaming_audit_validation_uses_one_cell_bounded_parquet_scan(
     tmp_path, monkeypatch
 ):
     group_count = 459
@@ -493,11 +502,11 @@ def test_streaming_audit_validation_projects_one_bounded_group_at_a_time(
 
     import pyarrow.parquet as pq
 
-    projected: list[tuple[str, ...]] = []
+    projected: list[tuple[tuple[str, ...], int]] = []
     original = pq.ParquetFile.iter_batches
 
     def recording_iter_batches(parquet_file, *args, **kwargs):
-        projected.append(tuple(kwargs["columns"]))
+        projected.append((tuple(kwargs["columns"]), kwargs["batch_size"]))
         yield from original(parquet_file, *args, **kwargs)
 
     monkeypatch.setattr(pq.ParquetFile, "iter_batches", recording_iter_batches)
@@ -509,8 +518,10 @@ def test_streaming_audit_validation_projects_one_bounded_group_at_a_time(
         feature_columns=[f"feat_{group:03d}" for group in range(group_count)],
     )
 
-    assert len(projected) == group_count
-    assert max(map(len, projected)) <= 6
+    assert len(projected) == 1
+    columns, batch_size = projected[0]
+    assert len(columns) == group_count * 4
+    assert batch_size * len(columns) <= 1_000_000
 
 
 def test_global_adjustment_version_mismatch_across_record_batches_has_row_context(
@@ -595,6 +606,7 @@ def test_governed_panel_final_read_excludes_all_numeric_audit_groups(tmp_path, m
 
     def fake_validate(path, manifest, governed, **kwargs):
         validated.extend(governed)
+        validated.extend(kwargs.get("outcome_fields", ()))
 
     monkeypatch.setattr("helix.data.event_table.validate_event_parquet_fields", fake_validate)
     original_read = pd.read_parquet
@@ -663,6 +675,89 @@ def test_streaming_grids_cannot_emit_a_physical_audit_column(tmp_path):
 
     with pytest.raises(EventLineageError, match="stream.*audit.*feature_source_date"):
         list(stream_feature_grids(path, keys, index, ["feature_source_date"]))
+
+
+@pytest.mark.parametrize("requested", [["rogue_future"], ["label_d2_return_hfq"]])
+def test_streaming_grids_accept_only_validated_feature_allowlist_before_read(
+    tmp_path, monkeypatch, requested
+):
+    frame = _governed_frame().assign(rogue_future=[9.0, 10.0])
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+    index, _, keys = open_event_source(
+        path,
+        ["label_d2_return_hfq"],
+        lineage_path=_write_manifest(tmp_path),
+        calendar_path=_write_calendar(tmp_path),
+        feature_columns=["feat_a"],
+    )
+    reads: list[list[str]] = []
+
+    def forbidden_read(*args, **kwargs):
+        reads.append(kwargs.get("columns", []))
+        raise AssertionError("parquet must not be read for a rejected stream request")
+
+    monkeypatch.setattr("pyarrow.parquet.read_table", forbidden_read)
+
+    with pytest.raises(EventLineageError, match="stream.*validated feature"):
+        list(stream_feature_grids(path, keys, index, requested))
+    assert reads == []
+
+
+@pytest.mark.parametrize("loader", ["panel", "source"])
+def test_positive_horizon_field_is_rejected_when_used_as_a_feature(tmp_path, loader):
+    frame = _governed_frame()
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+    payload = _manifest_dict()
+    payload["fields"]["feat_a"] = {
+        "source_date": "outcome_source_date",
+        "as_of_time": "outcome_as_of_time",
+        "price_basis": "outcome_price_basis",
+        "adj_factor_version": "outcome_adj_factor_version",
+        "horizon": 2,
+    }
+    lineage = _write_manifest(tmp_path, payload)
+    kwargs = {
+        "lineage_path": lineage,
+        "calendar_path": _write_calendar(tmp_path),
+        "feature_columns": ["feat_a"],
+    }
+
+    with pytest.raises(EventLineageError, match="feature.*feat_a.*horizon=0"):
+        if loader == "panel":
+            load_event_panel(path, ["label_d2_return_hfq"], **kwargs)
+        else:
+            open_event_source(path, ["label_d2_return_hfq"], **kwargs)
+
+
+def test_custom_event_key_columns_are_used_by_bounded_validation(tmp_path):
+    frame = _governed_frame().rename(columns={"trade_date": "date", "stock_code": "ticker"})
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+
+    index, labels, _ = open_event_source(
+        path,
+        ["label_d2_return_hfq"],
+        date_column="date",
+        code_column="ticker",
+        lineage_path=_write_manifest(tmp_path),
+        calendar_path=_write_calendar(tmp_path),
+        feature_columns=["feat_a"],
+    )
+
+    assert index.dates.tolist() == ["20240102", "20240103"]
+    assert labels["label_d2_return_hfq"].shape == index.shape
+    panel = load_event_panel(
+        path,
+        ["label_d2_return_hfq"],
+        feature_columns=["feat_a"],
+        lineage_path=_write_manifest(tmp_path),
+        calendar_path=_write_calendar(tmp_path),
+        date_column="date",
+        code_column="ticker",
+    )
+    assert panel.dates.tolist() == ["20240102", "20240103"]
 
 
 def test_ragged_days_pack_into_slots(frame):

@@ -27,7 +27,10 @@ Appends {n_factors} mined factor columns to a long-format event table and report
 per-date IC / IC_IR for each one.
 
     python apply_factors.py --input train_dataset_merged.parquet \\
-                            --output train_dataset_with_factors.parquet
+                            --lineage event-lineage.json \\
+                            --calendar trading-calendar.parquet \\
+                            --output train_dataset_with_factors.parquet \\
+                            --output-lineage train_dataset_with_factors.lineage.json
 
 Requires only numpy / pandas / pyarrow. Factors are oriented so that a HIGHER value
 means MORE likely to reach the target.
@@ -37,7 +40,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import warnings
+from datetime import datetime, time, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -49,7 +55,179 @@ FACTORS = json.loads({factors_json!r})
 IC_TARGETS = {ic_targets}
 SEARCH_END = {search_end!r}
 
+GP_SOURCE_DATE = "gp_factor_source_date"
+GP_AS_OF_TIME = "gp_factor_as_of_time"
+GP_PRICE_BASIS = "gp_factor_price_basis"
+GP_ADJ_FACTOR_VERSION = "gp_factor_adj_factor_version"
+VERSION_RE = re.compile(r"raw-times-same-day-adj-v1:[0-9a-f]{{64}}")
+AS_OF_RE = re.compile(
+    r"[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}"
+    r"(?:\\.[0-9]+)?[+-][0-9]{{2}}:[0-9]{{2}}"
+)
+
 EPS = 1e-9
+
+
+# -------------------------------------------------------------- input governance --
+def lineage_error(message):
+    raise SystemExit("event lineage validation failed: " + message)
+
+
+def parse_date(value, field, row):
+    if type(value) is not str:
+        lineage_error("field %r source date must be a literal string at row %d" % (field, row))
+    try:
+        if re.fullmatch(r"[0-9]{{8}}", value):
+            return datetime.strptime(value, "%Y%m%d").date()
+        if re.fullmatch(r"[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}", value):
+            return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        pass
+    lineage_error("field %r has invalid source date %r at row %d" % (field, value, row))
+
+
+def parse_as_of(value, source, field, row):
+    if type(value) is not str or not AS_OF_RE.fullmatch(value):
+        lineage_error("field %r has invalid as_of_time %r at row %d" % (field, value, row))
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        lineage_error("field %r has invalid as_of_time %r at row %d" % (field, value, row))
+    if parsed.utcoffset() != timedelta(hours=8):
+        lineage_error("field %r as_of_time must use +08:00 at row %d" % (field, row))
+    if parsed.date() != source:
+        lineage_error("field %r as_of_time is not local to source_date at row %d" % (field, row))
+    if parsed.timetz().replace(tzinfo=None) > time(15):
+        lineage_error("field %r as_of_time is after market close at row %d" % (field, row))
+    return parsed
+
+
+def load_manifest(path):
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
+        lineage_error("invalid manifest %s: %s" % (path, exc))
+    if type(payload) is not dict or set(payload) != {{"schema_version", "fields"}}:
+        lineage_error("manifest root must contain exactly schema_version and fields")
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+        lineage_error("manifest schema_version must be integer 1")
+    if type(payload["fields"]) is not dict:
+        lineage_error("manifest fields must be an object")
+    required = {{"source_date", "as_of_time", "price_basis", "adj_factor_version", "horizon"}}
+    for field, entry in payload["fields"].items():
+        if type(field) is not str or not field or type(entry) is not dict or set(entry) != required:
+            lineage_error("manifest field %r has an invalid entry" % field)
+        for key in ("source_date", "as_of_time", "price_basis", "adj_factor_version"):
+            if type(entry[key]) is not str or not entry[key]:
+                lineage_error("manifest field %r %s must be a non-empty string" % (field, key))
+        if type(entry["horizon"]) is not int or entry["horizon"] < 0:
+            lineage_error("manifest field %r horizon must be an integer >= 0" % field)
+    return payload
+
+
+def load_calendar(path):
+    try:
+        calendar_path = Path(path)
+        if calendar_path.suffix.lower() in (".parquet", ".pq"):
+            frame = pd.read_parquet(calendar_path)
+        elif calendar_path.suffix.lower() == ".csv":
+            frame = pd.read_csv(calendar_path, dtype=str)
+        else:
+            lineage_error("calendar must be parquet or CSV")
+    except (OSError, UnicodeError, TypeError, ValueError) as exc:
+        lineage_error("invalid calendar %s: %s" % (path, exc))
+    date_column = "cal_date" if "cal_date" in frame else "trade_date"
+    if date_column not in frame:
+        lineage_error("calendar needs cal_date or trade_date")
+    if "is_open" in frame:
+        keep = []
+        for row, value in enumerate(frame["is_open"].tolist()):
+            valid = (
+                type(value) is str and value in {{"0", "1"}}
+            ) or (
+                type(value) in (int, float)
+                and np.isfinite(value)
+                and float(value).is_integer()
+                and int(value) in {{0, 1}}
+            )
+            if not valid:
+                lineage_error("calendar has invalid is_open %r at row %d" % (value, row))
+            keep.append(int(value) == 1)
+        frame = frame.loc[keep]
+    raw = frame[date_column].tolist()
+    parsed = [parse_date(value, "calendar", row) for row, value in enumerate(raw)]
+    if not parsed:
+        lineage_error("calendar is empty")
+    if any(right <= left for left, right in zip(parsed, parsed[1:])):
+        lineage_error("calendar sessions must be strictly increasing and unique")
+    return parsed
+
+
+def validate_governed_input(df, payload, calendar, feature_fields, outcome_fields):
+    fields = payload["fields"]
+    calendar_positions = {{session: position for position, session in enumerate(calendar)}}
+    decisions = [
+        parse_date(value, DATE_COLUMN, row)
+        for row, value in enumerate(df[DATE_COLUMN].tolist())
+    ]
+    common_version = None
+    feature_asofs = {{}}
+    for role, names in (("feature", feature_fields), ("outcome", outcome_fields)):
+        for field in names:
+            entry = fields.get(field)
+            if entry is None:
+                lineage_error("field %r has no event lineage manifest entry" % field)
+            if role == "feature" and entry["horizon"] != 0:
+                lineage_error("feature field %r must declare horizon=0" % field)
+            required = [
+                field,
+                entry["source_date"],
+                entry["as_of_time"],
+                entry["price_basis"],
+                entry["adj_factor_version"],
+            ]
+            missing = [column for column in required if column not in df]
+            if missing:
+                lineage_error("field %r is missing governed columns %s" % (field, missing))
+            parsed_asofs = []
+            rows = zip(
+                df[entry["source_date"]].tolist(),
+                df[entry["as_of_time"]].tolist(),
+                df[entry["price_basis"]].tolist(),
+                df[entry["adj_factor_version"]].tolist(),
+            )
+            for row, (source_value, as_of_value, basis, version) in enumerate(rows):
+                if type(basis) is not str or basis != "hfq":
+                    lineage_error(
+                        "field %r price_basis must be literal hfq at row %d" % (field, row)
+                    )
+                if type(version) is not str or not VERSION_RE.fullmatch(version):
+                    lineage_error(
+                        "field %r has unsupported adj_factor_version at row %d" % (field, row)
+                    )
+                if common_version is None:
+                    common_version = version
+                elif version != common_version:
+                    lineage_error(
+                        "field %r has inconsistent adjustment version at row %d" % (field, row)
+                    )
+                source = parse_date(source_value, field, row)
+                parsed_asofs.append(parse_as_of(as_of_value, source, field, row))
+                decision_position = calendar_positions.get(decisions[row])
+                if decision_position is None:
+                    lineage_error(
+                        "field %r decision date is absent from calendar at row %d" % (field, row)
+                    )
+                expected_position = decision_position + entry["horizon"]
+                expected = calendar[expected_position] if expected_position < len(calendar) else None
+                if source != expected:
+                    lineage_error(
+                        "field %r horizon=%d source mismatch at row %d: got %s expected %s"
+                        % (field, entry["horizon"], row, source, expected)
+                    )
+            if role == "feature":
+                feature_asofs[field] = parsed_asofs
+    return common_version, feature_asofs
 
 
 # --------------------------------------------------------------------- operators --
@@ -169,7 +347,16 @@ def summarize(ic):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", required=True)
+    ap.add_argument("--lineage", required=True, help="Schema-v1 lineage manifest for --input.")
+    ap.add_argument(
+        "--calendar", required=True, help="Independent authoritative trading calendar."
+    )
     ap.add_argument("--output", default="")
+    ap.add_argument(
+        "--output-lineage",
+        default="",
+        help="Lineage sidecar for --output (default: <output>.lineage.json).",
+    )
     ap.add_argument("--report", default="factor_ic_report.json")
     ap.add_argument("--min-samples", type=int, default=30)
     ap.add_argument(
@@ -180,17 +367,41 @@ def main():
     )
     args = ap.parse_args()
 
+    if Path(args.input).resolve() == Path(args.calendar).resolve():
+        lineage_error("event trading calendar must be supplied independently")
+    if args.output_lineage and not args.output:
+        ap.error("--output-lineage requires --output")
+
     df = pd.read_parquet(args.input)
     missing = [c for c in FIELD_NAMES if c not in df.columns]
     if missing:
         raise SystemExit("input is missing required feature columns: %s" % missing[:10])
+    if DATE_COLUMN not in df or CODE_COLUMN not in df:
+        lineage_error("input needs %r and %r columns" % (DATE_COLUMN, CODE_COLUMN))
+
+    payload = load_manifest(args.lineage)
+    calendar = load_calendar(args.calendar)
+    targets = [t for t in IC_TARGETS if t in df.columns]
+    common_version, feature_asofs = validate_governed_input(
+        df, payload, calendar, list(FIELD_NAMES), targets
+    )
+    audit_columns = {{GP_SOURCE_DATE, GP_AS_OF_TIME, GP_PRICE_BASIS, GP_ADJ_FACTOR_VERSION}}
+    collisions = sorted(audit_columns & set(df.columns))
+    if collisions:
+        lineage_error("output factor audit columns already exist: %s" % collisions)
+    df[GP_SOURCE_DATE] = df[DATE_COLUMN].astype(str)
+    df[GP_AS_OF_TIME] = [
+        max(values).isoformat()
+        for values in zip(*(feature_asofs[name] for name in FIELD_NAMES))
+    ]
+    df[GP_PRICE_BASIS] = "hfq"
+    df[GP_ADJ_FACTOR_VERSION] = common_version
 
     df[DATE_COLUMN] = df[DATE_COLUMN].astype(str)
     df[CODE_COLUMN] = df[CODE_COLUMN].astype(str)
     order = np.lexsort((df[CODE_COLUMN].to_numpy(), df[DATE_COLUMN].to_numpy()))
     df = df.iloc[order].reset_index(drop=True)
 
-    targets = [t for t in IC_TARGETS if t in df.columns]
     dates, date_pos, slot, occupied, grids = pack(df, list(FIELD_NAMES) + targets)
     print("packed %d dates x %d slots (%d rows)" % (len(dates), occupied.shape[1], len(df)))
 
@@ -227,8 +438,28 @@ def main():
 
     if args.output:
         df.to_parquet(args.output, index=False, compression="zstd")
+        output_lineage = args.output_lineage or (args.output + ".lineage.json")
+        factor_entry = {{
+            "source_date": GP_SOURCE_DATE,
+            "as_of_time": GP_AS_OF_TIME,
+            "price_basis": GP_PRICE_BASIS,
+            "adj_factor_version": GP_ADJ_FACTOR_VERSION,
+            "horizon": 0,
+        }}
+        output_payload = {{
+            "schema_version": 1,
+            "fields": {{
+                **payload["fields"],
+                **{{spec["name"]: dict(factor_entry) for spec in FACTORS}},
+            }},
+        }}
+        Path(output_lineage).write_text(
+            json.dumps(output_payload, indent=2, ensure_ascii=False) + "\\n",
+            encoding="utf-8",
+        )
         print("wrote %s (%d columns, +%d factors)" % (
             args.output, df.shape[1], len(FACTORS)))
+        print("wrote %s" % output_lineage)
 
 
 if __name__ == "__main__":

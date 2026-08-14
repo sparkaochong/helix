@@ -71,7 +71,17 @@ class Panel:
     def f64(self, name: str) -> np.ndarray:
         return np.asarray(self[name], dtype=np.float64)
 
+    def validate_field_shapes(self, context: str = "") -> None:
+        """Fail before numpy can broadcast a malformed cached or injected field."""
+        for name in sorted(self.fields):
+            actual = self.fields[name].shape
+            if actual != self.shape:
+                raise PriceLineageError(
+                    f"{context}field {name!r} has shape {actual}, expected {self.shape}"
+                )
+
     def require_adjusted_prices(self, fields: tuple[str, ...], purpose: str) -> AdjustmentStamp:
+        self.validate_field_shapes()
         missing = [field for field in fields if field not in self]
         if missing:
             raise PriceLineageError(f"{purpose}: missing adjusted price fields {missing}")
@@ -114,7 +124,9 @@ class Panel:
             lineage[f"{prefix}as_of_time"] = np.asarray(item.as_of_time, dtype=str)
             lineage[f"{prefix}price_basis"] = np.asarray(item.price_basis, dtype=str)
             lineage[f"{prefix}adj_factor_version"] = np.asarray(item.adj_factor_version, dtype=str)
-        np.savez_compressed(path, dates=self.dates, codes=self.codes, **self.fields, **lineage)
+        np.savez_compressed(
+            path, dates=self.dates, codes=self.codes, **self.fields, **lineage  # type: ignore[arg-type]
+        )
         log.info("panel cached to %s (%d dates x %d codes)", path, *self.shape)
 
     @classmethod
@@ -140,7 +152,9 @@ class Panel:
                     price_basis=str(z[f"{prefix}price_basis"]),
                     adj_factor_version=str(z[f"{prefix}adj_factor_version"]),
                 )
-        return cls(dates=dates, codes=codes, fields=fields, price_lineage=lineage)
+        panel = cls(dates=dates, codes=codes, fields=fields, price_lineage=lineage)
+        panel.validate_field_shapes("cached ")
+        return panel
 
 
 def _pivot(df: pd.DataFrame, value: str, dates: np.ndarray, codes: np.ndarray) -> np.ndarray:

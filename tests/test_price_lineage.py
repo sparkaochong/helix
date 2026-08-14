@@ -289,3 +289,46 @@ def test_generated_lineage_passes_adjusted_price_guard_after_cache_round_trip(tm
     Panel.load(path).require_adjusted_prices(
         ("open_hfq", "high_hfq", "low_hfq", "close_hfq"), "cached test"
     )
+
+
+@pytest.mark.parametrize("field", ["open_hfq", "ordinary_feature"])
+def test_panel_cache_rejects_every_malformed_field_shape(tmp_path, field):
+    dates = np.asarray(["20240101", "20240102"])
+    codes = np.asarray(["000001.SZ", "000002.SZ"])
+    lineage = make_hfq_lineage(dates, VERSION)
+    panel = Panel(dates, codes)
+    panel.add("open_hfq", np.ones((2, 2), dtype=np.float32), price_lineage=lineage)
+    panel.add("ordinary_feature", np.ones((2, 2), dtype=np.float32))
+    path = tmp_path / "panel.npz"
+    panel.save(path)
+    with np.load(path, allow_pickle=False) as cache:
+        payload = {name: cache[name] for name in cache.files}
+    payload[field] = np.ones((2, 1), dtype=np.float32)
+    np.savez_compressed(path, **payload)
+
+    with pytest.raises(
+        PriceLineageError,
+        match=rf"cached field {field!r} has shape \(2, 1\), expected \(2, 2\)",
+    ):
+        Panel.load(path)
+
+
+def test_adjusted_price_guard_checks_all_panel_field_shapes_before_lineage():
+    dates = np.asarray(["20240101", "20240102"])
+    codes = np.asarray(["000001.SZ", "000002.SZ"])
+    lineage = make_hfq_lineage(dates, VERSION)
+    panel = Panel(
+        dates,
+        codes,
+        fields={
+            "open_hfq": np.ones((2, 2), dtype=np.float32),
+            "malformed_non_hfq": np.ones((2, 1), dtype=np.float32),
+        },
+        price_lineage={"open_hfq": lineage},
+    )
+
+    with pytest.raises(
+        PriceLineageError,
+        match=r"field 'malformed_non_hfq' has shape \(2, 1\), expected \(2, 2\)",
+    ):
+        panel.require_adjusted_prices(("open_hfq",), "test")

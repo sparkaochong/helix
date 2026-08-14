@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -268,7 +269,8 @@ def run_book(scored: pd.DataFrame, hold_k: int, signal_k: int,
     # them. Mixing the two would let a threshold flatter its own per-trade number by
     # sitting out the days it expected to lose, while the equity curve says otherwise.
     traded = daily[daily["positions"] > 0]
-    hit, base = float(traded["hit_rate"].mean()), float(daily["base_rate"].mean())
+    mean_hit = float(traded["hit_rate"].mean())
+    mean_base = float(daily["base_rate"].mean())
     years = len(daily) / TRADING_DAYS
     final = float(daily["equity"].iloc[-1])
     summary = {
@@ -280,9 +282,9 @@ def run_book(scored: pd.DataFrame, hold_k: int, signal_k: int,
         # unfillable, the shortlist is doing the work and its depth is a real assumption.
         "avg_fill_depth": round(float(traded["fill_depth"].mean()), 3),
         "short_day_rate": round(float(traded["short"].mean()), 6),
-        "hit_rate": round(hit, 6),
-        "base_rate": round(base, 6),
-        "lift": round(hit / max(base, 1e-12), 4),
+        "hit_rate": round(mean_hit, 6),
+        "base_rate": round(mean_base, 6),
+        "lift": round(mean_hit / max(mean_base, 1e-12), 4),
         "win_to_close": round(float(traded["win_to_close"].mean()), 6),
         "loss_to_close": round(float(traded["loss_to_close"].mean()), 6),
         "gross_per_trade": round(float(traded["gross_return"].mean()), 6),
@@ -318,17 +320,23 @@ def load_backtest_frame(
 ]:
     """Govern the source, then retain only functional backtest columns."""
     require_independent_event_calendar(input_path, calendar_path)
+    source_path = Path(input_path)
     manifest = load_event_lineage(lineage_path)
     calendar = load_event_calendar(calendar_path)
     features = numeric_feature_columns(
-        input_path,
+        source_path,
         [label, ic_target, return_col],
         extra_excluded=tuple(audit_column_names(manifest)),
     )
     price_columns = [ENTRY_HFQ, HIGH_HFQ, EXIT_HFQ]
-    governed = [*features, label, ic_target, return_col, *price_columns]
+    outcomes = [label, ic_target, return_col, *price_columns]
+    governed = [*features, *outcomes]
     validate_event_parquet_fields(
-        input_path, manifest, governed, calendar=calendar
+        source_path,
+        manifest,
+        features,
+        outcome_fields=outcomes,
+        calendar=calendar,
     )
     needed = sorted(
         {
@@ -341,7 +349,7 @@ def load_backtest_frame(
             *features,
         }
     )
-    frame = pd.read_parquet(input_path, columns=needed)
+    frame = pd.read_parquet(source_path, columns=needed)
     source_row_count = len(frame)
     source_positions = np.arange(source_row_count)
     frame["trade_date"] = frame["trade_date"].astype(str)
@@ -459,7 +467,8 @@ def main() -> None:
     validate_event_parquet_fields(
         args.input,
         manifest,
-        governed,
+        features,
+        outcome_fields=[field for field in governed if field not in features],
         calendar=calendar,
         train_end=train_end,
         row_mask=governed_training_rows,

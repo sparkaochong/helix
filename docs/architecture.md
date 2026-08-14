@@ -300,9 +300,13 @@ helix run       # 一条龙
 **事件表脚本**：
 
 ```bash
-python scripts/mine_argus.py --input train.parquet --out artifacts \
+python scripts/mine_argus.py --input train.parquet \
+       --lineage train.lineage.json --calendar calendar.parquet --out artifacts \
        --n-features 70 --rounds 5 --neutralize-base 8
-python artifacts/apply_factors.py --input train.parquet --output train_with_factors.parquet
+python artifacts/apply_factors.py --input train.parquet \
+       --lineage train.lineage.json --calendar calendar.parquet \
+       --output train_with_factors.parquet \
+       --output-lineage train_with_factors.lineage.json
 ```
 
 `--rounds K` 让每一轮把已找到的因子加进中性化基，逼出互不相关的因子。

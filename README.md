@@ -49,10 +49,14 @@ Helix 有两个后端，共用同一套算子、指标、切分纪律和 GP 引�
 这条通路的产出是**因子列**：`helix/gp/export.py` 生成一个只依赖 numpy/pandas/pyarrow 的独立脚本，直接在训练机上给数据集追加列并输出 IC/ICIR 报告。
 
 ```bash
-python scripts/mine_argus.py --input train.parquet --out artifacts \
+python scripts/mine_argus.py --input train.parquet \
+       --lineage train.lineage.json --calendar calendar.parquet --out artifacts \
        --n-features 70 --rounds 5 --neutralize-base 8
 # 然后把 artifacts/apply_factors.py 拷到训练机
-python apply_factors.py --input train.parquet --output train_with_factors.parquet
+python apply_factors.py --input train.parquet \
+       --lineage train.lineage.json --calendar calendar.parquet \
+       --output train_with_factors.parquet \
+       --output-lineage train_with_factors.lineage.json
 ```
 
 ---
@@ -304,7 +308,8 @@ GP 在这类场景下唯一的独特贡献本该是**截面算子**——树模�
 复现：
 
 ```bash
-python scripts/backtest_argus.py --input train.parquet --rank-by classify \
+python scripts/backtest_argus.py --input train.parquet \
+    --lineage train.lineage.json --calendar calendar.parquet --rank-by classify \
     --hold-grid 1,2,3,4,5,8,12,20 --signal-k 25 --daily-out daily_holds.csv
 python scripts/window_stats.py --input daily_holds.csv --hold 4 --exit close --slippage 10
 ```
