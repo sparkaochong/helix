@@ -149,6 +149,35 @@ def test_hit_rounding_mismatch_is_separate_from_adjustment_flip() -> None:
     assert audit["event_label_to_hfq_hit_difference_count"] == 1
 
 
+def test_constant_adjustment_factor_cannot_create_threshold_hit_flip() -> None:
+    events = pd.DataFrame(
+        {
+            "trade_date": ["2024-05-10"],
+            "stock_code": ["000001.SZ"],
+            "label_px_d1_open": [10.0],
+            "label_px_d2_high": [10.8],
+            "label_px_d2_close": [10.0],
+            "label_d2_return": [0.0],
+            "label_d2_hit_8pct": [1.0],
+        }
+    )
+    market = _market_for_adjustment_test().assign(
+        open=[9.8, 10.0, 10.0],
+        high=[10.0, 10.2, 10.8],
+        close=[9.9, 10.0, 10.0],
+        adj_factor=1.03,
+    )
+    prices = build_price_lookup(
+        market,
+        ["2024-05-10", "2024-05-13", "2024-05-14"],
+        ["000001.SZ"],
+    )
+
+    audit, _ = audit_adjustment_chain(events, prices)
+
+    assert audit["hit_flip_count"] == 0
+
+
 def test_ex_right_diagnostics_include_robust_control_and_top4_contribution() -> None:
     rows = []
     for day, date in enumerate(("2024-01-02", "2024-01-03")):
@@ -288,11 +317,11 @@ def test_cost_model_rejects_noncanonical_or_impossible_dates() -> None:
         apply_cost_by_d0([0.0], ["2023-02-30"], BacktestConfig())
 
 
-def test_audit_loads_effective_backtest_config_from_yaml(tmp_path: Path) -> None:
+def test_audit_requires_formal_top4_but_loads_effective_costs(tmp_path: Path) -> None:
     config_path = tmp_path / "audit.yaml"
     config_path.write_text(
         "backtest:\n"
-        "  top_k: 7\n"
+        "  top_k: 4\n"
         "  exit_rule: close\n"
         "  commission_bps: 3.0\n",
         encoding="utf-8",
@@ -300,8 +329,12 @@ def test_audit_loads_effective_backtest_config_from_yaml(tmp_path: Path) -> None
 
     config = load_audit_config(config_path)
 
-    assert config.top_k == 7
+    assert config.top_k == 4
     assert config.commission_bps == 3.0
+
+    config_path.write_text("backtest:\n  top_k: 7\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Top4"):
+        load_audit_config(config_path)
 
 
 def test_horizon_decay_uses_horizon_as_overlap_and_truncates_exit() -> None:
@@ -501,11 +534,55 @@ def _minimal_evidence() -> dict[str, object]:
         "预期指标变化": "消除错配",
         "不承诺效果": "不承诺转正",
     }
+    finite_factor_diagnostics = pd.DataFrame(
+        [
+            {
+                "sample": sample,
+                "n_events": 1,
+                "n_stocks": 1,
+                "factor_percentile_median": 0.5,
+                "factor_abs_robust_z_p95": 1.0,
+                "factor_abs_robust_z_max": 1.0,
+                "factor_robust_tail_rate": 0.0,
+                "prior_event_jump_abs_median": 0.1,
+                "prior_event_jump_abs_p95": 0.1,
+            }
+            for sample in ("D0除权", "D0非除权")
+        ]
+    )
+    finite_return_errors = pd.DataFrame(
+        [
+            {
+                "sample": sample,
+                "n_events": 1,
+                "n_stocks": 1,
+                "return_delta_mean": 0.0,
+                "return_delta_median": 0.0,
+                "return_delta_abs_p95": 0.0,
+                "return_delta_abs_max": 0.0,
+                "hit_flip_count": 0,
+                "adjustment_hit_flip_count": 0,
+                "equal_factor_hit_flip_count": 0,
+            }
+            for sample in ("全样本", "D+2除权", "D+2非除权")
+        ]
+    )
     return {
         "metadata": {
             "command": "PYTHONPATH=. .venv/bin/python scripts/gp000_loss_attribution.py",
             "train_start": "2022-01-04",
             "train_end": "2024-09-04",
+            "formal_factor": "gp_000",
+            "formal_expression": "formal expression",
+            "formal_sign": 1.0,
+            "calendar_digest": "a" * 64,
+            "input_sha256": "b" * 64,
+            "library_sha256": "c" * 64,
+            "config_sha256": "d" * 64,
+            "price_cache_sha256": "e" * 64,
+            "style_market_sha256": "f" * 64,
+            "industries_sha256": "0" * 64,
+            "effective_backtest": BacktestConfig().model_dump(),
         },
         "summary": "复权口径存在跨路径错配，但不是亏损核心原因。",
         "adjustment_matrix": pd.DataFrame(
@@ -513,6 +590,37 @@ def _minimal_evidence() -> dict[str, object]:
         ),
         "adjustment_stats": pd.DataFrame([{"指标": "收益错配数", "值": 1}]),
         "ex_right_samples": pd.DataFrame([{"trade_date": "2024-01-03", "n": 1}]),
+        "ex_right_counts": pd.DataFrame(
+            [
+                {"stage": stage, "n_events": 1, "n_stocks": 1}
+                for stage in ("D0", "D+1", "D+2")
+            ]
+        ),
+        "ex_right_factor_diagnostics": finite_factor_diagnostics,
+        "ex_right_return_errors": finite_return_errors,
+        "ex_right_top4_summary": {
+            "selected_trades": 4,
+            "selected_any_ex_right": 1,
+            "selected_holding_ex_right": 1,
+            "hfq_minus_raw_book_return_sum": 0.0,
+        },
+        "ex_right_portfolio_comparison": pd.DataFrame(
+            [
+                {
+                    "价格口径": price_basis,
+                    "成本口径": cost_basis,
+                    "CAGR": -0.1,
+                    "夏普": -0.2,
+                    "单笔收益": -0.001,
+                    "累计净值": 0.8,
+                    "最大回撤": -0.2,
+                    "执行率": 1.0,
+                    "交易日": 2,
+                }
+                for price_basis in ("raw", "HFQ")
+                for cost_basis in ("毛收益", "净收益")
+            ]
+        ),
         "quintiles": pd.DataFrame(
             [
                 {
@@ -524,6 +632,12 @@ def _minimal_evidence() -> dict[str, object]:
                 for quintile in range(1, 6)
             ]
         ),
+        "quintile_monotonicity": {
+            "q5_minus_q1_gross": -0.004,
+            "q5_minus_q1_net": -0.008,
+            "gross_spearman": -1.0,
+            "net_spearman": -1.0,
+        },
         "cost_split": pd.DataFrame(
             [
                 {
@@ -543,6 +657,9 @@ def _minimal_evidence() -> dict[str, object]:
                 [
                     {
                         "horizon": horizon,
+                        "n_d0": 1,
+                        "d0_end": "2024-01-02",
+                        "exit_end": "2024-01-03",
                         "ic_mean": -0.1,
                         "net_per_trade": -0.001,
                         "net_cagr": -0.1,
@@ -669,6 +786,94 @@ def test_invalid_evidence_writes_no_partial_outputs(tmp_path: Path) -> None:
     assert not any(path.exists() for path in vars(paths).values())
 
 
+@pytest.mark.parametrize(
+    "missing_section",
+    [
+        "ex_right_counts",
+        "ex_right_factor_diagnostics",
+        "ex_right_return_errors",
+        "ex_right_top4_summary",
+        "ex_right_portfolio_comparison",
+        "quintile_monotonicity",
+    ],
+)
+def test_missing_core_audit_contract_refuses_publish(
+    tmp_path: Path,
+    missing_section: str,
+) -> None:
+    evidence = _minimal_evidence()
+    del evidence[missing_section]
+    paths = OutputPaths(
+        report=tmp_path / "report.md",
+        json=tmp_path / "evidence.json",
+        daily=tmp_path / "daily.parquet",
+        equity_svg=tmp_path / "equity.svg",
+        decay_svg=tmp_path / "decay.svg",
+    )
+
+    with pytest.raises(ValueError, match="required"):
+        write_outputs(evidence, paths)
+
+
+def test_daily_artifact_requires_four_matching_arms_per_horizon(tmp_path: Path) -> None:
+    evidence = _minimal_evidence()
+    artifact = evidence["daily_artifact"]
+    evidence["daily_artifact"] = artifact.loc[
+        ~(
+            artifact["horizon"].eq(3)
+            & artifact["score_basis"].eq("style_neutral")
+            & artifact["cost_basis"].eq("net")
+        )
+    ]
+    paths = OutputPaths(
+        report=tmp_path / "report.md",
+        json=tmp_path / "evidence.json",
+        daily=tmp_path / "daily.parquet",
+        equity_svg=tmp_path / "equity.svg",
+        decay_svg=tmp_path / "decay.svg",
+    )
+
+    with pytest.raises(ValueError, match="four arms"):
+        write_outputs(evidence, paths)
+
+
+def test_daily_artifact_arm_dates_must_match_decay_boundary(tmp_path: Path) -> None:
+    evidence = _minimal_evidence()
+    artifact = evidence["daily_artifact"]
+    extra = artifact.loc[
+        artifact["horizon"].eq(2)
+        & artifact["score_basis"].eq("raw_common")
+        & artifact["cost_basis"].eq("gross")
+    ].copy()
+    extra["date"] = "2024-01-03"
+    evidence["daily_artifact"] = pd.concat([artifact, extra], ignore_index=True)
+    paths = OutputPaths(
+        report=tmp_path / "report.md",
+        json=tmp_path / "evidence.json",
+        daily=tmp_path / "daily.parquet",
+        equity_svg=tmp_path / "equity.svg",
+        decay_svg=tmp_path / "decay.svg",
+    )
+
+    with pytest.raises(ValueError, match="arm dates"):
+        write_outputs(evidence, paths)
+
+
+def test_missing_input_hash_refuses_publish(tmp_path: Path) -> None:
+    evidence = _minimal_evidence()
+    del evidence["metadata"]["config_sha256"]
+    paths = OutputPaths(
+        report=tmp_path / "report.md",
+        json=tmp_path / "evidence.json",
+        daily=tmp_path / "daily.parquet",
+        equity_svg=tmp_path / "equity.svg",
+        decay_svg=tmp_path / "decay.svg",
+    )
+
+    with pytest.raises(ValueError, match="input hashes"):
+        write_outputs(evidence, paths)
+
+
 def test_output_publish_failure_restores_previous_artifact_set(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -700,6 +905,38 @@ def test_output_publish_failure_restores_previous_artifact_set(
         write_outputs(evidence, paths)
 
     assert {path: path.read_bytes() for path in vars(paths).values()} == before
+
+
+def test_output_rollback_failure_retains_recovery_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = OutputPaths(
+        report=tmp_path / "report.md",
+        json=tmp_path / "evidence.json",
+        daily=tmp_path / "daily.parquet",
+        equity_svg=tmp_path / "equity.svg",
+        decay_svg=tmp_path / "decay.svg",
+    )
+    evidence = _minimal_evidence()
+    write_outputs(evidence, paths)
+    original_replace = audit_module.os.replace
+    calls = 0
+
+    def fail_publish_and_restore(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls in {2, 3}:
+            raise OSError("simulated replacement failure")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(audit_module.os, "replace", fail_publish_and_restore)
+    evidence["summary"] = "new summary"
+
+    with pytest.raises(RuntimeError, match="backups retained"):
+        write_outputs(evidence, paths)
+
+    assert list(tmp_path.glob("*.bak"))
 
 
 def test_training_calendar_requires_approved_bounds_count_and_digest() -> None:

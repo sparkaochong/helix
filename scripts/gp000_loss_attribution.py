@@ -96,6 +96,8 @@ class OutputPaths:
 def load_audit_config(path: Path) -> BacktestConfig:
     """Load the effective backtest settings and reject unsupported execution modes."""
     config = Config.load(path).backtest
+    if config.top_k != 4:
+        raise ValueError("gp000 loss-attribution audit is a fixed Top4 contract")
     if config.exit_rule != "close" or config.enable_realistic_exit:
         raise ValueError(
             "gp000 audit supports close exit with enable_realistic_exit=false only"
@@ -349,10 +351,20 @@ def audit_adjustment_chain(
 
     aligned["return_delta"] = aligned["hfq_return"] - aligned["raw_return"]
     aligned["raw_hit"] = aligned["label_d2_hit_8pct"].astype(bool)
-    aligned["reconstructed_raw_hit"] = (
-        aligned["raw_exit_high"] >= aligned["raw_entry"] * 1.08
+    with np.errstate(invalid="ignore", divide="ignore"):
+        aligned["reconstructed_raw_hit"] = (
+            aligned["raw_exit_high"] / aligned["raw_entry"] >= 1.08 - 1e-12
+        )
+        aligned["hfq_hit"] = (
+            aligned["hfq_exit_high"] / aligned["hfq_entry"] >= 1.08 - 1e-12
+        )
+    aligned["holding_adj_factor_changed"] = ~np.isclose(
+        aligned["entry_adj_factor"],
+        aligned["exit_adj_factor"],
+        rtol=0.0,
+        atol=1e-12,
+        equal_nan=False,
     )
-    aligned["hfq_hit"] = aligned["hfq_exit_high"] >= aligned["hfq_entry"] * 1.08
     return_rounding_error = (
         aligned["label_d2_return"] - aligned["raw_return"]
     ).abs()
@@ -370,6 +382,7 @@ def audit_adjustment_chain(
         atol=1e-12,
         equal_nan=True,
     )
+    hit_flip = aligned["reconstructed_raw_hit"] != aligned["hfq_hit"]
     summary: dict[str, object] = {
         "event_prices_match_raw": price_matches,
         "event_returns_match_raw": bool(raw_return_matches.all()),
@@ -378,8 +391,12 @@ def audit_adjustment_chain(
             (aligned["raw_hit"] != aligned["reconstructed_raw_hit"]).sum()
         ),
         "return_mismatch_count": int(return_mismatch.sum()),
-        "hit_flip_count": int(
-            (aligned["reconstructed_raw_hit"] != aligned["hfq_hit"]).sum()
+        "hit_flip_count": int(hit_flip.sum()),
+        "adjustment_hit_flip_count": int(
+            (hit_flip & aligned["holding_adj_factor_changed"]).sum()
+        ),
+        "equal_factor_hit_flip_count": int(
+            (hit_flip & ~aligned["holding_adj_factor_changed"]).sum()
         ),
         "event_label_to_hfq_hit_difference_count": int(
             (aligned["raw_hit"] != aligned["hfq_hit"]).sum()
@@ -1183,6 +1200,8 @@ def _factor_sample_diagnostics(
 
 def _return_error_row(frame: pd.DataFrame, sample: str) -> dict[str, object]:
     delta = frame["return_delta"]
+    hit_flip = frame["reconstructed_raw_hit"] != frame["hfq_hit"]
+    factor_changed = frame.get("holding_adj_factor_changed", frame["exit_ex_right"])
     return {
         "sample": sample,
         "n_events": len(frame),
@@ -1191,9 +1210,9 @@ def _return_error_row(frame: pd.DataFrame, sample: str) -> dict[str, object]:
         "return_delta_median": delta.median(),
         "return_delta_abs_p95": delta.abs().quantile(0.95),
         "return_delta_abs_max": delta.abs().max(),
-        "hit_flip_count": int(
-            (frame["reconstructed_raw_hit"] != frame["hfq_hit"]).sum()
-        ),
+        "hit_flip_count": int(hit_flip.sum()),
+        "adjustment_hit_flip_count": int((hit_flip & factor_changed).sum()),
+        "equal_factor_hit_flip_count": int((hit_flip & ~factor_changed).sum()),
     }
 
 
@@ -1324,7 +1343,7 @@ def evaluate_ex_right_samples(
             / config.top_k
             / 2
         ),
-        "hfq_minus_raw_trade_mean_on_holding_ex_right": float(
+        "hfq_minus_raw_trade_return_mean_on_holding_ex_right": float(
             selected.loc[selected_holding, "return_delta"].mean()
         ),
         "hfq_minus_raw_book_return_sum": float(
@@ -1584,7 +1603,11 @@ def build_evidence(
             {
                 "指标": "event hit 与 raw 高价重算不一致",
                 "值": adjustment["event_raw_hit_mismatch_count"],
-                "结论": "阈值/舍入口径差异，需同时修复",
+                "结论": (
+                    "原始标签与价格比率重算一致"
+                    if adjustment["event_raw_hit_mismatch_count"] == 0
+                    else "阈值/舍入口径差异，需同时修复"
+                ),
             },
             {
                 "指标": "raw/HFQ 收益不同样本",
@@ -1592,9 +1615,19 @@ def build_evidence(
                 "结论": "复权错配影响范围",
             },
             {
-                "指标": "8% hit 翻转样本",
+                "指标": "8% hit 复权真实翻转样本",
+                "值": adjustment["adjustment_hit_flip_count"],
+                "结论": "仅计持有期 adj_factor 变化且 raw/HFQ 结果不同",
+            },
+            {
+                "指标": "8% hit 同因子数值翻转样本",
+                "值": adjustment["equal_factor_hit_flip_count"],
+                "结论": "价格比率 + 1e-12 阈值容差后应为 0",
+            },
+            {
+                "指标": "8% hit raw/HFQ 总翻转样本",
                 "值": adjustment["hit_flip_count"],
-                "结论": "仅计 raw 重算与 HFQ 的真实复权翻转",
+                "结论": "真实复权翻转与同因子数值翻转之和",
             },
             {
                 "指标": "持有期含除权事件",
@@ -1613,7 +1646,7 @@ def build_evidence(
             },
             {
                 "指标": "D0 除权因子 robust |z|>3 比例",
-                "值": d0_ex_right_tail_rate,
+                "值": f"{d0_ex_right_tail_rate:.4%}",
                 "结论": f"非除权对照组 {d0_control_tail_rate:.4%}",
             },
             {
@@ -1673,7 +1706,8 @@ def build_evidence(
         f"**审计结论：口径不统一，确认是工程 bug。** event 标签保留 raw 价格，"
         f"而 panel 标签与 canonical 回测使用 `raw×adj_factor`。共有 "
         f"{adjustment['return_mismatch_count']} 个 D+2 收益样本因复权而不同，"
-        f"{adjustment['hit_flip_count']} 个 8% hit 发生真实翻转，另有 "
+        f"{adjustment['adjustment_hit_flip_count']} 个 8% hit 因持有期复权因子变化而"
+        f"真实翻转；同因子数值翻转为 {adjustment['equal_factor_hit_flip_count']} 个，另有 "
         f"{adjustment['event_raw_hit_mismatch_count']} 个 event hit 与 raw 高价公式的"
         f"阈值/舍入差异。D0 除权样本 robust |z|>3 比例为 "
         f"{d0_ex_right_tail_rate:.2%}，非除权对照为 {d0_control_tail_rate:.2%}；D+2 有 "
@@ -1723,14 +1757,18 @@ def build_evidence(
             "cause": "event 标签/回测用 raw，panel 链用 HFQ，跨路径复权口径错配",
             "evidence": (
                 f"{adjustment['return_mismatch_count']} 个收益样本不同、"
-                f"{adjustment['hit_flip_count']} 个 hit 翻转；Top4 单笔净收益修正 "
+                f"{adjustment['adjustment_hit_flip_count']} 个复权真实 hit 翻转；"
+                "Top4 单笔净收益修正 "
                 f"{adjustment_net_delta:.6%}"
             ),
             "是否核心": "否" if adjusted_still_loses else "是",
             "主导亏损": "否" if adjusted_still_loses else "是",
             "修复文件/接口": "helix/data/labels.py；统一 point-in-time HFQ LabelSet 接口",
             "回归测试": "除权日 raw/HFQ return 与 hit 翻转测试",
-            "预期指标变化": f"消除收益错配；本窗单笔净收益变化 {adjustment_net_delta:.6%}",
+            "预期指标变化": (
+                f"消除收益错配和 {adjustment['adjustment_hit_flip_count']} 个复权真实"
+                f" hit 翻转；本窗单笔净收益变化 {adjustment_net_delta:.6%}"
+            ),
             "不承诺效果": "修复后仍不承诺策略收益转正",
         },
         {
@@ -1800,7 +1838,11 @@ def build_evidence(
         {
             "类别": "工程 bug",
             "修复路径": "删除 raw event 收益的独立消费路径；标签和回测统一调用点时 raw×adj_factor 价格服务，并把除权日翻转测试纳入 CI",
-            "预期效果": f"消除 {adjustment['return_mismatch_count']} 个收益错配和 {adjustment['hit_flip_count']} 个 hit 翻转；本样本 Top4 单笔净收益变化 {adjustment_net_delta:.6%}",
+            "预期效果": (
+                f"消除 {adjustment['return_mismatch_count']} 个收益错配和 "
+                f"{adjustment['adjustment_hit_flip_count']} 个复权真实 hit 翻转；"
+                f"本样本 Top4 单笔净收益变化 {adjustment_net_delta:.6%}"
+            ),
         },
         {
             "类别": "工程 bug",
@@ -1931,6 +1973,9 @@ def _display_cell(value: object, column: str = "") -> str:
             "hit_rate",
             "win_rate",
             "coverage",
+            "执行率",
+            "tail_rate",
+            "q5_minus",
         )
         if any(token in column for token in percent_columns):
             return f"{float(value):.4%}"
@@ -2270,7 +2315,13 @@ def validate_evidence(evidence: dict[str, object]) -> None:
         "adjustment_matrix",
         "adjustment_stats",
         "ex_right_samples",
+        "ex_right_counts",
+        "ex_right_factor_diagnostics",
+        "ex_right_return_errors",
+        "ex_right_top4_summary",
+        "ex_right_portfolio_comparison",
         "quintiles",
+        "quintile_monotonicity",
         "cost_split",
         "decay",
         "monthly",
@@ -2283,10 +2334,46 @@ def validate_evidence(evidence: dict[str, object]) -> None:
     missing = required - set(evidence)
     if missing:
         raise ValueError(f"evidence is missing required sections: {sorted(missing)}")
+    metadata_required = {
+        "train_start",
+        "train_end",
+        "formal_factor",
+        "formal_expression",
+        "formal_sign",
+        "calendar_digest",
+        "input_sha256",
+        "library_sha256",
+        "config_sha256",
+        "price_cache_sha256",
+        "style_market_sha256",
+        "industries_sha256",
+        "effective_backtest",
+    }
+    metadata = evidence["metadata"]
+    if not isinstance(metadata, dict) or metadata_required - set(metadata):
+        raise ValueError("metadata is missing required input hashes or audit contracts")
+    for key in (
+        "calendar_digest",
+        "input_sha256",
+        "library_sha256",
+        "config_sha256",
+        "price_cache_sha256",
+        "style_market_sha256",
+        "industries_sha256",
+    ):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(metadata[key])):
+            raise ValueError(f"metadata {key} must be a SHA256 digest")
+    effective_backtest = metadata["effective_backtest"]
+    if not isinstance(effective_backtest, dict) or effective_backtest.get("top_k") != 4:
+        raise ValueError("effective backtest metadata must preserve the Top4 contract")
     for name in (
         "adjustment_matrix",
         "adjustment_stats",
         "ex_right_samples",
+        "ex_right_counts",
+        "ex_right_factor_diagnostics",
+        "ex_right_return_errors",
+        "ex_right_portfolio_comparison",
         "quintiles",
         "cost_split",
         "monthly",
@@ -2310,6 +2397,90 @@ def validate_evidence(evidence: dict[str, object]) -> None:
     require_finite("quintiles", ("gross_return", "net_return"))
     if evidence["quintiles"]["quintile"].astype(int).tolist() != [1, 2, 3, 4, 5]:
         raise ValueError("quintile evidence must contain Q1 through Q5")
+    monotonicity = evidence["quintile_monotonicity"]
+    monotonicity_keys = {
+        "q5_minus_q1_gross",
+        "q5_minus_q1_net",
+        "gross_spearman",
+        "net_spearman",
+    }
+    if not isinstance(monotonicity, dict) or set(monotonicity) != monotonicity_keys:
+        raise ValueError("quintile monotonicity is missing required metrics")
+    if not np.isfinite(np.asarray(list(monotonicity.values()), dtype=float)).all():
+        raise ValueError("quintile monotonicity required metrics must be finite")
+    ex_right_counts = evidence["ex_right_counts"]
+    if set(ex_right_counts["stage"].astype(str)) != {"D0", "D+1", "D+2"}:
+        raise ValueError("ex-right counts must contain D0, D+1, and D+2")
+    require_finite("ex_right_counts", ("n_events", "n_stocks"))
+    factor_diagnostics = evidence["ex_right_factor_diagnostics"]
+    if set(factor_diagnostics["sample"].astype(str)) != {"D0除权", "D0非除权"}:
+        raise ValueError("ex-right factor diagnostics must contain treatment and control")
+    require_finite(
+        "ex_right_factor_diagnostics",
+        (
+            "n_events",
+            "n_stocks",
+            "factor_percentile_median",
+            "factor_abs_robust_z_p95",
+            "factor_abs_robust_z_max",
+            "factor_robust_tail_rate",
+            "prior_event_jump_abs_median",
+            "prior_event_jump_abs_p95",
+        ),
+    )
+    return_errors = evidence["ex_right_return_errors"]
+    if set(return_errors["sample"].astype(str)) != {
+        "全样本",
+        "D+2除权",
+        "D+2非除权",
+    }:
+        raise ValueError("ex-right return errors must contain full and D+2 controls")
+    require_finite(
+        "ex_right_return_errors",
+        (
+            "n_events",
+            "n_stocks",
+            "return_delta_mean",
+            "return_delta_median",
+            "return_delta_abs_p95",
+            "return_delta_abs_max",
+            "hit_flip_count",
+            "adjustment_hit_flip_count",
+            "equal_factor_hit_flip_count",
+        ),
+    )
+    portfolio_comparison = evidence["ex_right_portfolio_comparison"]
+    portfolio_arms = set(
+        zip(
+            portfolio_comparison["价格口径"].astype(str),
+            portfolio_comparison["成本口径"].astype(str),
+            strict=True,
+        )
+    )
+    if portfolio_arms != {
+        ("raw", "毛收益"),
+        ("raw", "净收益"),
+        ("HFQ", "毛收益"),
+        ("HFQ", "净收益"),
+    }:
+        raise ValueError("ex-right portfolio comparison must contain four arms")
+    require_finite(
+        "ex_right_portfolio_comparison",
+        ("CAGR", "夏普", "单笔收益", "累计净值", "最大回撤", "执行率", "交易日"),
+    )
+    top4_summary = evidence["ex_right_top4_summary"]
+    top4_required = {
+        "selected_trades",
+        "selected_any_ex_right",
+        "selected_holding_ex_right",
+        "hfq_minus_raw_book_return_sum",
+    }
+    if not isinstance(top4_summary, dict) or top4_required - set(top4_summary):
+        raise ValueError("ex-right Top4 summary is missing required metrics")
+    if not np.isfinite(
+        np.asarray([top4_summary[key] for key in top4_required], dtype=float)
+    ).all():
+        raise ValueError("ex-right Top4 required metrics must be finite")
     require_finite(
         "cost_split",
         ("CAGR", "夏普", "单笔收益", "累计净值", "最大回撤", "执行率", "交易日"),
@@ -2354,6 +2525,43 @@ def validate_evidence(evidence: dict[str, object]) -> None:
         raise ValueError("daily artifact must contain gross and net arms")
     if not np.isfinite(artifact["portfolio_return"]).all():
         raise ValueError("daily artifact returns must contain only finite values")
+    artifact_keys = ["horizon", "score_basis", "cost_basis", "date"]
+    if artifact.duplicated(artifact_keys).any():
+        raise ValueError("daily artifact contains duplicate horizon/arm/date rows")
+    expected_arms = {
+        ("raw_common", "gross"),
+        ("raw_common", "net"),
+        ("style_neutral", "gross"),
+        ("style_neutral", "net"),
+    }
+    for horizon, block in artifact.groupby("horizon", sort=True):
+        arms = set(
+            zip(
+                block["score_basis"].astype(str),
+                block["cost_basis"].astype(str),
+                strict=True,
+            )
+        )
+        if arms != expected_arms:
+            raise ValueError(f"daily artifact D+{horizon} must contain four arms")
+        date_sets = [
+            set(arm["date"].astype(str))
+            for _, arm in block.groupby(["score_basis", "cost_basis"], sort=False)
+        ]
+        if any(dates != date_sets[0] for dates in date_sets[1:]):
+            raise ValueError(f"daily artifact D+{horizon} arm dates must match")
+        boundary = decay_summary.loc[
+            decay_summary["horizon"].astype(int) == int(horizon)
+        ]
+        if len(boundary) != 1:
+            raise ValueError(f"decay boundary for D+{horizon} must be unique")
+        boundary_row = boundary.iloc[0]
+        if (
+            len(date_sets[0]) != int(boundary_row["n_d0"])
+            or max(date_sets[0]) != str(boundary_row["d0_end"])
+            or block["exit_date"].astype(str).max() != str(boundary_row["exit_end"])
+        ):
+            raise ValueError(f"daily artifact D+{horizon} does not match decay boundary")
     if artifact["exit_date"].astype(str).max() > str(
         evidence["metadata"]["train_end"]
     ):
@@ -2409,6 +2617,7 @@ def write_outputs(evidence: dict[str, object], paths: OutputPaths) -> None:
     staged: dict[Path, Path] = {}
     backups: dict[Path, Path] = {}
     replaced: list[Path] = []
+    retained_backups: set[Path] = set()
     targets = [*rendered, paths.daily]
     try:
         for target in targets:
@@ -2438,20 +2647,31 @@ def write_outputs(evidence: dict[str, object], paths: OutputPaths) -> None:
         for target in targets:
             os.replace(staged[target], target)
             replaced.append(target)
-    except Exception:
+    except Exception as publish_error:
+        restore_errors: list[tuple[Path, Path, Exception]] = []
         for target in reversed(replaced):
             backup = backups.get(target)
-            if backup is not None and backup.exists():
-                os.replace(backup, target)
-            elif target.exists():
-                target.unlink()
+            try:
+                if backup is not None and backup.exists():
+                    os.replace(backup, target)
+                elif target.exists():
+                    target.unlink()
+            except Exception as restore_error:
+                if backup is not None and backup.exists():
+                    retained_backups.add(backup)
+                    restore_errors.append((target, backup, restore_error))
+        if restore_errors:
+            retained = ", ".join(str(backup) for _, backup, _ in restore_errors)
+            raise RuntimeError(
+                f"artifact publish and rollback failed; backups retained: {retained}"
+            ) from publish_error
         raise
     finally:
         for temporary in staged.values():
             if temporary.exists():
                 temporary.unlink()
         for backup in backups.values():
-            if backup.exists():
+            if backup.exists() and backup not in retained_backups:
                 backup.unlink()
 
 
