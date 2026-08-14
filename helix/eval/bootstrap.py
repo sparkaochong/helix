@@ -118,3 +118,20 @@ def summarize_bootstrap_distribution(
             "values": samples.tolist(),
         }
     return output
+
+
+def summarize_metric_runs(
+    runs: Sequence[Mapping[str, float]],
+) -> dict[str, dict[str, float | list[float]]]:
+    """Aggregate generic seeded metric mappings while retaining non-finite values."""
+    keys = tuple(dict.fromkeys(key for run in runs for key in run))
+    output: dict[str, dict[str, float | list[float]]] = {}
+    for key in keys:
+        values = np.asarray([run.get(key, np.nan) for run in runs], dtype=np.float64)
+        finite = values[np.isfinite(values)]
+        output[key] = {
+            "mean": float(finite.mean()) if finite.size else float("nan"),
+            "std": float(finite.std(ddof=1)) if finite.size > 1 else 0.0,
+            "values": values.tolist(),
+        }
+    return output

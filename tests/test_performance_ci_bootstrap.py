@@ -10,6 +10,7 @@ from helix.eval.bootstrap import (
     bootstrap_performance_metrics,
     circular_block_bootstrap_indices,
     summarize_bootstrap_distribution,
+    summarize_metric_runs,
 )
 
 
@@ -112,3 +113,20 @@ def test_bootstrap_summary_rejects_nonfinite_or_singleton_distributions():
         summarize_bootstrap_distribution({"sharpe": np.array([0.1, np.nan])})
     with pytest.raises(ValueError, match="at least two"):
         summarize_bootstrap_distribution({"sharpe": np.array([0.1])})
+
+
+def test_generic_metric_run_summary_preserves_g3_nonfinite_compatibility():
+    runs = [
+        {"score": 1.0, "optional": np.nan},
+        {"score": 2.0, "optional": 4.0},
+        {"score": 3.0, "optional": np.nan},
+    ]
+
+    result = summarize_metric_runs(runs)
+
+    assert result["score"]["mean"] == pytest.approx(2.0)
+    assert result["score"]["std"] == pytest.approx(1.0)
+    assert result["score"]["values"] == [1.0, 2.0, 3.0]
+    assert result["optional"]["mean"] == pytest.approx(4.0)
+    assert result["optional"]["std"] == 0.0
+    assert np.isnan(result["optional"]["values"][0])
