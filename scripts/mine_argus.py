@@ -32,13 +32,13 @@ from helix.gp.library import FactorLibrary, compute_factors
 from helix.gp.neutralize import build_basis
 from helix.logging_setup import get_logger, setup_logging
 from helix.pipeline_events import (
-    BINARY_TARGET,
     DEFAULT_LABELS,
     PRIMARY_TARGET,
     EventRun,
     evaluate_ic,
     save,
 )
+from helix.splits import complete_outcome_window
 
 log = get_logger(__name__)
 
@@ -67,7 +67,9 @@ def main() -> None:
     # ---------------------------------------------------------------- pass 1 --
     index, label_grids, keys = open_event_source(path, labels)
     n_dates = len(index.dates)
-    rows = slice(0, max(int(n_dates * args.search_fraction), 1))
+    rows = complete_outcome_window(
+        slice(0, max(int(n_dates * args.search_fraction), 1)), cfg.label.touch_offset
+    )
     log.info(
         "search window %s ~ %s (%d/%d dates); IC is reported on the %d dates after it",
         index.dates[rows][0], index.dates[rows][-1], len(index.dates[rows]), n_dates,
@@ -117,7 +119,7 @@ def main() -> None:
     # none of them can. Without this the search just keeps rediscovering the same
     # linear blend of the same few volatility columns.
     search_fields = {k: panel.fields[k][rows].astype(np.float64) for k in kept}
-    y = panel.f64(BINARY_TARGET)[rows]
+    gross_returns = panel.f64("label_d2_return")[rows]
     pset = build_event_pset(kept)
 
     base_grids = [search_fields[n] for n in kept[: args.neutralize_base]]
@@ -130,8 +132,16 @@ def main() -> None:
                  round_index + 1, args.rounds, 0 if basis is None else basis.shape[2])
         cfg.gp.seed = cfg.gp.seed + round_index
         result = run_search(
-            fields=search_fields, field_names=kept, y=y, mask=mask,
-            cfg=cfg.gp, embargo_days=cfg.split.embargo_days,
+            fields=search_fields,
+            field_names=kept,
+            gross_returns=gross_returns,
+            candidate_mask=mask,
+            dates=panel.dates[rows],
+            cfg=cfg.gp,
+            backtest_cfg=cfg.backtest,
+            entry_offset=cfg.label.entry_offset,
+            touch_offset=cfg.label.touch_offset,
+            embargo_days=cfg.split.embargo_days,
             pset=pset, kind="event", basis=basis,
         )
         if not result.library.factors:
@@ -149,7 +159,7 @@ def main() -> None:
 
     library = FactorLibrary(factors=all_specs, field_names=kept, windows=[], kind="event")
     run = EventRun(panel=panel, library=library, selected_features=kept,
-                   search_rows=rows, report={})
+                   search_rows=rows, config=cfg, report={})
     evaluate_ic(run, min_samples=args.min_samples)
     paths = save(run, Path(args.out))
     print(json.dumps({k: str(v) for k, v in paths.items()}, indent=2))

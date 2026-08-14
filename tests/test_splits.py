@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 
 from helix.config import Config, SplitConfig
-from helix.splits import search_window, walk_forward
+from helix.splits import (
+    complete_outcome_window,
+    fit_selection_windows,
+    search_window,
+    walk_forward,
+)
 
 
 @pytest.fixture
@@ -43,6 +48,22 @@ def test_too_little_history_is_a_loud_error(cfg):
 def test_search_window_is_the_first_training_block(cfg):
     assert search_window(1000, cfg) == slice(0, cfg.train_days)
     assert search_window(40, cfg) == slice(0, 40)
+
+
+def test_complete_outcome_window_drops_boundary_decisions():
+    assert complete_outcome_window(slice(0, 649), horizon=2) == slice(0, 647)
+    assert complete_outcome_window(slice(10, 20), horizon=3) == slice(10, 17)
+
+
+def test_complete_outcome_window_rejects_too_short_windows():
+    with pytest.raises(ValueError, match="outcome-complete"):
+        complete_outcome_window(slice(0, 2), horizon=2)
+
+
+def test_fit_selection_windows_match_the_formal_training_geometry():
+    fit, selection = fit_selection_windows(647, embargo_days=5)
+    assert fit == slice(0, 517)
+    assert selection == slice(522, 647)
 
 
 def test_config_rejects_an_embargo_shorter_than_the_label_horizon(tmp_path):

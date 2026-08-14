@@ -70,3 +70,35 @@ def search_window(n_dates: int, cfg: SplitConfig) -> slice:
     single most common way these pipelines fool themselves. GP search is confined here.
     """
     return slice(0, min(cfg.train_days, n_dates))
+
+
+def complete_outcome_window(rows: slice, horizon: int) -> slice:
+    """Remove D0 rows whose forward outcome lands beyond ``rows``.
+
+    This is for objective construction at a hard training boundary.  It is deliberately
+    independent of whether a particular outcome cell happens to be present: every
+    decision date follows the same calendar rule.
+    """
+    start = 0 if rows.start is None else rows.start
+    if rows.stop is None or horizon < 1 or rows.stop - start <= horizon:
+        raise ValueError("window is too short to build an outcome-complete slice")
+    return slice(start, rows.stop - horizon)
+
+
+def fit_selection_windows(
+    n_rows: int,
+    embargo_days: int,
+    fit_fraction: float = 0.8,
+    min_selection_rows: int = 20,
+) -> tuple[slice, slice]:
+    """Return the two training-only blocks used by GP and factor monitoring."""
+    if n_rows <= 0 or embargo_days < 0 or not 0 < fit_fraction < 1:
+        raise ValueError("invalid fit/selection window geometry")
+    cut = int(n_rows * fit_fraction)
+    selection_start = min(cut + embargo_days, n_rows)
+    if n_rows - selection_start < min_selection_rows:
+        raise ValueError(
+            f"search window of {n_rows} dates is too short to hold out a selection block; "
+            "increase split.train_days or lengthen the data range"
+        )
+    return slice(0, cut), slice(selection_start, n_rows)

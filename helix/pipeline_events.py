@@ -20,13 +20,14 @@ import pandas as pd
 
 from .config import Config
 from .data.event_table import EventPanel, assert_no_label_columns, load_event_panel
-from .eval.ic import daily_ic, summarize_ic
+from .eval.factor_monitor import evaluate_training_monitors
 from .gp.engine import run_search
 from .gp.event_primitives import build_event_pset
 from .gp.export import write_apply_script
 from .gp.feature_select import select_features
 from .gp.library import FactorLibrary, compute_factors, save_factors
 from .logging_setup import get_logger
+from .splits import complete_outcome_window
 
 log = get_logger(__name__)
 
@@ -46,6 +47,7 @@ class EventRun:
     library: FactorLibrary
     selected_features: list[str]
     search_rows: slice
+    config: Config
     report: dict
 
 
@@ -68,7 +70,9 @@ def mine_events(
     feature_max_abs_corr: float = 0.85,
 ) -> EventRun:
     """Screen features and evolve factors, both confined to the search window."""
-    rows = _search_rows(len(panel.dates), search_fraction)
+    rows = complete_outcome_window(
+        _search_rows(len(panel.dates), search_fraction), cfg.label.touch_offset
+    )
     log.info(
         "search window: %s ~ %s (%d/%d dates); evaluation uses everything after",
         panel.dates[rows][0], panel.dates[rows][-1], len(panel.dates[rows]), len(panel.dates),
@@ -89,14 +93,18 @@ def mine_events(
     for s in scores[:15]:
         log.info("  feature %-34s IC %+.5f  ICIR %+.3f", s.name, s.ic_mean, s.icir)
 
-    # The GP fitness is a ranking metric on the binary hit label, which is the tradable
-    # event; the continuous target drives feature screening because it is less noisy.
+    # Feature screening remains a monitor/input reduction step. Evolution itself is
+    # anchored to the realised D+2-close economic outcome below.
     result = run_search(
         fields={k: np.asarray(panel.fields[k][rows], dtype=np.float64) for k in selected},
         field_names=selected,
-        y=panel.f64(BINARY_TARGET)[rows],
-        mask=mask,
+        gross_returns=panel.f64("label_d2_return")[rows],
+        candidate_mask=mask,
+        dates=panel.dates[rows],
         cfg=cfg.gp,
+        backtest_cfg=cfg.backtest,
+        entry_offset=cfg.label.entry_offset,
+        touch_offset=cfg.label.touch_offset,
         embargo_days=cfg.split.embargo_days,
         pset=build_event_pset(selected),
         kind="event",
@@ -106,50 +114,48 @@ def mine_events(
         library=result.library,
         selected_features=selected,
         search_rows=rows,
+        config=cfg,
         report={},
     )
 
 
 def evaluate_ic(run: EventRun, min_samples: int = 30) -> dict:
-    """IC / IC_IR of every kept factor, split into search rows and everything after."""
+    """Training-only economic objective plus IC/gini/hit monitoring for kept factors."""
     panel = run.panel
     if not run.library.factors:
         log.warning("no factors to evaluate")
         return {}
 
     names, values = compute_factors(run.library, panel.fields)
-    after = slice(run.search_rows.stop, len(panel.dates))
-    targets = {
-        name: panel.f64(name)
-        for name in (PRIMARY_TARGET, BINARY_TARGET)
-        if name in panel.labels
-    }
+    rows = run.search_rows
+    cfg = run.config
+    specs = {factor.name: factor for factor in run.library.factors}
 
     report: dict[str, dict] = {}
     for k, name in enumerate(names):
-        factor = values[:, :, k].astype(np.float64)
-        entry: dict[str, dict] = {
-            "expression": run.library.factors[k].expression,
-            "sign": run.library.factors[k].sign,
-        }
-        for target_name, target in targets.items():
-            entry[target_name] = {
-                "in_sample": summarize_ic(
-                    daily_ic(factor[run.search_rows], target[run.search_rows],
-                             panel.occupied[run.search_rows], min_samples)
-                ),
-                "out_of_sample": summarize_ic(
-                    daily_ic(factor[after], target[after], panel.occupied[after], min_samples)
-                ),
-            }
-        report[name] = entry
-        primary = entry[PRIMARY_TARGET]
+        monitors = evaluate_training_monitors(
+            score=values[rows, :, k].astype(np.float64),
+            hit_label=panel.f64(BINARY_TARGET)[rows],
+            peak_return=panel.f64(PRIMARY_TARGET)[rows],
+            gross_return=panel.f64("label_d2_return")[rows],
+            candidate_mask=panel.occupied[rows],
+            dates=panel.dates[rows],
+            config=cfg.backtest,
+            entry_offset=cfg.label.entry_offset,
+            touch_offset=cfg.label.touch_offset,
+            embargo_days=cfg.split.embargo_days,
+            min_samples=min_samples,
+        )
+        spec = specs[name]
+        report[name] = {"expression": spec.expression, "sign": spec.sign, **monitors}
+        fit_net = monitors["fit"]["production_objective"]["net"]["mean"]
+        selection_net = monitors["selection"]["production_objective"]["net"]["mean"]
         log.info(
-            "%s | IS  IC %+.5f ICIR %+.3f | OOS IC %+.5f ICIR %+.3f (ann %+.2f, pos %.0f%%)",
+            "%s | training fit Top%d net %+.4f%% | selection net %+.4f%%",
             name,
-            primary["in_sample"]["ic_mean"], primary["in_sample"]["icir"],
-            primary["out_of_sample"]["ic_mean"], primary["out_of_sample"]["icir"],
-            primary["out_of_sample"]["icir_ann"], 100 * primary["out_of_sample"]["positive_rate"],
+            cfg.backtest.top_k,
+            100 * fit_net,
+            100 * selection_net,
         )
     run.report = report
     return report

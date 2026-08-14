@@ -23,13 +23,15 @@ from .dl.dataset import SequenceDataset, normalize_factors
 from .dl.models import pick_device
 from .dl.train import predict_scores, train_walk_forward
 from .eval.backtest import run_backtest
-from .eval.metrics import daily_gini, lift_at_k, summarize_daily
+from .eval.factor_monitor import evaluate_training_monitors
+from .eval.metrics import lift_at_k
 from .features.base_fields import compute_base_fields, field_names
+from .features.operators import lead
 from .gp.engine import liquidity_top_columns, run_search
 from .gp.library import FactorLibrary, compute_factors, load_factors, save_factors
 from .labels.touch_label import LabelSet, build_touch_label
 from .logging_setup import get_logger
-from .splits import search_window, walk_forward
+from .splits import complete_outcome_window, search_window, walk_forward
 
 log = get_logger(__name__)
 
@@ -98,26 +100,36 @@ def prepare(cfg: Config, rebuild: bool = False) -> Prepared:
 def mine(cfg: Config, prepared: Prepared) -> FactorLibrary:
     """Run GP discovery on the oldest training block only."""
     panel, labels = prepared.panel, prepared.labels
-    rows = search_window(len(panel.dates), cfg.split)
+    rows = complete_outcome_window(
+        search_window(len(panel.dates), cfg.split), cfg.label.touch_offset
+    )
     log.info(
         "GP search window: %s ~ %s (%d dates)",
         panel.dates[rows][0], panel.dates[rows][-1], len(panel.dates[rows]),
     )
 
     population_rows = prepared.universe[rows]
-    label_rows = labels.valid[rows]
     cols = liquidity_top_columns(
         panel.f64("amount")[rows], population_rows, cfg.gp.search_max_stocks
     )
     log.info("evolving on %d liquidity-ranked stocks", len(cols))
 
     sub_fields = {k: np.asarray(v[rows][:, cols], dtype=np.float64) for k, v in prepared.fields.items()}
+    gross = np.where(
+        labels.valid[rows],
+        labels.exit_price[rows] / labels.entry_price[rows] - 1.0,
+        np.nan,
+    )
     result = run_search(
         fields=sub_fields,
         field_names=prepared.names,
-        y=labels.y[rows][:, cols],
-        mask=label_rows[:, cols],
+        gross_returns=gross[:, cols],
+        candidate_mask=prepared.universe[rows][:, cols],
+        dates=panel.dates[rows],
         cfg=cfg.gp,
+        backtest_cfg=cfg.backtest,
+        entry_offset=cfg.label.entry_offset,
+        touch_offset=cfg.label.touch_offset,
         embargo_days=cfg.split.embargo_days,
     )
     save_factors(artifacts_dir(cfg) / "factors.json", result.library)
@@ -125,25 +137,51 @@ def mine(cfg: Config, prepared: Prepared) -> FactorLibrary:
 
 
 def evaluate_factors(cfg: Config, prepared: Prepared, library: FactorLibrary) -> dict[str, dict]:
-    """Per-factor daily gini on the full panel, split into search and post-search rows."""
+    """Report economic and label monitors using outcome-complete training rows only."""
     names, values = compute_factors(library, prepared.fields)
     labels = prepared.labels
-    rows = search_window(len(prepared.panel.dates), cfg.split)
-    after = slice(rows.stop, len(prepared.panel.dates))
+    panel = prepared.panel
+    rows = complete_outcome_window(
+        search_window(len(panel.dates), cfg.split), cfg.label.touch_offset
+    )
+    gross = np.where(
+        labels.valid[rows],
+        labels.exit_price[rows] / labels.entry_price[rows] - 1.0,
+        np.nan,
+    )
+    high_at_exit = lead(panel.f64("high_hfq"), cfg.label.touch_offset)
+    peak = np.where(
+        labels.valid[rows],
+        high_at_exit[rows] / labels.entry_price[rows] - 1.0,
+        np.nan,
+    )
+    specs = {factor.name: factor for factor in library.factors}
 
     report: dict[str, dict] = {}
     for k, name in enumerate(names):
-        layer = values[:, :, k].astype(np.float64)
-        in_sample = summarize_daily(
-            daily_gini(layer[rows], labels.y[rows], labels.valid[rows], cfg.gp.min_daily_samples)
+        monitors = evaluate_training_monitors(
+            score=values[rows, :, k].astype(np.float64),
+            hit_label=labels.y[rows],
+            peak_return=peak,
+            gross_return=gross,
+            candidate_mask=prepared.universe[rows],
+            dates=panel.dates[rows],
+            config=cfg.backtest,
+            entry_offset=cfg.label.entry_offset,
+            touch_offset=cfg.label.touch_offset,
+            embargo_days=cfg.split.embargo_days,
+            min_samples=cfg.gp.min_daily_samples,
         )
-        out_sample = summarize_daily(
-            daily_gini(layer[after], labels.y[after], labels.valid[after], cfg.gp.min_daily_samples)
-        )
-        report[name] = {"in_sample": in_sample, "out_of_sample": out_sample}
+        spec = specs[name]
+        report[name] = {"expression": spec.expression, "sign": spec.sign, **monitors}
+        fit_net = monitors["fit"]["production_objective"]["net"]["mean"]
+        selection_net = monitors["selection"]["production_objective"]["net"]["mean"]
         log.info(
-            "%s | in-sample gini %.4f (IR %.2f) | out-of-sample gini %.4f (IR %.2f)",
-            name, in_sample["mean"], in_sample["ir"], out_sample["mean"], out_sample["ir"],
+            "%s | training fit Top%d net %.4f%% | selection net %.4f%%",
+            name,
+            cfg.backtest.top_k,
+            100 * fit_net,
+            100 * selection_net,
         )
     return report
 

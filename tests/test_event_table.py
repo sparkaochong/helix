@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
 
+from helix import pipeline_events
+from helix.config import Config
 from helix.data.event_table import (
+    EventPanel,
     assert_no_label_columns,
     build_event_panel,
     is_label_column,
@@ -255,3 +260,48 @@ def test_all_nan_ic_series_is_reported_not_crashed():
     stats = summarize_ic(np.array([np.nan, np.nan]))
     assert stats["n_days"] == 0
     assert np.isnan(stats["ic_mean"])
+
+
+def test_event_mining_uses_only_complete_training_outcomes(monkeypatch):
+    shape = (12, 5)
+    dates = np.array([f"202401{day:02d}" for day in range(2, 14)])
+    occupied = np.ones(shape, dtype=bool)
+    occupied[:, -1] = False
+    close_return = np.arange(np.prod(shape), dtype=float).reshape(shape) / 10_000
+    panel = EventPanel(
+        dates=dates,
+        codes=np.full(shape, "000001.SZ"),
+        occupied=occupied,
+        fields={"feat_a": np.ones(shape)},
+        labels={
+            pipeline_events.PRIMARY_TARGET: close_return + 0.02,
+            pipeline_events.BINARY_TARGET: (close_return > 0.002).astype(float),
+            "label_d2_return": close_return,
+        },
+    )
+    captured: dict[str, object] = {}
+
+    def fake_select_features(**kwargs):
+        captured["screen"] = kwargs
+        return ["feat_a"], []
+
+    def fake_run_search(**kwargs):
+        captured["search"] = kwargs
+        return SimpleNamespace(
+            library=FactorLibrary([], field_names=["feat_a"], windows=[], kind="event")
+        )
+
+    monkeypatch.setattr(pipeline_events, "select_features", fake_select_features)
+    monkeypatch.setattr(pipeline_events, "run_search", fake_run_search)
+
+    run = pipeline_events.mine_events(panel, Config(), search_fraction=0.75)
+
+    assert run.search_rows == slice(0, 7)
+    screen = captured["screen"]
+    assert screen["fields"]["feat_a"].shape == (7, 5)
+    np.testing.assert_array_equal(screen["mask"], occupied[:7])
+    search = captured["search"]
+    np.testing.assert_array_equal(search["candidate_mask"], occupied[:7])
+    np.testing.assert_array_equal(search["gross_returns"], close_return[:7])
+    np.testing.assert_array_equal(search["dates"], dates[:7])
+    assert search["backtest_cfg"].top_k == 4

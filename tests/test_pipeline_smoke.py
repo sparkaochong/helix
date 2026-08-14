@@ -40,7 +40,9 @@ def market() -> Panel:
     rng = np.random.default_rng(42)
     shape = (N_DATES, N_CODES)
 
-    daily_ret = rng.normal(0.0, 0.025, size=shape)
+    innovations = rng.normal(0.0, 0.025, size=shape)
+    daily_ret = innovations.copy()
+    daily_ret[2:] += 0.6 * innovations[:-2]
     close = 10.0 * np.exp(np.cumsum(daily_ret, axis=0))
     prev_close = np.vstack([close[:1], close[:-1]])
     open_ = prev_close * (1.0 + rng.normal(0.0, 0.01, size=shape))
@@ -96,7 +98,7 @@ def test_label_base_rate_is_plausible(prepared):
 
 
 @pytest.fixture(scope="module")
-def library(prepared, split):
+def library(prepared, split, market):
     fields, names, labels = prepared
     rows = search_window(N_DATES, split)
     cfg = GPConfig(
@@ -104,12 +106,28 @@ def library(prepared, split):
         windows=[3, 5, 10], max_nodes=15, max_depth=4,
         min_daily_samples=20, search_max_stocks=N_CODES, seed=5,
     )
+    gross = np.where(
+        labels.valid[rows],
+        labels.exit_price[rows] / labels.entry_price[rows] - 1.0,
+        np.nan,
+    )
     result = run_search(
-        fields={k: v[rows] for k, v in fields.items()},
+        fields={name: values[rows] for name, values in fields.items()},
         field_names=names,
-        y=labels.y[rows],
-        mask=labels.valid[rows],
+        gross_returns=gross,
+        candidate_mask=np.ones_like(gross, dtype=bool),
+        dates=market.dates[rows],
         cfg=cfg,
+        backtest_cfg=BacktestConfig(
+            top_k=4,
+            commission_bps=0,
+            transfer_bps=0,
+            stamp_sell_bps=0,
+            stamp_sell_bps_before_cut=0,
+            slippage_bps=0,
+        ),
+        entry_offset=1,
+        touch_offset=2,
         embargo_days=split.embargo_days,
     )
     return result.library

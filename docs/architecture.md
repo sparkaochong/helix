@@ -162,14 +162,14 @@ touched  = high_hfq[D+2] >= target
 **② fit / sel 双窗口。** 搜索块内部再按 `fit_fraction=0.8` 切开，中间隔 `embargo_days`：
 
 ```
-[──────── fit 段（驱动进化，最大化 |gini|）────────][embargo][── sel 段（决定去留）──]
+[──────── fit 段（驱动进化，最大化 Top4 净收益）────────][embargo][── sel 段（决定去留）──]
 ```
 
-进化只看 fit 段；一个因子只有在 sel 段上**符号仍然一致且为正**（`sel_gini > 0`）才会被保留。在同一批行上既优化又筛选，是 GP 产出「样本内绝美、样本外归零」的标准姿势。sel 段不足 20 行直接报错。
+进化只看 fit 段；一个因子只有在 sel 段上生产 Top4 D+2 收盘净收益严格为正（`sel_net_return > 0`）才会被保留。两个窗口都在 D+2 结果完整的训练范围内，sel 段不足 20 行直接报错。
 
-**③ 符号是自由参数。** gini `-0.2` 的因子取负后和 `+0.2` 一样好用，所以适应度用 `|gini|`，符号单独记在 `factors.json` 的 `sign` 字段。
+**③ 方向必须显式。** 适应度不取绝对值、不隐式翻 sign；反向由表达式中的 `neg(...)` 表达，新因子统一保存 `sign=+1`。
 
-适应度：`fitness = |mean(daily_gini(fit))| − complexity_penalty × n_nodes`
+适应度：`fitness = 10_000 × mean(fit 日 production Top4 D+2-close net portfolio return)`。节点数只在 P&L 完全相等时作为次级排序键。
 
 ### 6.3 残差 IC 中性化（`neutralize.py`）
 
@@ -185,7 +185,7 @@ touched  = high_hfq[D+2] >= target
 
 ### 6.4 去相关与保留
 
-名人堂（60）→ 过 sel 段符号检验 → 按 `sel_gini` 排序 → 贪心按截面秩相关去重（`max_abs_corr=0.7`）→ 保留 `n_keep=24`。
+名人堂（60）→ 过 `sel_net_return > 0` → 按 `(-sel_net_return, n_nodes)` 排序 → 贪心按截面秩相关去重（`max_abs_corr=0.7`）→ 保留 `n_keep=24`。
 
 喂 24 个同一个想法的副本给网络，效果不如喂 8 个真正不同的。
 

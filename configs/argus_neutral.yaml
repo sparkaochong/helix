@@ -45,7 +45,6 @@ gp:
   - 10
   - 20
   - 60
-  complexity_penalty: 0.0015
   min_daily_samples: 50
   min_coverage: 0.4
   max_abs_corr: 0.7

@@ -43,7 +43,6 @@ gp:
   max_depth: 8
   max_nodes: 40
   windows: [3, 5, 10, 20, 60]
-  complexity_penalty: 0.0015     # subtracted per node from |gini|
   min_daily_samples: 50
   min_coverage: 0.4              # fraction of dates with a usable cross-section
   max_abs_corr: 0.7              # dedup threshold against already-kept factors
@@ -67,11 +66,8 @@ dl:
   seed: 20240101
 
 backtest:
-  # 持仓只数。TOP4 是 README「持仓规模」那张网格里最稳的一档（Sharpe 1.39±0.02，
-  # 3 的 Sharpe 高 0.01 而种子标准差是它的 9 倍）。分散改的是方差不是胜率：回撤随
-  # 持仓数单调变浅，日胜率几乎不动。TOP1 是灾难——分类器最强的信念恰好是按 D+2
-  # 收益算最差的一只（IC -0.064）。
-  # 注意：峰值落在 3~4 是在测试集上挑出来的，不是样本外保证。
+  # 生产选股数，也是 GP D+2 收盘净收益适应度的唯一 K 配置源。
+  # 修改后必须重跑搜索与目标/P&L 对齐验证；Top10 仅作补充报告。
   top_k: 4
   # Exit assumption. "close": every position exits at the D+2 close, hit or miss.
   # "target": fill at entry * target_ratio when the D+2 high reaches it -- mirrors the

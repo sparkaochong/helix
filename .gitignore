@@ -24,3 +24,4 @@ build/
 # local agent tooling state
 .claude/
 .claude-flow/
+.worktrees/

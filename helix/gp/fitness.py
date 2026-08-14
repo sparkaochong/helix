@@ -1,12 +1,9 @@
-"""Fitness for a candidate factor.
+"""Production-economic fitness for a candidate factor.
 
-Two windows, not one. Evolution is driven by the *fit* window; a factor is only kept
-if it still points the same way on a held-out *selection* window that sits after an
-embargo. Optimising and selecting on the same rows is how GP pipelines end up with
-beautiful in-sample factors and nothing else.
-
-Sign is a free parameter: a factor with gini ``-0.2`` is exactly as useful as one with
-``+0.2`` once negated, so fitness uses ``|gini|`` and the sign is recorded separately.
+Evolution is driven by cost-adjusted D+2-close Top-K P&L on the fit window.  The
+embargoed selection window is reported separately and gates factor retention in the
+search engine.  Direction belongs to the GP expression itself: fitness never takes an
+absolute value or silently flips a factor's sign.
 """
 
 from __future__ import annotations
@@ -15,7 +12,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from ..eval.metrics import daily_gini, summarize_daily
+from ..eval.objective import TopKPortfolio, daily_top_k_portfolio, summarize_objective
 from .neutralize import residualize
 
 INVALID = -1e9
@@ -26,14 +23,14 @@ class EvalContext:
     """Everything a factor is scored against. Built once and reused for the whole run."""
 
     field_arrays: list[np.ndarray]
-    y: np.ndarray
-    mask: np.ndarray
+    net_returns: np.ndarray
+    candidate_mask: np.ndarray
     fit_rows: slice
     sel_rows: slice
-    min_daily_samples: int = 50
+    top_k: int
+    overlap: int
     min_coverage: float = 0.4
     min_defined_fraction: float = 0.2
-    complexity_penalty: float = 0.0015
     #: Optional ``(T, N, K)`` orthonormal basis. When set, fitness scores the factor's
     #: residual after projecting it out, so a good linear blend of columns the model
     #: already has scores zero instead of scoring well.
@@ -45,9 +42,10 @@ class EvalContext:
 class FactorScore:
     fitness: float
     sign: float
-    fit_gini: float
-    fit_ir: float
-    sel_gini: float
+    fit_net_return: float
+    fit_net_ir: float
+    sel_net_return: float
+    sel_net_ir: float
     coverage: float
     n_nodes: int
 
@@ -55,51 +53,68 @@ class FactorScore:
         return {
             "fitness": self.fitness,
             "sign": self.sign,
-            "fit_gini": self.fit_gini,
-            "fit_ir": self.fit_ir,
-            "sel_gini": self.sel_gini,
+            "fit_net_return": self.fit_net_return,
+            "fit_net_ir": self.fit_net_ir,
+            "sel_net_return": self.sel_net_return,
+            "sel_net_ir": self.sel_net_ir,
             "coverage": self.coverage,
             "n_nodes": float(self.n_nodes),
         }
 
 
 def _invalid(n_nodes: int) -> FactorScore:
-    return FactorScore(INVALID, 1.0, float("nan"), float("nan"), float("nan"), 0.0, n_nodes)
+    return FactorScore(
+        INVALID,
+        1.0,
+        float("nan"),
+        float("nan"),
+        float("nan"),
+        float("nan"),
+        0.0,
+        n_nodes,
+    )
+
+
+def _rows(series: TopKPortfolio, rows: slice) -> TopKPortfolio:
+    return TopKPortfolio(series.portfolio_return[rows], series.executed[rows])
 
 
 def score_values(values: np.ndarray, ctx: EvalContext, n_nodes: int) -> FactorScore:
     """Score already-computed factor values. Separated out so tests can call it directly."""
-    if not isinstance(values, np.ndarray) or values.shape != ctx.y.shape:
+    if (
+        not isinstance(values, np.ndarray)
+        or values.shape != ctx.net_returns.shape
+        or ctx.candidate_mask.shape != ctx.net_returns.shape
+    ):
         return _invalid(n_nodes)
 
-    defined = np.isfinite(values) & ctx.mask
-    if defined.sum() < ctx.min_defined_fraction * max(ctx.mask.sum(), 1):
+    defined = np.isfinite(values) & ctx.candidate_mask
+    if defined.sum() < ctx.min_defined_fraction * max(ctx.candidate_mask.sum(), 1):
         return _invalid(n_nodes)
 
     if ctx.basis is not None:
-        values = residualize(values, ctx.basis, ctx.mask)
+        values = residualize(values, ctx.basis, ctx.candidate_mask)
 
-    fit = daily_gini(
-        values[ctx.fit_rows], ctx.y[ctx.fit_rows], ctx.mask[ctx.fit_rows], ctx.min_daily_samples
+    portfolio = daily_top_k_portfolio(
+        values,
+        ctx.net_returns,
+        ctx.candidate_mask,
+        top_k=ctx.top_k,
+        overlap=ctx.overlap,
     )
-    fit_stats = summarize_daily(fit)
+    fit_stats = summarize_objective(_rows(portfolio, ctx.fit_rows), ctx.top_k)
     if fit_stats["coverage"] < ctx.min_coverage or not np.isfinite(fit_stats["mean"]):
         return _invalid(n_nodes)
 
-    sign = 1.0 if fit_stats["mean"] >= 0 else -1.0
-    sel = daily_gini(
-        values[ctx.sel_rows], ctx.y[ctx.sel_rows], ctx.mask[ctx.sel_rows], ctx.min_daily_samples
-    )
-    sel_stats = summarize_daily(sel)
-    sel_gini = sign * sel_stats["mean"] if np.isfinite(sel_stats["mean"]) else float("nan")
-
-    fitness = abs(fit_stats["mean"]) - ctx.complexity_penalty * n_nodes
+    sel_stats = summarize_objective(_rows(portfolio, ctx.sel_rows), ctx.top_k)
+    fitness = 10_000.0 * fit_stats["mean"]
     return FactorScore(
         fitness=float(fitness),
-        sign=sign,
-        fit_gini=float(sign * fit_stats["mean"]),
-        fit_ir=float(fit_stats["ir"]),
-        sel_gini=float(sel_gini),
+        sign=1.0,
+        fit_net_return=float(fit_stats["mean"]),
+        fit_net_ir=float(fit_stats["ir"]),
+        sel_net_return=float(sel_stats["mean"]),
+        sel_net_ir=float(sel_stats["ir"]),
         coverage=float(fit_stats["coverage"]),
         n_nodes=n_nodes,
     )
