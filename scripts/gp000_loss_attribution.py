@@ -2391,6 +2391,7 @@ def validate_evidence(evidence: dict[str, object]) -> None:
         "daily",
         "daily_artifact",
         "style_table",
+        "style_orthogonality",
         "root_causes",
         "repairs",
     }
@@ -2473,14 +2474,59 @@ def validate_evidence(evidence: dict[str, object]) -> None:
         adjustment_audit
     ):
         raise ValueError("adjustment audit is missing required metrics")
-    numeric_adjustment = adjustment_required - {
+    adjustment_flags = {
         "event_prices_match_raw",
         "event_returns_match_raw",
     }
+    for flag_name in adjustment_flags:
+        if not isinstance(adjustment_audit[flag_name], (bool, np.bool_)):
+            raise ValueError(f"adjustment audit {flag_name} must be boolean")
+    adjustment_counts = {
+        "event_raw_hit_mismatch_count",
+        "return_mismatch_count",
+        "hit_flip_count",
+        "adjustment_hit_flip_count",
+        "equal_factor_hit_flip_count",
+        "event_label_to_hfq_hit_difference_count",
+        "holding_ex_right_count",
+    }
+    for count_name in adjustment_counts:
+        count = adjustment_audit[count_name]
+        if (
+            isinstance(count, (bool, np.bool_))
+            or not isinstance(count, (int, np.integer))
+            or count < 0
+        ):
+            raise ValueError(
+                f"adjustment audit {count_name} must be a non-negative integer"
+            )
+    adjustment_measurements = {
+        "event_return_rounding_error_max",
+        "mean_return_delta",
+        "max_abs_return_delta",
+    }
+    for measurement_name in adjustment_measurements:
+        measurement = adjustment_audit[measurement_name]
+        if isinstance(measurement, (bool, np.bool_)) or not isinstance(
+            measurement,
+            (int, float, np.integer, np.floating),
+        ):
+            raise ValueError(
+                f"adjustment audit {measurement_name} must be numeric"
+            )
+    numeric_adjustment = adjustment_required - adjustment_flags
     if not np.isfinite(
         np.asarray([adjustment_audit[key] for key in numeric_adjustment], dtype=float)
     ).all():
         raise ValueError("adjustment audit required metrics must be finite")
+    for magnitude_name in (
+        "event_return_rounding_error_max",
+        "max_abs_return_delta",
+    ):
+        if adjustment_audit[magnitude_name] < 0:
+            raise ValueError(
+                f"adjustment audit {magnitude_name} must be non-negative"
+            )
     if not (
         adjustment_audit["event_prices_match_raw"]
         and adjustment_audit["event_returns_match_raw"]
@@ -2623,6 +2669,56 @@ def validate_evidence(evidence: dict[str, object]) -> None:
         "style_table",
         ("D+2 IC", "ICIR", "CAGR", "夏普", "单笔净收益", "累计净值", "最大回撤", "交易日"),
     )
+    style_orthogonality = evidence["style_orthogonality"]
+    style_orthogonality_required = {
+        "analysis_coverage_of_raw_factor",
+        "max_abs_normalized_exposure",
+        "max_abs_covariance",
+        "style_complete_rows",
+        "raw_factor_rows",
+        "industry_count",
+    }
+    if (
+        not isinstance(style_orthogonality, dict)
+        or style_orthogonality_required - set(style_orthogonality)
+    ):
+        raise ValueError("style orthogonality is missing required metrics")
+    style_measurements = {
+        "analysis_coverage_of_raw_factor",
+        "max_abs_normalized_exposure",
+        "max_abs_covariance",
+    }
+    for measurement_name in style_measurements:
+        measurement = style_orthogonality[measurement_name]
+        if isinstance(measurement, (bool, np.bool_)) or not isinstance(
+            measurement,
+            (int, float, np.integer, np.floating),
+        ):
+            raise ValueError("style orthogonality measurements must be numeric")
+    if not np.isfinite(
+        np.asarray(
+            [style_orthogonality[key] for key in style_orthogonality_required],
+            dtype=float,
+        )
+    ).all():
+        raise ValueError("style orthogonality metrics must be finite")
+    coverage = style_orthogonality["analysis_coverage_of_raw_factor"]
+    if not 0.0 <= coverage <= 1.0:
+        raise ValueError("style orthogonality coverage must be between zero and one")
+    for magnitude_name in (
+        "max_abs_normalized_exposure",
+        "max_abs_covariance",
+    ):
+        if style_orthogonality[magnitude_name] < 0:
+            raise ValueError("style orthogonality magnitudes must be non-negative")
+    for count_name in ("style_complete_rows", "raw_factor_rows", "industry_count"):
+        count = style_orthogonality[count_name]
+        if (
+            isinstance(count, (bool, np.bool_))
+            or not isinstance(count, (int, np.integer))
+            or count < 0
+        ):
+            raise ValueError("style orthogonality counts must be non-negative integers")
     daily = evidence["daily"]
     for column in (
         "gross_portfolio_return",
@@ -2720,6 +2816,31 @@ def validate_evidence(evidence: dict[str, object]) -> None:
     }
     if any(root_fields - set(row) for row in evidence["root_causes"]):
         raise ValueError("each root cause must contain the full remediation contract")
+    core_labels = {"是", "否", "次要", "未证实"}
+    dominant_labels = {"是", "否", "未证实"}
+    if any(
+        row["是否核心"] not in core_labels or row["主导亏损"] not in dominant_labels
+        for row in evidence["root_causes"]
+    ):
+        raise ValueError("root-cause classification must use controlled values")
+    adjustment_roots = [
+        row
+        for row in evidence["root_causes"]
+        if row["category"] == "工程 bug" and row["priority"] == 1
+    ]
+    if len(adjustment_roots) != 1 or any(
+        adjustment_roots[0][field] != "否" for field in ("是否核心", "主导亏损")
+    ):
+        raise ValueError("adjustment root cause must be non-core and non-dominant")
+    target_mismatch_roots = [
+        row
+        for row in evidence["root_causes"]
+        if row["category"] == "参数配置" and row["priority"] == 1
+    ]
+    if len(target_mismatch_roots) != 1 or any(
+        target_mismatch_roots[0][field] != "是" for field in ("是否核心", "主导亏损")
+    ):
+        raise ValueError("target-mismatch root cause must be core and dominant")
 
 
 def write_outputs(evidence: dict[str, object], paths: OutputPaths) -> None:

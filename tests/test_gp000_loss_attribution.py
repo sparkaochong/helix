@@ -722,6 +722,10 @@ def _minimal_evidence() -> dict[str, object]:
         "style_orthogonality": {
             "analysis_coverage_of_raw_factor": 0.95,
             "max_abs_normalized_exposure": 1e-12,
+            "max_abs_covariance": 1e-12,
+            "style_complete_rows": 95,
+            "raw_factor_rows": 100,
+            "industry_count": 2,
         },
         "root_causes": [
             {
@@ -737,6 +741,8 @@ def _minimal_evidence() -> dict[str, object]:
                 "cause": "错配",
                 "evidence": "raw/hfq",
                 **root_contract,
+                "是否核心": "否",
+                "主导亏损": "否",
             },
             {
                 "category": "参数配置",
@@ -744,6 +750,8 @@ def _minimal_evidence() -> dict[str, object]:
                 "cause": "目标",
                 "evidence": "hit/close",
                 **root_contract,
+                "是否核心": "是",
+                "主导亏损": "是",
             },
         ],
         "repairs": [
@@ -761,6 +769,76 @@ def test_adjustment_consistency_must_pass_before_publish(field: str) -> None:
     evidence["adjustment_audit"][field] = False
 
     with pytest.raises(ValueError, match="adjustment audit consistency"):
+        validate_evidence(evidence)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("event_prices_match_raw", "false"),
+        ("event_returns_match_raw", 1),
+    ),
+)
+def test_adjustment_consistency_flags_must_be_boolean(
+    field: str,
+    value: object,
+) -> None:
+    evidence = _minimal_evidence()
+    evidence["adjustment_audit"][field] = value
+
+    with pytest.raises(ValueError, match="boolean"):
+        validate_evidence(evidence)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "event_raw_hit_mismatch_count",
+        "return_mismatch_count",
+        "hit_flip_count",
+        "adjustment_hit_flip_count",
+        "equal_factor_hit_flip_count",
+        "event_label_to_hfq_hit_difference_count",
+        "holding_ex_right_count",
+    ),
+)
+@pytest.mark.parametrize("value", (-1, 1.5))
+def test_adjustment_counts_must_be_non_negative_integers(
+    field: str,
+    value: float,
+) -> None:
+    evidence = _minimal_evidence()
+    evidence["adjustment_audit"][field] = value
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        validate_evidence(evidence)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("event_return_rounding_error_max", "max_abs_return_delta"),
+)
+def test_adjustment_error_magnitudes_must_be_non_negative(field: str) -> None:
+    evidence = _minimal_evidence()
+    evidence["adjustment_audit"][field] = -1.0
+
+    with pytest.raises(ValueError, match="non-negative"):
+        validate_evidence(evidence)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "event_return_rounding_error_max",
+        "mean_return_delta",
+        "max_abs_return_delta",
+    ),
+)
+def test_adjustment_measurements_must_be_numeric(field: str) -> None:
+    evidence = _minimal_evidence()
+    evidence["adjustment_audit"][field] = "0"
+
+    with pytest.raises(ValueError, match="numeric"):
         validate_evidence(evidence)
 
 
@@ -782,6 +860,107 @@ def test_each_root_cause_requires_both_loss_classifications(field: str) -> None:
     evidence["root_causes"][0].pop(field)
 
     with pytest.raises(ValueError, match="full remediation contract"):
+        validate_evidence(evidence)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("是否核心", ""),
+        ("是否核心", None),
+        ("是否核心", "maybe"),
+        ("主导亏损", ""),
+        ("主导亏损", None),
+        ("主导亏损", "maybe"),
+    ),
+)
+def test_root_cause_classifications_use_controlled_values(
+    field: str,
+    value: object,
+) -> None:
+    evidence = _minimal_evidence()
+    evidence["root_causes"][0][field] = value
+
+    with pytest.raises(ValueError, match="classification"):
+        validate_evidence(evidence)
+
+
+def test_adjustment_root_cause_must_be_non_core_and_non_dominant() -> None:
+    evidence = _minimal_evidence()
+    adjustment = next(
+        row
+        for row in evidence["root_causes"]
+        if row["category"] == "工程 bug" and row["priority"] == 1
+    )
+    adjustment["是否核心"] = "是"
+
+    with pytest.raises(ValueError, match="adjustment root cause"):
+        validate_evidence(evidence)
+
+
+def test_target_mismatch_must_be_core_and_dominant() -> None:
+    evidence = _minimal_evidence()
+    mismatch = next(
+        row
+        for row in evidence["root_causes"]
+        if row["category"] == "参数配置" and row["priority"] == 1
+    )
+    mismatch["主导亏损"] = "否"
+
+    with pytest.raises(ValueError, match="target-mismatch root cause"):
+        validate_evidence(evidence)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "analysis_coverage_of_raw_factor",
+        "max_abs_normalized_exposure",
+        "max_abs_covariance",
+        "style_complete_rows",
+        "raw_factor_rows",
+        "industry_count",
+    ),
+)
+def test_style_orthogonality_requires_each_reported_statistic(field: str) -> None:
+    evidence = _minimal_evidence()
+    evidence["style_orthogonality"].pop(field)
+
+    with pytest.raises(ValueError, match="style orthogonality"):
+        validate_evidence(evidence)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("analysis_coverage_of_raw_factor", np.nan),
+        ("max_abs_normalized_exposure", np.inf),
+    ),
+)
+def test_style_orthogonality_statistics_must_be_finite(
+    field: str,
+    value: float,
+) -> None:
+    evidence = _minimal_evidence()
+    evidence["style_orthogonality"][field] = value
+
+    with pytest.raises(ValueError, match="style orthogonality"):
+        validate_evidence(evidence)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "analysis_coverage_of_raw_factor",
+        "max_abs_normalized_exposure",
+        "max_abs_covariance",
+    ),
+)
+def test_style_orthogonality_measurements_must_be_numeric(field: str) -> None:
+    evidence = _minimal_evidence()
+    evidence["style_orthogonality"][field] = "0"
+
+    with pytest.raises(ValueError, match="style orthogonality measurements"):
         validate_evidence(evidence)
 
 
@@ -848,11 +1027,30 @@ def test_emit_audit_trace_logs_each_checkpoint(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     evidence = _minimal_evidence()
+    expected = audit_trace_records(evidence)
     with caplog.at_level(logging.INFO, logger=audit_module.__name__):
         emit_audit_trace(evidence)
 
-    for checkpoint in audit_trace_records(evidence):
-        assert f"checkpoint={checkpoint}" in caplog.text
+    observed = {}
+    for record in caplog.records:
+        prefix, payload = record.getMessage().split(" data=", maxsplit=1)
+        checkpoint = prefix.removeprefix("audit checkpoint=")
+        observed[checkpoint] = json.loads(payload)
+
+    assert observed == audit_module.json_ready(expected)
+
+
+def test_d10_ledger_and_report_are_reciprocally_linked() -> None:
+    root = Path(__file__).resolve().parents[1]
+    ledger = (root / "docs/factor-governance.md").read_text(encoding="utf-8")
+    report = (root / "docs/risk/gp000_loss_attribution.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "[专项报告](risk/gp000_loss_attribution.md)" in ledger
+    assert "[治理台账 D10](../factor-governance.md)" in report
+    for frozen_impact in ("1,425 个收益样本不同", "48 个真实 hit 翻转", "+0.022226%"):
+        assert frozen_impact in ledger
 
 
 def test_root_causes_rank_engineering_before_config_before_alpha() -> None:
@@ -965,6 +1163,7 @@ def test_invalid_evidence_writes_no_partial_outputs(tmp_path: Path) -> None:
         "ex_right_portfolio_comparison",
         "ex_right_event_sample_count",
         "ex_right_d0_unobservable_count",
+        "style_orthogonality",
         "quintile_monotonicity",
         "adjustment_audit",
     ],

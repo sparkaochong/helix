@@ -261,7 +261,7 @@ DataFrame/dict，测试不依赖 3.4GB 本地数据。
 |---|---|---|---|
 | 事件价格逐笔匹配原始行情 | `audit_adjustment_chain` 重建 D+1/D+2 原始价；`validate_evidence` 要求匹配结果为真 | 合成除权样本验证三类价格；伪造 `False` 证据必须拒绝发布 | `adjustment_basis` |
 | event 收益匹配 raw 公式 | 比较持久化收益与重建 raw 收益并限制舍入误差 | 合成样本验证 raw/HFQ 收益；伪造不一致证据必须拒绝发布 | `adjustment_basis` |
-| raw/HFQ 收益差与 hit 翻转分类闭合 | 总翻转等于复权真实翻转加同因子数值翻转；同因子数值翻转必须为零 | 覆盖真实翻转、舍入差异和非法分类证据 | `adjustment_samples` |
+| raw/HFQ 收益差与 hit 翻转分类闭合 | 总翻转等于复权真实翻转加同因子数值翻转；同因子数值翻转必须为零 | 覆盖真实翻转、舍入差异和非法分类证据 | `adjustment_statistics` |
 | D0、D+1、D+2 除权样本完整统计 | `evaluate_ex_right_samples` 输出各阶段事件数、股票数和不可观测数 | 合成样本逐阶段验证计数和对照边界 | `ex_right_counts` |
 | 除权/非除权收益误差与因子异常对照 | 输出均值、中位数、p95、极值、分位和 robust z-score 尾部率 | 验证全部字段、样本组和有限值合同 | `ex_right_factor_diagnostics`、`ex_right_return_errors` |
 | Top4 除权贡献及 raw/HFQ 四臂比较 | 固定名单计算持有期贡献，四臂必须同时存在 | 验证选择数、收益贡献、四臂集合及有限值 | `ex_right_top4`、`ex_right_portfolio` |
