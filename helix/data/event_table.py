@@ -27,6 +27,7 @@ from .event_lineage import (
     audit_column_names,
     load_event_calendar,
     load_event_lineage,
+    require_independent_event_calendar,
     validate_event_fields,
     validate_event_schema,
 )
@@ -108,6 +109,7 @@ class SlotIndex:
     row_order: np.ndarray   # positions into the *deduplicated, sorted* frame
     date_pos: np.ndarray
     slot: np.ndarray
+    audit_columns: frozenset[str] = field(default_factory=frozenset)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -202,6 +204,7 @@ def load_event_panel(
     train_end: str | None = None,
 ) -> EventPanel:
     """Read and govern a parquet event table before packing selected numeric fields."""
+    require_independent_event_calendar(path, calendar_path)
     manifest = load_event_lineage(lineage_path)
     audit_columns = audit_column_names(manifest)
     if feature_columns is not None:
@@ -225,8 +228,6 @@ def load_event_panel(
     validate_event_schema(schema_names, manifest, requested)
     required_audits = audit_column_names({field: manifest[field] for field in requested})
     needs_calendar = any(manifest[field].horizon > 0 for field in requested)
-    if calendar_path is not None and Path(calendar_path).resolve() == Path(path).resolve():
-        raise EventLineageError("event trading calendar must be supplied independently")
     calendar = (
         load_event_calendar(calendar_path)
         if calendar_path is not None or needs_calendar
@@ -306,14 +307,19 @@ def open_event_source(
     """
     import pyarrow.parquet as pq
 
+    require_independent_event_calendar(path, calendar_path)
     manifest = load_event_lineage(lineage_path)
+    all_audits = audit_column_names(manifest)
+    leaked_audits = sorted(set(feature_columns or ()) & all_audits)
+    if leaked_audits:
+        raise EventLineageError(
+            f"feature_columns cannot include event audit columns: {leaked_audits}"
+        )
     governed = list(dict.fromkeys([*(feature_columns or []), *label_columns]))
     schema_names = set(pq.ParquetFile(path).schema_arrow.names)
     validate_event_schema(schema_names, manifest, governed)
     audits = audit_column_names({field: manifest[field] for field in governed})
     needs_calendar = any(manifest[field].horizon > 0 for field in governed)
-    if calendar_path is not None and Path(calendar_path).resolve() == Path(path).resolve():
-        raise EventLineageError("event trading calendar must be supplied independently")
     calendar = (
         load_event_calendar(calendar_path)
         if calendar_path is not None or needs_calendar
@@ -326,6 +332,7 @@ def open_event_source(
     keys["_row"] = np.arange(len(keys))
     keys = normalize_frame(keys, date_column, code_column)
     index = build_slot_index(keys, date_column, code_column)
+    index.audit_columns = frozenset(all_audits)
     labels = {
         c: index.pack(pd.to_numeric(keys[c], errors="coerce").to_numpy()) for c in label_columns
     }
@@ -342,6 +349,11 @@ def stream_feature_grids(
     """Yield ``(name, grid)`` for each column, reading the parquet in column batches."""
     import pyarrow.parquet as pq
 
+    leaked_audits = sorted(set(columns) & index.audit_columns)
+    if leaked_audits:
+        raise EventLineageError(
+            f"stream cannot emit event audit columns: {leaked_audits}"
+        )
     take = keys["_row"].to_numpy()
     for start in range(0, len(columns), batch_size):
         batch = columns[start : start + batch_size]

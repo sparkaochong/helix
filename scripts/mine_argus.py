@@ -17,7 +17,11 @@ from pathlib import Path
 import numpy as np
 
 from helix.config import Config
-from helix.data.event_lineage import audit_column_names, load_event_lineage
+from helix.data.event_lineage import (
+    audit_column_names,
+    load_event_lineage,
+    require_independent_event_calendar,
+)
 from helix.data.event_table import (
     EventPanel,
     numeric_feature_columns,
@@ -67,6 +71,7 @@ def main() -> None:
     cfg = Config.load(args.config)
     path = Path(args.input)
     labels = list(DEFAULT_LABELS)
+    require_independent_event_calendar(path, args.calendar)
     manifest = load_event_lineage(args.lineage)
     features = numeric_feature_columns(
         path, labels, extra_excluded=tuple(audit_column_names(manifest))

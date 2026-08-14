@@ -57,6 +57,14 @@ class EventAuditColumns:
 EventLineageManifest = dict[str, EventAuditColumns]
 
 
+def require_independent_event_calendar(
+    event_path: Path | str, calendar_path: Path | str | None
+) -> None:
+    """Reject using the governed event table as its own calendar authority."""
+    if calendar_path is not None and Path(event_path).resolve() == Path(calendar_path).resolve():
+        raise EventLineageError("event trading calendar must be supplied independently")
+
+
 def _manifest_error(message: str, exc: Exception | None = None) -> EventLineageError:
     error = EventLineageError(f"invalid event lineage manifest: {message}")
     if exc is not None:

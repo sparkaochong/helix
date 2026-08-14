@@ -27,6 +27,8 @@ from helix.data.event_table import (
     is_label_column,
     load_event_panel,
     numeric_feature_columns,
+    open_event_source,
+    stream_feature_grids,
 )
 from helix.eval.ic import daily_ic, summarize_ic
 from helix.gp.event_primitives import (
@@ -416,6 +418,35 @@ def test_explicit_feature_columns_reject_physical_audit_columns(tmp_path):
             lineage_path=_write_manifest(tmp_path),
             calendar_path=tmp_path / "calendar.parquet",
         )
+
+
+def test_streaming_source_rejects_explicit_audit_feature_before_read(tmp_path):
+    path = tmp_path / "events.parquet"
+    _governed_frame().to_parquet(path, index=False)
+
+    with pytest.raises(EventLineageError, match="feature_columns.*audit.*feature_source_date"):
+        open_event_source(
+            path,
+            ["label_d2_return_hfq"],
+            lineage_path=_write_manifest(tmp_path),
+            calendar_path=_write_calendar(tmp_path),
+            feature_columns=["feat_a", "feature_source_date"],
+        )
+
+
+def test_streaming_grids_cannot_emit_a_physical_audit_column(tmp_path):
+    path = tmp_path / "events.parquet"
+    _governed_frame().to_parquet(path, index=False)
+    index, _, keys = open_event_source(
+        path,
+        ["label_d2_return_hfq"],
+        lineage_path=_write_manifest(tmp_path),
+        calendar_path=_write_calendar(tmp_path),
+        feature_columns=["feat_a"],
+    )
+
+    with pytest.raises(EventLineageError, match="stream.*audit.*feature_source_date"):
+        list(stream_feature_grids(path, keys, index, ["feature_source_date"]))
 
 
 def test_ragged_days_pack_into_slots(frame):

@@ -19,6 +19,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import backtest_argus  # noqa: E402
+import mine_argus  # noqa: E402
 from backtest_argus import (  # noqa: E402
     COMMISSION_BPS,
     ENTRY_HFQ,
@@ -35,6 +36,8 @@ from backtest_argus import (  # noqa: E402
     target_hit,
 )
 from fillability import unfillable_mask  # noqa: E402
+
+from helix.data.event_lineage import EventLineageError  # noqa: E402
 
 
 def test_stamp_duty_is_charged_on_the_sell_side_only():
@@ -149,6 +152,35 @@ def test_backtest_cli_rejects_omitted_lineage(monkeypatch, capsys):
     with pytest.raises(SystemExit, match="2"):
         backtest_argus.main()
     assert "--lineage" in capsys.readouterr().err
+
+
+def test_mine_cli_rejects_omitted_lineage(monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["mine_argus.py", "--input", "events.parquet", "--calendar", "calendar.parquet"],
+    )
+    with pytest.raises(SystemExit, match="2"):
+        mine_argus.main()
+    assert "--lineage" in capsys.readouterr().err
+
+
+def test_backtest_rejects_event_file_as_its_own_calendar(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "backtest_argus.py",
+            "--input",
+            "same.parquet",
+            "--calendar",
+            "same.parquet",
+            "--lineage",
+            "missing.json",
+        ],
+    )
+    with pytest.raises(EventLineageError, match="calendar.*independently"):
+        backtest_argus.main()
 
 
 def _book(scores, unfillable, hit, to_close) -> pd.DataFrame:

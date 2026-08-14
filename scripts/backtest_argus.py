@@ -52,6 +52,7 @@ from helix.data.event_lineage import (
     audit_column_names,
     load_event_calendar,
     load_event_lineage,
+    require_independent_event_calendar,
     validate_event_fields,
     validate_event_schema,
 )
@@ -342,6 +343,7 @@ def main() -> None:
                     help="Per-day portfolio return for every (seed, exit, slippage). "
                          "Feeds window_stats.py.")
     args = ap.parse_args()
+    require_independent_event_calendar(args.input, args.calendar)
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     slippages = [float(s) for s in args.slippage_grid.split(",") if s.strip()]
     # None first, so the ungated book is always the reference every gate is read against.
