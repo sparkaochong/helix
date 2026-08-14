@@ -279,7 +279,8 @@ def render_report(payload: dict[str, object]) -> str:
   `{config['transfer_bps']}`，印花税 `{config['stamp_sell_bps_before_cut']}` →
   `{config['stamp_sell_bps']}`，单边滑点 `{config['slippage_bps']}`。
 - circular moving block bootstrap：块长 `{metadata['block_length']}`，种子
-  `{metadata['seeds']}`；完整交易日截面为最小重采样单位。
+  `{metadata['seeds']}`；完整交易日截面为最小重采样单位；95% CI 使用
+  2.5% / 97.5% 线性百分位法。
 
 ## 核心指标
 

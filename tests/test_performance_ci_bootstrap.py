@@ -288,6 +288,7 @@ def test_report_renders_ci_decision_and_reproduction_contract():
     assert "0.012345" in report
     assert LIFT_DOWNGRADE in report
     assert "2024-09-02" in report
+    assert "百分位法" in report
     assert "--cache-only" in report
     assert "7,13,42,101,211,307,419,523,631,743" in report
 
