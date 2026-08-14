@@ -589,6 +589,20 @@ def _minimal_evidence() -> dict[str, object]:
             [{"节点": "数据源层", "口径": "原始价+点时复权因子", "未来函数": "未发现"}]
         ),
         "adjustment_stats": pd.DataFrame([{"指标": "收益错配数", "值": 1}]),
+        "adjustment_audit": {
+            "event_prices_match_raw": True,
+            "event_returns_match_raw": True,
+            "event_return_rounding_error_max": 0.0,
+            "event_raw_hit_mismatch_count": 0,
+            "return_mismatch_count": 1,
+            "hit_flip_count": 1,
+            "adjustment_hit_flip_count": 1,
+            "equal_factor_hit_flip_count": 0,
+            "event_label_to_hfq_hit_difference_count": 1,
+            "holding_ex_right_count": 1,
+            "mean_return_delta": 0.0,
+            "max_abs_return_delta": 0.01,
+        },
         "ex_right_samples": pd.DataFrame([{"trade_date": "2024-01-03", "n": 1}]),
         "ex_right_counts": pd.DataFrame(
             [
@@ -795,6 +809,7 @@ def test_invalid_evidence_writes_no_partial_outputs(tmp_path: Path) -> None:
         "ex_right_top4_summary",
         "ex_right_portfolio_comparison",
         "quintile_monotonicity",
+        "adjustment_audit",
     ],
 )
 def test_missing_core_audit_contract_refuses_publish(
@@ -871,6 +886,42 @@ def test_missing_input_hash_refuses_publish(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="input hashes"):
+        write_outputs(evidence, paths)
+
+
+def test_missing_effective_cost_field_refuses_publish(tmp_path: Path) -> None:
+    evidence = _minimal_evidence()
+    del evidence["metadata"]["effective_backtest"]["commission_bps"]
+    paths = OutputPaths(
+        report=tmp_path / "report.md",
+        json=tmp_path / "evidence.json",
+        daily=tmp_path / "daily.parquet",
+        equity_svg=tmp_path / "equity.svg",
+        decay_svg=tmp_path / "decay.svg",
+    )
+
+    with pytest.raises(ValueError, match="complete BacktestConfig"):
+        write_outputs(evidence, paths)
+
+
+def test_daily_artifact_exit_date_must_match_across_four_arms(tmp_path: Path) -> None:
+    evidence = _minimal_evidence()
+    artifact = evidence["daily_artifact"]
+    wrong_row = (
+        artifact["horizon"].eq(2)
+        & artifact["score_basis"].eq("raw_common")
+        & artifact["cost_basis"].eq("gross")
+    )
+    artifact.loc[wrong_row, "exit_date"] = "2024-01-02"
+    paths = OutputPaths(
+        report=tmp_path / "report.md",
+        json=tmp_path / "evidence.json",
+        daily=tmp_path / "daily.parquet",
+        equity_svg=tmp_path / "equity.svg",
+        decay_svg=tmp_path / "decay.svg",
+    )
+
+    with pytest.raises(ValueError, match="exit dates"):
         write_outputs(evidence, paths)
 
 

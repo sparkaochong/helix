@@ -2314,6 +2314,7 @@ def validate_evidence(evidence: dict[str, object]) -> None:
         "summary",
         "adjustment_matrix",
         "adjustment_stats",
+        "adjustment_audit",
         "ex_right_samples",
         "ex_right_counts",
         "ex_right_factor_diagnostics",
@@ -2364,8 +2365,54 @@ def validate_evidence(evidence: dict[str, object]) -> None:
         if not re.fullmatch(r"[0-9a-f]{64}", str(metadata[key])):
             raise ValueError(f"metadata {key} must be a SHA256 digest")
     effective_backtest = metadata["effective_backtest"]
-    if not isinstance(effective_backtest, dict) or effective_backtest.get("top_k") != 4:
+    expected_backtest_fields = set(BacktestConfig.model_fields)
+    if (
+        not isinstance(effective_backtest, dict)
+        or set(effective_backtest) != expected_backtest_fields
+    ):
+        raise ValueError("effective config must contain the complete BacktestConfig")
+    try:
+        validated_backtest = BacktestConfig.model_validate(effective_backtest)
+    except ValueError as error:
+        raise ValueError("effective config must contain valid BacktestConfig values") from error
+    if (
+        validated_backtest.top_k != 4
+        or validated_backtest.exit_rule != "close"
+        or validated_backtest.enable_realistic_exit
+    ):
         raise ValueError("effective backtest metadata must preserve the Top4 contract")
+    adjustment_audit = evidence["adjustment_audit"]
+    adjustment_required = {
+        "event_prices_match_raw",
+        "event_returns_match_raw",
+        "event_return_rounding_error_max",
+        "event_raw_hit_mismatch_count",
+        "return_mismatch_count",
+        "hit_flip_count",
+        "adjustment_hit_flip_count",
+        "equal_factor_hit_flip_count",
+        "event_label_to_hfq_hit_difference_count",
+        "holding_ex_right_count",
+        "mean_return_delta",
+        "max_abs_return_delta",
+    }
+    if not isinstance(adjustment_audit, dict) or adjustment_required - set(
+        adjustment_audit
+    ):
+        raise ValueError("adjustment audit is missing required metrics")
+    numeric_adjustment = adjustment_required - {
+        "event_prices_match_raw",
+        "event_returns_match_raw",
+    }
+    if not np.isfinite(
+        np.asarray([adjustment_audit[key] for key in numeric_adjustment], dtype=float)
+    ).all():
+        raise ValueError("adjustment audit required metrics must be finite")
+    if adjustment_audit["hit_flip_count"] != (
+        adjustment_audit["adjustment_hit_flip_count"]
+        + adjustment_audit["equal_factor_hit_flip_count"]
+    ):
+        raise ValueError("adjustment hit-flip classification must reconcile")
     for name in (
         "adjustment_matrix",
         "adjustment_stats",
@@ -2550,6 +2597,10 @@ def validate_evidence(evidence: dict[str, object]) -> None:
         ]
         if any(dates != date_sets[0] for dates in date_sets[1:]):
             raise ValueError(f"daily artifact D+{horizon} arm dates must match")
+        if block.groupby("date")["exit_date"].nunique(dropna=False).ne(1).any():
+            raise ValueError(
+                f"daily artifact D+{horizon} exit dates must match across four arms"
+            )
         boundary = decay_summary.loc[
             decay_summary["horizon"].astype(int) == int(horizon)
         ]
