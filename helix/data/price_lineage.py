@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, time, timedelta
 from hashlib import sha256
 
 import numpy as np
@@ -11,10 +13,40 @@ import pandas as pd
 
 HFQ_BASIS = "hfq"
 ADJUSTMENT_ALGORITHM = "raw-times-same-day-adj-v1"
+_VERSION_RE = re.compile(rf"{ADJUSTMENT_ALGORITHM}:[0-9a-f]{{64}}")
+_AS_OF_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+08:00")
 
 
 class PriceLineageError(ValueError):
     """Raised when adjusted-price provenance cannot be trusted."""
+
+
+def _parse_source_date(value: str) -> datetime.date:
+    text = str(value)
+    try:
+        if re.fullmatch(r"\d{8}", text):
+            return datetime.strptime(text, "%Y%m%d").date()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        pass
+    raise PriceLineageError(f"invalid source date {value!r}")
+
+
+def _parse_as_of_time(value: str, source_date: datetime.date) -> None:
+    text = str(value)
+    if not _AS_OF_RE.fullmatch(text):
+        raise PriceLineageError(f"invalid as_of_time {value!r}")
+    try:
+        as_of_time = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise PriceLineageError(f"invalid as_of_time {value!r}") from exc
+    if as_of_time.utcoffset() != timedelta(hours=8):
+        raise PriceLineageError(f"as_of_time must use +08:00, got {value!r}")
+    if as_of_time.date() != source_date:
+        raise PriceLineageError(f"as_of_time is not local to source date {source_date.isoformat()}")
+    if as_of_time.timetz().replace(tzinfo=None) > time(15):
+        raise PriceLineageError(f"as_of_time is after market close {value!r}")
 
 
 @dataclass(frozen=True)
@@ -31,18 +63,23 @@ class PriceLineage:
     adj_factor_version: str
 
     def __post_init__(self) -> None:
-        source_date = np.asarray(self.source_date).astype(str)
-        as_of_time = np.asarray(self.as_of_time).astype(str)
+        source_date = np.array(self.source_date, dtype=str, copy=True)
+        as_of_time = np.array(self.as_of_time, dtype=str, copy=True)
         if source_date.ndim != 1 or as_of_time.ndim != 1:
             raise PriceLineageError("price lineage dates must be one-dimensional")
         if source_date.shape != as_of_time.shape:
             raise PriceLineageError("price lineage source_date and as_of_time shapes differ")
-        if not self.adj_factor_version:
-            raise PriceLineageError("price lineage adj_factor_version must not be empty")
+        version = str(self.adj_factor_version)
+        if not _VERSION_RE.fullmatch(version):
+            raise PriceLineageError(f"unsupported adj_factor_version {version!r}")
+        for source, as_of in zip(source_date, as_of_time, strict=True):
+            _parse_as_of_time(as_of, _parse_source_date(source))
+        source_date.setflags(write=False)
+        as_of_time.setflags(write=False)
         object.__setattr__(self, "source_date", source_date)
         object.__setattr__(self, "as_of_time", as_of_time)
         object.__setattr__(self, "price_basis", str(self.price_basis))
-        object.__setattr__(self, "adj_factor_version", str(self.adj_factor_version))
+        object.__setattr__(self, "adj_factor_version", version)
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, PriceLineage):
@@ -74,22 +111,13 @@ def adjustment_factor_version(frame: pd.DataFrame) -> str:
     return f"{ADJUSTMENT_ALGORITHM}:{digest.hexdigest()}"
 
 
-def _local_date(value: str) -> str:
-    return "".join(char for char in str(value)[:10] if char.isdigit())
-
-
-def _canonical_date(value: str) -> str:
-    date = _local_date(value)
-    if len(date) != 8:
-        raise PriceLineageError(f"invalid source date {value!r}")
-    return f"{date[:4]}-{date[4:6]}-{date[6:]}"
-
-
 def make_hfq_lineage(dates: Sequence[str] | np.ndarray, version: str) -> PriceLineage:
     source_date = np.asarray(dates).astype(str)
     return PriceLineage(
         source_date=source_date,
-        as_of_time=np.asarray([f"{_canonical_date(date)}T15:00:00+08:00" for date in source_date]),
+        as_of_time=np.asarray(
+            [f"{_parse_source_date(date).isoformat()}T15:00:00+08:00" for date in source_date]
+        ),
         price_basis=HFQ_BASIS,
         adj_factor_version=version,
     )
@@ -128,10 +156,12 @@ def require_hfq_lineage(
                 f"{purpose}: field {field!r} source_date does not match panel date {date}"
             )
         for source_date, as_of_time in zip(item.source_date, item.as_of_time, strict=True):
-            if _local_date(as_of_time) != _local_date(source_date):
+            try:
+                _parse_as_of_time(as_of_time, _parse_source_date(source_date))
+            except PriceLineageError as exc:
                 raise PriceLineageError(
-                    f"{purpose}: field {field!r} as_of_time is not local to source date {source_date}"
-                )
+                    f"{purpose}: field {field!r} has invalid lineage: {exc}"
+                ) from exc
         current = AdjustmentStamp(item.price_basis, item.adj_factor_version)
         if stamp is not None and current != stamp:
             raise PriceLineageError(

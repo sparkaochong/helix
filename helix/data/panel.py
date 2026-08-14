@@ -23,6 +23,7 @@ import pandas as pd
 from ..logging_setup import get_logger
 from . import schema
 from .price_lineage import (
+    AdjustmentStamp,
     PriceLineage,
     PriceLineageError,
     adjustment_factor_version,
@@ -70,7 +71,7 @@ class Panel:
     def f64(self, name: str) -> np.ndarray:
         return np.asarray(self[name], dtype=np.float64)
 
-    def require_adjusted_prices(self, fields: tuple[str, ...], purpose: str):
+    def require_adjusted_prices(self, fields: tuple[str, ...], purpose: str) -> AdjustmentStamp:
         missing = [field for field in fields if field not in self]
         if missing:
             raise PriceLineageError(f"{purpose}: missing adjusted price fields {missing}")
@@ -148,33 +149,41 @@ def _pivot(df: pd.DataFrame, value: str, dates: np.ndarray, codes: np.ndarray) -
     return wide.to_numpy(dtype=np.float32)
 
 
-def _deduplicate_adjustment_rows(adj: pd.DataFrame) -> pd.DataFrame:
+def _deduplicate_rows(frame: pd.DataFrame, columns: tuple[str, ...], row_type: str) -> pd.DataFrame:
     keys = ["trade_date", "ts_code"]
-    duplicate_rows = adj[adj.duplicated(keys, keep=False)]
+    duplicate_rows = frame[frame.duplicated(keys, keep=False)]
     for (date, code), group in duplicate_rows.groupby(keys, sort=True):
-        values = group["adj_factor"].to_numpy()
-        if not all(
-            (pd.isna(value) and pd.isna(values[0])) or value == values[0] for value in values[1:]
-        ):
-            raise PriceLineageError(
-                f"adj_factor rows conflict for {date} {code}: conflicting values"
-            )
-    return adj.drop_duplicates(keys, keep="first")
+        first = group.iloc[0]
+        for _, row in group.iloc[1:].iterrows():
+            for column in columns:
+                left, right = row[column], first[column]
+                if not ((pd.isna(left) and pd.isna(right)) or left == right):
+                    raise PriceLineageError(
+                        f"{row_type} rows conflict for {date} {code}: conflicting values"
+                    )
+    return frame.drop_duplicates(keys, keep="first")
 
 
 def build_adjusted_price_fields(
     daily: pd.DataFrame, adj: pd.DataFrame, dates: np.ndarray, codes: np.ndarray
 ) -> tuple[dict[str, np.ndarray], dict[str, PriceLineage]]:
     """Build HFQ price fields using only same-date adjustment factors."""
+    dates = np.asarray(dates).astype(str)
+    codes = np.asarray(codes).astype(str)
+    daily = daily.copy()
+    daily["trade_date"] = daily["trade_date"].astype(str)
+    daily["ts_code"] = daily["ts_code"].astype(str)
+    daily = _deduplicate_rows(daily, PRICE_COLUMNS, "daily")
     adj = adj.copy()
     adj["trade_date"] = adj["trade_date"].astype(str)
     adj["ts_code"] = adj["ts_code"].astype(str)
     adj["adj_factor"] = pd.to_numeric(adj["adj_factor"], errors="coerce")
+    adj = _deduplicate_rows(adj, ("adj_factor",), "adj_factor")
     adj = adj[adj["trade_date"].isin(dates) & adj["ts_code"].isin(codes)]
-    adj = _deduplicate_adjustment_rows(adj)
     adj_factor = _pivot(adj, "adj_factor", dates, codes)
-    raw_close = _pivot(daily, "close", dates, codes)
-    invalid = np.isfinite(raw_close) & (~np.isfinite(adj_factor) | (adj_factor <= 0))
+    prices = {column: _pivot(daily, column, dates, codes) for column in PRICE_COLUMNS}
+    raw_price_present = np.logical_or.reduce([np.isfinite(values) for values in prices.values()])
+    invalid = raw_price_present & (~np.isfinite(adj_factor) | (adj_factor <= 0))
     if invalid.any():
         row, column = np.argwhere(invalid)[0]
         raise PriceLineageError(
@@ -185,7 +194,7 @@ def build_adjusted_price_fields(
     fields = {"adj_factor": adj_factor}
     field_lineage = {}
     for column in PRICE_COLUMNS:
-        fields[f"{column}_hfq"] = _pivot(daily, column, dates, codes) * adj_factor
+        fields[f"{column}_hfq"] = prices[column] * adj_factor
         field_lineage[f"{column}_hfq"] = lineage
     return fields, field_lineage
 
@@ -198,15 +207,9 @@ def build_panel(store: ParquetStore, start_date: str = "", end_date: str = "") -
 
     daily["trade_date"] = daily["trade_date"].astype(str)
     daily["ts_code"] = daily["ts_code"].astype(str)
-    daily = daily.drop_duplicates(["trade_date", "ts_code"], keep="last")
-
     dates = np.array(sorted(daily["trade_date"].unique()), dtype=object).astype(str)
     codes = np.array(sorted(daily["ts_code"].unique()), dtype=object).astype(str)
     log.info("building panel: %d dates x %d codes", len(dates), len(codes))
-
-    panel = Panel(dates=dates, codes=codes)
-    for col in (*PRICE_COLUMNS, "vol", "amount"):
-        panel.add(col, _pivot(daily, col, dates, codes))
 
     adj = store.read_dated(schema.ADJ_FACTOR, start_date, end_date)
     if adj.empty:
@@ -214,6 +217,10 @@ def build_panel(store: ParquetStore, start_date: str = "", end_date: str = "") -
     adj["trade_date"] = adj["trade_date"].astype(str)
     adj["ts_code"] = adj["ts_code"].astype(str)
     adjusted_fields, price_lineage = build_adjusted_price_fields(daily, adj, dates, codes)
+    daily = daily.drop_duplicates(["trade_date", "ts_code"], keep="last")
+    panel = Panel(dates=dates, codes=codes)
+    for col in (*PRICE_COLUMNS, "vol", "amount"):
+        panel.add(col, _pivot(daily, col, dates, codes))
     for name, values in adjusted_fields.items():
         panel.add(name, values, price_lineage=price_lineage.get(name))
 

@@ -73,21 +73,18 @@ def prepare(cfg: Config, rebuild: bool = False) -> Prepared:
     panel_path = cache_dir(cfg) / "panel.npz"
     rebuild_panel = rebuild or not panel_path.exists()
     if not rebuild_panel:
-        panel = Panel.load(panel_path)
-        missing = [field for field in PANEL_CACHE_REQUIRED_FIELDS if field not in panel]
-        if missing:
-            log.warning("cached panel lacks required fields %s; rebuilding", missing)
+        try:
+            panel = Panel.load(panel_path)
+            missing = [field for field in PANEL_CACHE_REQUIRED_FIELDS if field not in panel]
+            if missing:
+                raise PriceLineageError(f"missing required fields {missing}")
+            panel.require_adjusted_prices(PANEL_CACHE_REQUIRED_ADJUSTED_FIELDS, "cached panel")
+        except PriceLineageError as exc:
+            log.warning("cached panel lacks valid provenance: %s; rebuilding", exc)
             rebuild_panel = True
             rebuild = True
         else:
-            try:
-                panel.require_adjusted_prices(PANEL_CACHE_REQUIRED_ADJUSTED_FIELDS, "cached panel")
-            except PriceLineageError as exc:
-                log.warning("cached panel lacks valid adjusted-price lineage: %s; rebuilding", exc)
-                rebuild_panel = True
-                rebuild = True
-            else:
-                log.info("loaded cached panel %d dates x %d codes", *panel.shape)
+            log.info("loaded cached panel %d dates x %d codes", *panel.shape)
     if rebuild_panel:
         panel = build_panel(store, cfg.data.start_date, cfg.data.end_date)
         panel.save(panel_path)
