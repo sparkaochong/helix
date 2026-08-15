@@ -136,9 +136,9 @@ def test_run_experiment_routes_d2_boundary_rows_only_to_oos_appendix(
             "trade_date": calendar[:5],
             "stock_code": ["A", "B", "C", "D", "E"],
             "feat": 1.0,
-            "label_d2_hit_8pct": 0.0,
-            "label_px_d1_open": 10.0,
-            "label_px_d2_close": 11.0,
+            "label_d2_hit_8pct_hfq": 0.0,
+            "label_px_d1_open_hfq": 10.0,
+            "label_px_d2_close_hfq": 11.0,
         }
     )
     library = FactorLibrary(
@@ -315,32 +315,35 @@ def test_nonfinite_decision_inputs_are_no_go(value):
         assert decide_go(*args)["decision"] == "NO-GO"
 
 
-def test_formal_library_must_be_the_single_event_gp_000():
+def test_formal_library_selects_the_named_event_factor():
     valid = FactorLibrary(
         factors=[FactorSpec("gp_000", "feat", 1.0)],
         field_names=["feat"],
         windows=[],
         kind="event",
     )
-    assert validate_formal_library(valid).name == "gp_000"
+    assert validate_formal_library(valid, "gp_000").name == "gp_000"
 
-    with pytest.raises(ValueError, match="gp_000"):
-        validate_formal_library(
-            FactorLibrary(
-                factors=[FactorSpec("gp_001", "feat", 1.0)],
-                field_names=["feat"],
-                windows=[],
-                kind="event",
-            )
-        )
+    # A library with several factors is fine as long as exactly one matches the name.
+    multi = FactorLibrary(
+        factors=[FactorSpec("gp_000", "feat", 1.0), FactorSpec("gp_001", "feat", 1.0)],
+        field_names=["feat"],
+        windows=[],
+        kind="event",
+    )
+    assert validate_formal_library(multi, "gp_001").name == "gp_001"
+
+    with pytest.raises(ValueError, match="gp_002"):
+        validate_formal_library(multi, "gp_002")
     with pytest.raises(ValueError, match="exactly one"):
         validate_formal_library(
             FactorLibrary(
-                factors=[valid.factors[0], FactorSpec("gp_001", "feat", 1.0)],
+                factors=[valid.factors[0], FactorSpec("gp_000", "feat", 1.0)],
                 field_names=["feat"],
                 windows=[],
                 kind="event",
-            )
+            ),
+            "gp_000",
         )
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the formal gp_000 G3 ablation against explicit economic styles."""
+"""Run the formal G3 ablation for a named factor against explicit economic styles."""
 
 from __future__ import annotations
 
@@ -30,8 +30,8 @@ TRAIN_START = "2022-01-04"
 TRAIN_END = "2024-09-04"
 TRAIN_DATES = 649
 TRAIN_DATE_DIGEST = "df8186eafc50efa3e7ae9432e6e6327a333f7050b677f130838a17b03571e381"
-TARGET = "label_d2_hit_8pct"
-FORMAL_FACTOR = "gp_000"
+TARGET = "label_d2_hit_8pct_hfq"
+DEFAULT_FACTOR_NAME = "gp_000"
 DEFAULT_SEEDS = (7, 13, 42, 101, 211, 307, 419, 523, 631, 743)
 DEFAULT_HORIZONS = (1, 2, 3, 5, 10, 20)
 DEFAULT_BLOCK_LENGTH = 20
@@ -42,7 +42,7 @@ STYLE_COLUMNS = (
     "volatility_20d",
     "turnover_mean_20d",
 )
-LABEL_COLUMNS = (TARGET, "label_px_d1_open", "label_px_d2_close")
+LABEL_COLUMNS = (TARGET, "label_px_d1_open_hfq", "label_px_d2_close_hfq")
 REQUIRED_METRICS = (
     "ic_mean",
     "icir",
@@ -59,7 +59,7 @@ REQUIRED_METRICS = (
     "coverage",
 )
 
-DEFAULT_INPUT = PROJECT_ROOT / "data/raw/argus_quant_working.parquet"
+DEFAULT_INPUT = PROJECT_ROOT / "data/raw/argus_quant_working_hfq.parquet"
 DEFAULT_LIBRARY = PROJECT_ROOT / "data/artifacts/argus/event_factors.json"
 DEFAULT_PLACEBO = PROJECT_ROOT / "data/artifacts/placebo_ic_distribution.parquet"
 DEFAULT_MARKET_CACHE = PROJECT_ROOT / "data/artifacts/g3_style_market.parquet"
@@ -292,15 +292,16 @@ def decide_go(
     }
 
 
-def validate_formal_library(library: FactorLibrary) -> FactorSpec:
+def validate_formal_library(library: FactorLibrary, factor_name: str) -> FactorSpec:
     if library.kind != "event":
-        raise ValueError("formal gp_000 library must be an event library")
-    if len(library.factors) != 1:
-        raise ValueError("formal library must contain exactly one factor")
-    factor = library.factors[0]
-    if factor.name != FORMAL_FACTOR:
-        raise ValueError("formal library factor must be gp_000")
-    return factor
+        raise ValueError("formal library must be an event library")
+    matches = [factor for factor in library.factors if factor.name == factor_name]
+    if len(matches) != 1:
+        raise ValueError(
+            f"formal library must contain exactly one factor named {factor_name!r}, "
+            f"found {len(matches)}"
+        )
+    return matches[0]
 
 
 def load_placebo_icir_p95(path: str | Path) -> float:
@@ -611,8 +612,8 @@ def _evaluate_window(
         list(LABEL_COLUMNS),
     )
     names, values = compute_factors(library, source_panel.fields)
-    if names != [FORMAL_FACTOR]:
-        raise ValueError("formal factor replay did not return exactly gp_000")
+    if len(names) != 1:
+        raise ValueError("formal factor replay must return exactly one factor")
     columns = {"factor": values[..., 0]}
     columns.update({name: source_panel.f64(name) for name in LABEL_COLUMNS})
     aligned = source_panel.to_long(columns)
@@ -647,8 +648,8 @@ def _evaluate_window(
         industry_levels=levels,
     )
     label = panel.f64(TARGET)
-    entry = panel.f64("label_px_d1_open")
-    exit_ = panel.f64("label_px_d2_close")
+    entry = panel.f64("label_px_d1_open_hfq")
+    exit_ = panel.f64("label_px_d2_close_hfq")
     arms = {"raw": raw, "style_neutral": neutral}
     deterministic = {
         name: _evaluate_arm(score, label, entry, exit_, common_mask, panel.dates, config)
@@ -863,7 +864,7 @@ def render_report(payload: dict[str, object]) -> str:
 
 ## 数据与泄漏控制
 
-正式因子为 `data/artifacts/argus/event_factors.json` 中唯一的 `gp_000`。五类风格为
+正式因子为 `{metadata.get('library_path', '')}` 中的 `{metadata.get('factor_name', '')}`。五类风格为
 对数总市值、申万 2021 一级行业哑变量、20 日动量、20 日波动率和 20 日平均自由
 流通换手率。每个 D0 的风格只使用 D0 及此前 19 个市场交易日；每日 Gram 伪逆回归相互
 独立。训练窗末日之后的标签、退出价、衰减目标和样本外指标均不进入判定函数。
@@ -1135,6 +1136,7 @@ def run_experiment(
     top_k: int = DEFAULT_TOP_K,
     horizons: Sequence[int] = DEFAULT_HORIZONS,
     refresh_style_cache: bool = False,
+    factor_name: str = DEFAULT_FACTOR_NAME,
 ) -> dict[str, object]:
     seed_values = validate_seed_contract(seeds)
     if block_length <= 0 or top_k <= 0:
@@ -1143,7 +1145,11 @@ def run_experiment(
     if not horizon_values or horizon_values[0] < 1:
         raise ValueError("horizons must be positive")
     library = load_factors(library_path)
-    validate_formal_library(library)
+    factor = validate_formal_library(library, factor_name)
+    single_library = FactorLibrary(
+        factors=[factor], field_names=library.field_names,
+        windows=library.windows, kind=library.kind,
+    )
     columns = ["trade_date", "stock_code", *library.field_names, *LABEL_COLUMNS]
     frame = pd.read_parquet(input_path, columns=list(dict.fromkeys(columns)))
     train_by_d0, oos = split_evaluation_windows(frame)
@@ -1176,7 +1182,7 @@ def run_experiment(
     config = BacktestConfig(top_k=top_k)
     train_result = _evaluate_window(
         train,
-        library,
+        single_library,
         styles,
         members,
         prices,
@@ -1199,7 +1205,7 @@ def run_experiment(
 
     legacy_result = _evaluate_window(
         train_by_d0,
-        library,
+        single_library,
         styles,
         members,
         prices,
@@ -1247,7 +1253,7 @@ def run_experiment(
     if not oos.empty:
         oos_result = _evaluate_window(
             oos,
-            library,
+            single_library,
             styles,
             members,
             prices,
@@ -1281,7 +1287,8 @@ def run_experiment(
             "input_path": str(input_path),
             "library_path": str(library_path),
             "library_sha256": _sha256(library_path),
-            "factor_expression": library.factors[0].expression,
+            "factor_name": factor.name,
+            "factor_expression": factor.expression,
             "market_cache_sha256": _sha256(market_cache),
             "industry_cache_sha256": _sha256(industry_cache),
             "market_cache_rows": int(len(market)),
@@ -1309,6 +1316,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--library", type=Path, default=DEFAULT_LIBRARY)
+    parser.add_argument("--factor-name", default=DEFAULT_FACTOR_NAME)
     parser.add_argument("--placebo", type=Path, default=DEFAULT_PLACEBO)
     parser.add_argument("--market-cache", type=Path, default=DEFAULT_MARKET_CACHE)
     parser.add_argument("--industry-cache", type=Path, default=DEFAULT_INDUSTRY_CACHE)
@@ -1339,6 +1347,7 @@ def main() -> None:
         top_k=args.top_k,
         horizons=tuple(int(value) for value in args.horizons.split(",") if value.strip()),
         refresh_style_cache=args.refresh_style_cache,
+        factor_name=args.factor_name,
     )
     print(f"{payload['decision']['decision']}: wrote {args.report} and {args.result}")
 

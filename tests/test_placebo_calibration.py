@@ -101,7 +101,7 @@ def _small_calibration_case(tmp_path, monkeypatch):
                 {
                     "trade_date": trade_date,
                     "stock_code": f"{index:06d}",
-                    "label_d2_hit_8pct": label,
+                    "label_d2_hit_8pct_hfq": label,
                     "signal": signal,
                 }
             )
@@ -524,7 +524,7 @@ def test_training_loader_excludes_post_cutoff_extremes_from_frame_and_result(
         {
             "trade_date": ["2024-09-03", "2024-09-03", train_end, train_end],
             "stock_code": ["000001", "000002", "000001", "000002"],
-            "label_d2_hit_8pct": [0.0, 1.0, 1.0, 0.0],
+            "label_d2_hit_8pct_hfq": [0.0, 1.0, 1.0, 0.0],
             "signal": [1.0, 2.0, 3.0, 4.0],
             "unused": [10.0, 20.0, 30.0, 40.0],
         }
@@ -533,7 +533,7 @@ def test_training_loader_excludes_post_cutoff_extremes_from_frame_and_result(
         {
             "trade_date": ["2024-09-05", "2024-09-05"],
             "stock_code": ["000001", "000002"],
-            "label_d2_hit_8pct": [1.0, 1.0],
+            "label_d2_hit_8pct_hfq": [1.0, 1.0],
             "signal": [1e100, 1e100],
             "unused": [1e100, 1e100],
         }
@@ -567,7 +567,7 @@ def test_training_loader_excludes_post_cutoff_extremes_from_frame_and_result(
         assert set(call["columns"]) == {
             "trade_date",
             "stock_code",
-            "label_d2_hit_8pct",
+            "label_d2_hit_8pct_hfq",
             "signal",
         }
         assert "unused" not in call["columns"]
@@ -595,7 +595,7 @@ def test_training_loader_rejects_input_without_the_exact_formal_cutoff_date(tmp_
         {
             "trade_date": ["2024-09-03", "2024-09-03"],
             "stock_code": ["000001", "000002"],
-            "label_d2_hit_8pct": [0.0, 1.0],
+            "label_d2_hit_8pct_hfq": [0.0, 1.0],
             "signal": [1.0, 2.0],
         }
     ).to_parquet(path, index=False)
@@ -612,7 +612,7 @@ def test_training_loader_rejects_a_missing_requested_column(tmp_path):
         {
             "trade_date": ["2024-09-04", "2024-09-04"],
             "stock_code": ["000001", "000002"],
-            "label_d2_hit_8pct": [0.0, 1.0],
+            "label_d2_hit_8pct_hfq": [0.0, 1.0],
         }
     ).to_parquet(path, index=False)
 
@@ -785,7 +785,7 @@ def test_report_documents_training_only_thresholds_and_separate_scopes():
     )
     metadata = {
         "input": "data/raw/argus_quant_working.parquet",
-        "target": "label_d2_hit_8pct",
+        "target": "label_d2_hit_8pct_hfq",
         "seed": 20260813,
         "n_permutations": 1000,
         "min_samples": 50,
@@ -866,7 +866,7 @@ def _render_minimal_report(input_path: str | Path, library_path: str | Path) -> 
     )
     metadata = {
         "input": str(input_path),
-        "target": "label_d2_hit_8pct",
+        "target": "label_d2_hit_8pct_hfq",
         "seed": 20260813,
         "n_permutations": 1,
         "min_samples": 1,
@@ -1044,7 +1044,7 @@ def test_calibration_rejects_library_fields_that_are_outcomes():
     from scripts.calibrate_placebo import validate_library_fields
 
     with pytest.raises(ValueError, match="label"):
-        validate_library_fields(["volume", "label_d2_hit_8pct"])
+        validate_library_fields(["volume", "label_d2_hit_8pct_hfq"])
 
 
 def test_calibration_rejects_a_partially_replayed_library(monkeypatch):
