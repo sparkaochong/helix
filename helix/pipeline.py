@@ -86,7 +86,9 @@ def prepare(cfg: Config, rebuild: bool = False) -> Prepared:
         else:
             log.info("loaded cached panel %d dates x %d codes", *panel.shape)
     if rebuild_panel:
-        panel = build_panel(store, cfg.data.start_date, cfg.data.end_date)
+        panel = build_panel(
+            store, cfg.data.start_date, cfg.data.end_date, calendar_exchange=cfg.data.calendar_exchange
+        )
         panel.save(panel_path)
 
     fields_path = cache_dir(cfg) / "base_fields.npz"
