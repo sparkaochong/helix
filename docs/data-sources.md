@@ -141,8 +141,8 @@
 
 ## 4. 接入前必须核对的口径陷阱
 
-1. **`bak_daily.amount` 是万元，`daily.amount` 是千元**——相差 10 倍，混用会产生量级错误（详见基线校验报告 Step 2）。
-2. **`daily`/`adj_factor`/`daily_basic`/`stk_limit` 等已接入表全部用 `trade_date=YYYYMMDD`**；新接口逐个确认日期字段格式后再对齐。
+1. **`bak_daily.amount` 是万元，`daily.amount` 是千元**——相差 10 倍，混用会产生量级错误（详见基线校验报告 Step 2）。**已加装守护工具** `helix/data/unit_registry.py::bak_daily_amount_to_kcny()`（含真实数值对回归测试 `tests/test_unit_registry.py`），但 `bak_daily` 本身仍未接入下载管道——真正接入时必须走这个转换，不能绕开。
+2. **`daily`/`adj_factor`/`daily_basic`/`stk_limit` 等已接入表全部用 `trade_date=YYYYMMDD`**；新接口逐个确认日期字段格式后再对齐。**已加装统一工具** `helix/data/dates.py::normalize_trade_date()`，兼容 `YYYYMMDD` 与 `YYYY-MM-DD`。这解决的是"以后要 join 不同格式的表"这个通用问题；`argus_quant_working.parquet` 本身用 `YYYY-MM-DD`，`docs/factor-governance.md` 已把它冻结为 legacy 基线，**不会**被这个工具改写——它是给未来 join 代码用的桥接函数，不是文件迁移脚本。
 3. 财务类接口（`income`/`balancesheet`/`cashflow`/`fina_indicator`）返回**多个口径版本**（如 `balancesheet` 同一 `period` 返回合并 / 母公司两行），接入前需明确按 `report_type` / `comp_type` 过滤，避免重复行造成面板错位。
 4. 任何新接入的数据源，落盘前都必须过 `helix/data/schema.py` 同款的显式列契约校验，不能绕开 `docs/factor-governance.md` §5.1 的标签前缀盲扫等既有防泄漏机制。
 
@@ -162,3 +162,21 @@
 | 行业 / 概念结构 | `index_classify`、`index_member`、`concept` |
 
 任何一个方向真正接入前仍需走完整的 G0~G3 准入流程，本文只解决"数据拿不拿得到"，不构成任何因子有效性的背书。
+
+---
+
+## 6. 本轮修复状态（2026-08-15，`fix/data-baseline-remediation`）
+
+针对《Helix 数据基线校验》审计发现的 P1/P2 缺陷与口径陷阱，本轮已完成：
+
+| 项目 | 状态 |
+|---|---|
+| `namechange` 分页截断（P1） | **已修复**：`TushareSource._call_paginated()`，本地行数已核实变为 14,178，与官方全量一致 |
+| 配置声明区间与实际覆盖不符 | **已修复**：默认 `start_date` 纠正为如实的 `20211201`；`build_panel` 新增 `_validate_panel_coverage()` 强制校验，区间缺口直接 `PanelCoverageError` |
+| `stk_limit` 兜底规则缺 ST 5% 分支（P2） | **已修复**：`helix/data/st_status.py` + `panel.py::_limit_pct()`，仅对主板 ST/*ST 生效（科创/创业/北交所维持原板块比例，"退" 类不适用），真实数据核验 95.6% 落在 0.01 元误差内 |
+| 每日数据完整性巡检 | **已交付**：`scripts/check_data_freshness.py`（默认模式纯本地、`--deep` 模式含实时分页复核） |
+| 历史回填（2018-01~2021-11） | **工具已交付，未实际执行**：`configs/backfill_2018_2021.yaml` |
+| `bak_daily` 单位陷阱 | **已加装守护**，见 §4 第 1 条 |
+| `trade_date` 格式桥接 | **已加装工具**，见 §4 第 2 条 |
+
+完整的修复前后对比、校验数据与剩余风险见修复验证报告（Artifact，随本轮提交发布）。
