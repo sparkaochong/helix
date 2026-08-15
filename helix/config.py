@@ -20,7 +20,9 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "default.yaml"
 
 class DataConfig(BaseModel):
     root: Path = Path("data")
-    start_date: str = "20180101"
+    # Actual downloaded coverage only reaches back to 2021-12-01 as of 2026-08-15;
+    # revert to "20180101" once the historical backfill lands (see configs/backfill_2018_2021.yaml).
+    start_date: str = "20211201"
     end_date: str = ""
     calendar_exchange: str = "SSE"
     requests_per_minute: int = Field(400, gt=0)
