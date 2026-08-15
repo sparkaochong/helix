@@ -34,9 +34,9 @@ FORMAL_TRAIN_START = "2022-01-04"
 FORMAL_TRAIN_DATES = 649
 # SHA-256 of newline-joined sorted unique dates from the filtered formal input window.
 FORMAL_TRAIN_DATE_DIGEST = "df8186eafc50efa3e7ae9432e6e6327a333f7050b677f130838a17b03571e381"
-TARGET = "label_d2_hit_8pct"
+TARGET = "label_d2_hit_8pct_hfq"
 
-DEFAULT_INPUT = Path("data/raw/argus_quant_working.parquet")
+DEFAULT_INPUT = Path("data/raw/argus_quant_working_hfq.parquet")
 DEFAULT_FORMAL_LIBRARY = Path("data/artifacts/argus/event_factors.json")
 DEFAULT_N40_LIBRARY = Path("data/artifacts/argus_n40/event_factors.json")
 DEFAULT_MULTI_LIBRARY = Path("data/artifacts/argus_multi/event_factors.json")
