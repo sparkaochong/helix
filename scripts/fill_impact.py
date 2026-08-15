@@ -137,8 +137,8 @@ def evaluate(scored: pd.DataFrame, label: str, k: int) -> dict[str, dict]:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", required=True)
-    ap.add_argument("--label", default="label_d2_hit_8pct")
-    ap.add_argument("--ic-target", default="label_d2_peak_return")
+    ap.add_argument("--label", default="label_d2_hit_8pct_hfq")
+    ap.add_argument("--ic-target", default="label_d2_peak_return_hfq")
     ap.add_argument("--split-date", default="2024-09-04")
     ap.add_argument("--embargo-days", type=int, default=3)
     ap.add_argument("--top-k", type=int, default=20)

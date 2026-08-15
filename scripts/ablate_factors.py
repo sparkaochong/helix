@@ -130,8 +130,8 @@ def main() -> None:
                          "categorical the model should have been using can sit unread in "
                          "the table indefinitely without anything reporting it missing.")
     ap.add_argument("--features", required=True, help="JSON list of base feature column names")
-    ap.add_argument("--label", default="label_d2_hit_8pct")
-    ap.add_argument("--ic-target", default="label_d2_peak_return")
+    ap.add_argument("--label", default="label_d2_hit_8pct_hfq")
+    ap.add_argument("--ic-target", default="label_d2_peak_return_hfq")
     ap.add_argument("--split-date", required=True, help="Train on dates <= this, test after")
     ap.add_argument("--embargo-days", type=int, default=3,
                     help="Trade dates dropped either side of the split; a D0 row resolves on D+2.")
