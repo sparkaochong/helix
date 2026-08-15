@@ -30,6 +30,7 @@ from .price_lineage import (
     make_hfq_lineage,
     require_hfq_lineage,
 )
+from .st_status import point_in_time_risk_warning_mask
 from .store import ParquetStore
 
 log = get_logger(__name__)
@@ -321,28 +322,43 @@ def build_panel(
     return panel
 
 
-def _limit_pct(codes: np.ndarray, store: ParquetStore) -> np.ndarray:
-    """Per-stock daily limit as a fraction, from board rules. Shape ``(N,)``."""
+def _limit_pct(dates: np.ndarray, codes: np.ndarray, store: ParquetStore) -> np.ndarray:
+    """Per-stock, per-date daily limit as a fraction, from board rules + point-in-time
+    ST override. Shape ``(T, N)``.
+
+    The 5% ST band only applies to main-board risk-warning names; STAR/ChiNext/BSE
+    keep their own 20%/20%/30% band even when ST-flagged, and "退" (delisting
+    consolidation) names follow neither -- see
+    :func:`helix.data.st_status.point_in_time_risk_warning_mask`. Real-data
+    validation against the local store (2026-08-15 remediation) confirmed 95.6%
+    agreement with official ``stk_limit`` values once scoped this way, vs. 2.6% for
+    a blanket "any ST marker -> 5%" rule.
+    """
     basic = store.read_static(schema.STOCK_BASIC)
     market = (
         basic.set_index(basic["ts_code"].astype(str))["market"].astype(str).to_dict()
         if not basic.empty
         else {}
     )
-    pct = np.full(len(codes), 0.10)
+    board_pct = np.full(len(codes), 0.10)
     for j, code in enumerate(codes):
         mkt = market.get(code, "")
         if code.startswith("688") or code.startswith("689"):
-            pct[j] = 0.20  # 科创板
+            board_pct[j] = 0.20  # 科创板
         elif code.startswith("30"):
-            pct[j] = 0.20  # 创业板 (post-2020-08; conservative for the whole sample)
+            board_pct[j] = 0.20  # 创业板 (post-2020-08; conservative for the whole sample)
         elif code.endswith(".BJ") or mkt == "北交所":
-            pct[j] = 0.30
+            board_pct[j] = 0.30
+    is_main_board = board_pct == 0.10
+
+    pct = np.broadcast_to(board_pct[None, :], (len(dates), len(codes))).copy()
+    risk_warning = point_in_time_risk_warning_mask(dates, codes, store)
+    pct[risk_warning & is_main_board[None, :]] = 0.05
     return pct
 
 
 def _fallback_limit_prices(panel: Panel, store: ParquetStore) -> tuple[np.ndarray, np.ndarray]:
     """Rule-based limit prices from ``pre_close``, used where stk_limit has gaps."""
-    pct = _limit_pct(panel.codes, store)[None, :]
+    pct = _limit_pct(panel.dates, panel.codes, store)
     pre = panel["pre_close"].astype(np.float64)
     return np.round(pre * (1 + pct), 2), np.round(pre * (1 - pct), 2)

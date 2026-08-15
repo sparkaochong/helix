@@ -15,52 +15,15 @@ from ..config import UniverseConfig
 from ..logging_setup import get_logger
 from . import schema
 from .panel import Panel
+from .st_status import point_in_time_st_mask
 from .store import ParquetStore
 
 log = get_logger(__name__)
 
-ST_MARKERS = ("ST", "*ST", "退")
-
-
-def _looks_st(name: str) -> bool:
-    upper = str(name).upper().replace(" ", "")
-    return any(marker in upper for marker in ST_MARKERS)
-
 
 def st_mask(panel: Panel, store: ParquetStore) -> np.ndarray:
     """``(T, N)`` bool: True where the stock was ST / delisting-flagged on that date."""
-    dates, codes = panel.dates, panel.codes
-    mask = np.zeros((len(dates), len(codes)), dtype=bool)
-    code_index = {code: j for j, code in enumerate(codes)}
-
-    changes = store.read_static(schema.NAMECHANGE)
-    covered: set[str] = set()
-    if not changes.empty:
-        changes = changes.dropna(subset=["ts_code", "name", "start_date"]).copy()
-        changes["ts_code"] = changes["ts_code"].astype(str)
-        changes["start_date"] = changes["start_date"].astype(str)
-        covered = set(changes["ts_code"])
-        for row in changes.itertuples(index=False):
-            j = code_index.get(row.ts_code)
-            if j is None or not _looks_st(row.name):
-                continue
-            lo = int(np.searchsorted(dates, row.start_date, "left"))
-            end = str(row.end_date) if pd.notna(row.end_date) else ""
-            hi = int(np.searchsorted(dates, end, "right")) if end else len(dates)
-            if hi > lo:
-                mask[lo:hi, j] = True
-
-    # Stocks with no namechange history: fall back to the current name for all dates.
-    basic = store.read_static(schema.STOCK_BASIC)
-    if not basic.empty:
-        for row in basic.itertuples(index=False):
-            code = str(row.ts_code)
-            if code in covered:
-                continue
-            j = code_index.get(code)
-            if j is not None and _looks_st(row.name):
-                mask[:, j] = True
-    return mask
+    return point_in_time_st_mask(panel.dates, panel.codes, store)
 
 
 def listing_mask(panel: Panel, store: ParquetStore, min_list_days: int) -> np.ndarray:
