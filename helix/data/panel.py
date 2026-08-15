@@ -37,6 +37,10 @@ log = get_logger(__name__)
 PRICE_COLUMNS = ("open", "high", "low", "close", "pre_close")
 
 
+class PanelCoverageError(RuntimeError):
+    """Raised when the store has fewer trading days than the requested/declared range."""
+
+
 @dataclass
 class Panel:
     dates: np.ndarray  # (T,) YYYYMMDD strings, ascending
@@ -213,7 +217,50 @@ def build_adjusted_price_fields(
     return fields, field_lineage
 
 
-def build_panel(store: ParquetStore, start_date: str = "", end_date: str = "") -> Panel:
+def _validate_panel_coverage(
+    dates: np.ndarray, store: ParquetStore, start_date: str, end_date: str, calendar_exchange: str
+) -> None:
+    """Fail closed if the assembled panel silently has fewer trading days than it should.
+
+    An empty ``start_date``/``end_date`` means "whatever the store actually has" -- so
+    the lower/upper bound for "expected" defaults to the panel's own earliest/latest
+    date, not the dawn of the exchange's calendar. An *explicit* start/end date is
+    checked against reality: this is exactly the shape of the bug that let the store
+    silently start at 2021-12-01 while ``data.start_date`` claimed 2018-01-01.
+    """
+    cal = store.read_static(schema.TRADE_CAL)
+    if cal.empty:
+        log.warning("trade_cal is empty; skipping panel coverage validation")
+        return
+    cal = cal[cal["exchange"].astype(str) == calendar_exchange]
+    open_days = sorted(
+        cal.loc[pd.to_numeric(cal["is_open"], errors="coerce") == 1, "cal_date"].astype(str)
+    )
+    if not open_days:
+        log.warning("trade_cal has no open days for exchange %s; skipping coverage validation", calendar_exchange)
+        return
+
+    lo = start_date or (dates[0] if len(dates) else open_days[0])
+    hi = end_date or (dates[-1] if len(dates) else open_days[-1])
+    expected = [d for d in open_days if lo <= d <= hi]
+    actual = set(dates.tolist())
+    missing = [d for d in expected if d not in actual]
+    if missing:
+        pct = 100.0 * len(missing) / len(expected)
+        message = (
+            f"panel coverage gap: {len(missing)}/{len(expected)} ({pct:.1f}%) configured "
+            f"trading days in [{lo}, {hi}] have no data in the store "
+            f"(earliest actual date {dates[0] if len(dates) else 'N/A'}); "
+            f"first missing {missing[0]}, last missing {missing[-1]}. "
+            "Run `helix download` (or a backfill config) to close the gap before building the panel."
+        )
+        log.error(message)
+        raise PanelCoverageError(message)
+
+
+def build_panel(
+    store: ParquetStore, start_date: str = "", end_date: str = "", calendar_exchange: str = "SSE"
+) -> Panel:
     """Assemble the raw panel from the local store. No derived features yet."""
     daily = store.read_dated(schema.DAILY, start_date, end_date)
     if daily.empty:
@@ -224,6 +271,7 @@ def build_panel(store: ParquetStore, start_date: str = "", end_date: str = "") -
     dates = np.array(sorted(daily["trade_date"].unique()), dtype=object).astype(str)
     codes = np.array(sorted(daily["ts_code"].unique()), dtype=object).astype(str)
     log.info("building panel: %d dates x %d codes", len(dates), len(codes))
+    _validate_panel_coverage(dates, store, start_date, end_date, calendar_exchange)
 
     adj = store.read_dated(schema.ADJ_FACTOR, start_date, end_date)
     if adj.empty:
