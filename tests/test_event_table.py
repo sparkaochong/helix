@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,12 +12,24 @@ import pytest
 
 from helix import pipeline_events
 from helix.config import Config
+from helix.data.event_lineage import (
+    EventAuditColumns,
+    EventLineageError,
+    audit_column_names,
+    load_event_calendar,
+    load_event_lineage,
+    validate_event_fields,
+)
 from helix.data.event_table import (
     EventPanel,
     assert_no_label_columns,
     build_event_panel,
     is_label_column,
+    load_event_panel,
     numeric_feature_columns,
+    open_event_source,
+    stream_feature_grids,
+    validate_event_parquet_fields,
 )
 from helix.eval.ic import daily_ic, summarize_ic
 from helix.gp.event_primitives import (
@@ -40,6 +54,710 @@ def frame() -> pd.DataFrame:
             "label_hit": [1.0, 0.0, 0.0, 1.0, 0.0],
         }
     )
+
+
+VERSION = "raw-times-same-day-adj-v1:" + "a" * 64
+CALENDAR = ["20240102", "20240103", "20240104", "20240105"]
+
+
+def _governed_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "trade_date": ["20240102", "20240103"],
+            "stock_code": ["000001.SZ", "000002.SZ"],
+            "feat_a": [1.0, 2.0],
+            "feat_b": [3.0, 4.0],
+            "label_d2_return_hfq": [0.1, -0.1],
+            "feature_source_date": ["20240102", "2024-01-03"],
+            "feature_as_of_time": [
+                "2024-01-02T15:00:00+08:00",
+                "2024-01-03T14:59:59+08:00",
+            ],
+            "feature_price_basis": ["hfq", "hfq"],
+            "feature_adj_factor_version": [VERSION, VERSION],
+            "outcome_source_date": ["20240104", "2024-01-05"],
+            "outcome_as_of_time": [
+                "2024-01-04T15:00:00+08:00",
+                "2024-01-05T15:00:00+08:00",
+            ],
+            "outcome_price_basis": ["hfq", "hfq"],
+            "outcome_adj_factor_version": [VERSION, VERSION],
+        }
+    )
+
+
+def _manifest_dict() -> dict:
+    feature_audit = {
+        "source_date": "feature_source_date",
+        "as_of_time": "feature_as_of_time",
+        "price_basis": "feature_price_basis",
+        "adj_factor_version": "feature_adj_factor_version",
+        "horizon": 0,
+    }
+    return {
+        "schema_version": 1,
+        "fields": {
+            "feat_a": feature_audit,
+            "feat_b": feature_audit.copy(),
+            "label_d2_return_hfq": {
+                "source_date": "outcome_source_date",
+                "as_of_time": "outcome_as_of_time",
+                "price_basis": "outcome_price_basis",
+                "adj_factor_version": "outcome_adj_factor_version",
+                "horizon": 2,
+            },
+        },
+    }
+
+
+def _write_manifest(tmp_path, payload: dict | str | None = None) -> Path:
+    path = tmp_path / "event-lineage.json"
+    if isinstance(payload, str):
+        path.write_text(payload, encoding="utf-8")
+    else:
+        path.write_text(json.dumps(_manifest_dict() if payload is None else payload), encoding="utf-8")
+    return path
+
+
+def _write_calendar(tmp_path) -> Path:
+    path = tmp_path / "calendar.parquet"
+    pd.DataFrame({"cal_date": CALENDAR, "is_open": 1}).to_parquet(path, index=False)
+    return path
+
+
+def test_event_lineage_manifest_is_required():
+    with pytest.raises(EventLineageError, match="event lineage manifest is required"):
+        load_event_lineage(None)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not json",
+        {"schema_version": 2, "fields": {}},
+        {"schema_version": 1},
+        {"schema_version": 1, "fields": [], "extra": True},
+        {"schema_version": 1, "fields": {"feat_a": {"horizon": 0}}},
+        {
+            "schema_version": 1,
+            "fields": {
+                "feat_a": {
+                    "source_date": "source",
+                    "as_of_time": "asof",
+                    "price_basis": "basis",
+                    "adj_factor_version": "version",
+                    "horizon": -1,
+                }
+            },
+        },
+    ],
+)
+def test_invalid_event_lineage_manifest_fails_with_governed_error(tmp_path, payload):
+    path = _write_manifest(tmp_path, payload)
+    with pytest.raises(EventLineageError, match="event lineage manifest"):
+        load_event_lineage(path)
+
+
+def test_manifest_loads_frozen_audit_entries_and_exposes_shared_columns(tmp_path):
+    manifest = load_event_lineage(_write_manifest(tmp_path))
+
+    assert manifest["feat_a"] == EventAuditColumns(
+        "feature_source_date",
+        "feature_as_of_time",
+        "feature_price_basis",
+        "feature_adj_factor_version",
+        0,
+    )
+    assert manifest["feat_a"] == manifest["feat_b"]
+    assert audit_column_names(manifest) == {
+        "feature_source_date",
+        "feature_as_of_time",
+        "feature_price_basis",
+        "feature_adj_factor_version",
+        "outcome_source_date",
+        "outcome_as_of_time",
+        "outcome_price_basis",
+        "outcome_adj_factor_version",
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda frame: frame.drop(columns="feature_source_date"), "feat_a.*source_date.*missing"),
+        (lambda frame: frame.drop(columns="feature_as_of_time"), "feat_a.*as_of_time.*missing"),
+        (lambda frame: frame.drop(columns="feature_price_basis"), "feat_a.*price_basis.*missing"),
+        (
+            lambda frame: frame.drop(columns="feature_adj_factor_version"),
+            "feat_a.*adj_factor_version.*missing",
+        ),
+        (lambda frame: frame.assign(feature_price_basis="raw"), "feat_a.*price_basis.*20240102"),
+        (
+            lambda frame: frame.assign(feature_price_basis=["hfq", "raw"]),
+            "feat_a.*price_basis.*20240103",
+        ),
+        (
+            lambda frame: frame.assign(feature_price_basis=["hfq", None]),
+            "feat_a.*price_basis.*20240103",
+        ),
+        (
+            lambda frame: frame.assign(feature_adj_factor_version="bad"),
+            "feat_a.*adj_factor_version.*20240102",
+        ),
+        (
+            lambda frame: frame.assign(feature_adj_factor_version=[VERSION, VERSION[:-1] + "b"]),
+            "feat_a.*adjustment version.*20240103",
+        ),
+        (
+            lambda frame: frame.assign(feature_source_date=["20240102", "2024/01/03"]),
+            "feat_a.*source_date.*20240103",
+        ),
+        (
+            lambda frame: frame.assign(
+                feature_as_of_time=["2024-01-02T15:00:00+08:00", "not-a-time"]
+            ),
+            "feat_a.*as_of_time.*20240103",
+        ),
+        (
+            lambda frame: frame.assign(
+                feature_as_of_time=[
+                    "2024-01-02T15:00:00+08:00",
+                    "2024-01-03T15:00:00+00:00",
+                ]
+            ),
+            r"feat_a.*\+08:00.*20240103",
+        ),
+        (
+            lambda frame: frame.assign(
+                feature_as_of_time=[
+                    "2024-01-02T15:00:01+08:00",
+                    "2024-01-03T15:00:00+08:00",
+                ]
+            ),
+            "feat_a.*after.*close.*20240102",
+        ),
+        (
+            lambda frame: frame.assign(
+                feature_source_date=["20240101", "20240103"],
+                feature_as_of_time=[
+                    "2024-01-01T15:00:00+08:00",
+                    "2024-01-03T14:59:59+08:00",
+                ],
+            ),
+            "feat_a.*horizon=0.*20240102",
+        ),
+        (
+            lambda frame: frame.assign(
+                outcome_source_date=["20240103", "20240105"],
+                outcome_as_of_time=[
+                    "2024-01-03T15:00:00+08:00",
+                    "2024-01-05T15:00:00+08:00",
+                ],
+            ),
+            "label_d2_return_hfq.*horizon=2.*20240102",
+        ),
+    ],
+)
+def test_event_field_validation_fails_closed(tmp_path, mutation, message):
+    manifest = load_event_lineage(_write_manifest(tmp_path))
+    with pytest.raises(EventLineageError, match=message):
+        validate_event_fields(
+            mutation(_governed_frame()),
+            manifest,
+            ["feat_a"],
+            outcome_fields=["label_d2_return_hfq"],
+            calendar=CALENDAR,
+        )
+
+
+def test_event_field_validation_requires_manifest_entry(tmp_path):
+    manifest = load_event_lineage(_write_manifest(tmp_path))
+    with pytest.raises(EventLineageError, match="unknown.*manifest entry"):
+        validate_event_fields(_governed_frame(), manifest, ["unknown"], calendar=CALENDAR)
+
+
+def test_event_field_validation_rejects_outcomes_beyond_training_cutoff(tmp_path):
+    manifest = load_event_lineage(_write_manifest(tmp_path))
+    with pytest.raises(EventLineageError, match="label_d2_return_hfq.*train_end.*20240102"):
+        validate_event_fields(
+            _governed_frame(),
+            manifest,
+            [],
+            outcome_fields=["label_d2_return_hfq"],
+            calendar=CALENDAR,
+            train_end="20240103",
+        )
+
+
+def test_positive_horizon_requires_independent_trading_calendar(tmp_path):
+    manifest = load_event_lineage(_write_manifest(tmp_path))
+    with pytest.raises(EventLineageError, match="authoritative event trading calendar is required"):
+        validate_event_fields(
+            _governed_frame(), manifest, [], outcome_fields=["label_d2_return_hfq"]
+        )
+
+
+def test_authoritative_calendar_rejects_omitted_intervening_session():
+    frame = pd.DataFrame(
+        {
+            "trade_date": ["20240102"],
+            "label_d1": [1.0],
+            "source": ["20240104"],
+            "asof": ["2024-01-04T15:00:00+08:00"],
+            "basis": ["hfq"],
+            "version": [VERSION],
+        }
+    )
+    manifest = {"label_d1": EventAuditColumns("source", "asof", "basis", "version", 1)}
+
+    with pytest.raises(EventLineageError, match="label_d1.*horizon=1.*expected 2024-01-03"):
+        validate_event_fields(
+            frame,
+            manifest,
+            [],
+            outcome_fields=["label_d1"],
+            calendar=["20240102", "20240103", "20240104"],
+        )
+
+
+def test_authoritative_calendar_accepts_exact_d1_and_d2():
+    frame = pd.DataFrame(
+        {
+            "trade_date": ["20240102"],
+            "label_d1": [1.0],
+            "label_d2": [2.0],
+            "d1_source": ["20240103"],
+            "d1_asof": ["2024-01-03T15:00:00+08:00"],
+            "d2_source": ["20240104"],
+            "d2_asof": ["2024-01-04T15:00:00+08:00"],
+            "basis": ["hfq"],
+            "version": [VERSION],
+        }
+    )
+    manifest = {
+        "label_d1": EventAuditColumns("d1_source", "d1_asof", "basis", "version", 1),
+        "label_d2": EventAuditColumns("d2_source", "d2_asof", "basis", "version", 2),
+    }
+
+    validate_event_fields(
+        frame,
+        manifest,
+        [],
+        outcome_fields=["label_d1", "label_d2"],
+        calendar=["20240102", "20240103", "20240104"],
+    )
+
+
+def test_event_calendar_loader_reads_only_open_sessions(tmp_path):
+    path = tmp_path / "calendar.parquet"
+    pd.DataFrame(
+        {
+            "cal_date": ["20240102", "20240103", "20240104"],
+            "is_open": [1, 0, 1],
+        }
+    ).to_parquet(path, index=False)
+
+    assert load_event_calendar(path) == ("20240102", "20240104")
+
+
+@pytest.mark.parametrize("bad_is_open", [None, "oops", 0.5, -1, 2])
+def test_event_calendar_rejects_invalid_is_open_instead_of_dropping_session(
+    tmp_path, bad_is_open
+):
+    path = tmp_path / "calendar.parquet"
+    pd.DataFrame(
+        {
+            "cal_date": ["20240102", "20240103", "20240104"],
+            "is_open": ["1", None if bad_is_open is None else str(bad_is_open), "1"],
+        }
+    ).to_parquet(path, index=False)
+
+    with pytest.raises(EventLineageError, match="is_open.*20240103"):
+        load_event_calendar(path)
+
+
+def test_row_validation_error_names_position_trade_date_and_stock(tmp_path):
+    manifest = load_event_lineage(_write_manifest(tmp_path))
+    frame = _governed_frame()
+    frame.loc[1, "feature_price_basis"] = "raw"
+
+    with pytest.raises(
+        EventLineageError,
+        match=r"feat_a.*price_basis.*row 1.*trade_date=.?20240103.*stock_code=.?000002\.SZ",
+    ):
+        validate_event_fields(frame, manifest, ["feat_a"], calendar=CALENDAR)
+
+
+def test_governed_load_packs_fields_and_labels_without_audit_columns(tmp_path):
+    frame = _governed_frame()
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+    lineage_path = _write_manifest(tmp_path)
+
+    panel = load_event_panel(
+        path,
+        label_columns=["label_d2_return_hfq"],
+        feature_columns=["feat_a", "feat_b"],
+        lineage_path=lineage_path,
+        calendar_path=_write_calendar(tmp_path),
+    )
+
+    assert panel.field_names() == ["feat_a", "feat_b"]
+    assert set(panel.labels) == {"label_d2_return_hfq"}
+    assert not (set(panel.fields) & audit_column_names(load_event_lineage(lineage_path)))
+
+
+def test_formal_load_rejects_legacy_table_without_manifest(tmp_path, frame):
+    path = tmp_path / "legacy.parquet"
+    frame.to_parquet(path, index=False)
+    with pytest.raises(EventLineageError, match="event lineage manifest is required"):
+        load_event_panel(path, label_columns=["label_hit"])
+
+
+def test_formal_load_rejects_positive_horizon_without_calendar(tmp_path):
+    path = tmp_path / "events.parquet"
+    _governed_frame().to_parquet(path, index=False)
+
+    with pytest.raises(EventLineageError, match="authoritative event trading calendar is required"):
+        load_event_panel(
+            path,
+            label_columns=["label_d2_return_hfq"],
+            feature_columns=["feat_a"],
+            lineage_path=_write_manifest(tmp_path),
+        )
+
+
+def test_auto_feature_discovery_excludes_shared_audit_columns(tmp_path):
+    frame = _governed_frame()
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+    lineage_path = _write_manifest(tmp_path)
+
+    panel = load_event_panel(
+        path,
+        label_columns=["label_d2_return_hfq"],
+        lineage_path=lineage_path,
+        calendar_path=_write_calendar(tmp_path),
+    )
+
+    assert panel.field_names() == ["feat_a", "feat_b"]
+
+
+def test_auto_feature_discovery_excludes_numeric_manifest_audit_sentinel(tmp_path):
+    frame = _governed_frame().assign(numeric_audit_sentinel=[101, 102])
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+    payload = _manifest_dict()
+    payload["fields"]["unused_governed_field"] = {
+        "source_date": "numeric_audit_sentinel",
+        "as_of_time": "feature_as_of_time",
+        "price_basis": "feature_price_basis",
+        "adj_factor_version": "feature_adj_factor_version",
+        "horizon": 0,
+    }
+
+    panel = load_event_panel(
+        path,
+        label_columns=["label_d2_return_hfq"],
+        lineage_path=_write_manifest(tmp_path, payload),
+        calendar_path=_write_calendar(tmp_path),
+    )
+
+    assert "numeric_audit_sentinel" not in panel.fields
+
+
+def test_streaming_audit_validation_uses_one_cell_bounded_parquet_scan(
+    tmp_path, monkeypatch
+):
+    group_count = 459
+    data: dict[str, list] = {
+        "trade_date": ["20240102", "20240103"],
+        "stock_code": ["000001.SZ", "000002.SZ"],
+        "label_h0": [0.0, 1.0],
+    }
+    fields: dict[str, dict] = {}
+    for group in range(group_count):
+        name = f"feat_{group:03d}"
+        data[name] = [float(group), float(group + 1)]
+        data[f"source_{group}"] = ["20240102", "20240103"]
+        data[f"asof_{group}"] = [
+            "2024-01-02T15:00:00+08:00",
+            "2024-01-03T15:00:00+08:00",
+        ]
+        data[f"basis_{group}"] = ["hfq", "hfq"]
+        data[f"version_{group}"] = [VERSION, VERSION]
+        fields[name] = {
+            "source_date": f"source_{group}",
+            "as_of_time": f"asof_{group}",
+            "price_basis": f"basis_{group}",
+            "adj_factor_version": f"version_{group}",
+            "horizon": 0,
+        }
+    fields["label_h0"] = fields["feat_000"].copy()
+    path = tmp_path / "wide-events.parquet"
+    pd.DataFrame(data).to_parquet(path, index=False)
+    manifest_path = _write_manifest(
+        tmp_path, {"schema_version": 1, "fields": fields}
+    )
+
+    import pyarrow.parquet as pq
+
+    projected: list[tuple[tuple[str, ...], int]] = []
+    original = pq.ParquetFile.iter_batches
+
+    def recording_iter_batches(parquet_file, *args, **kwargs):
+        projected.append((tuple(kwargs["columns"]), kwargs["batch_size"]))
+        yield from original(parquet_file, *args, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", recording_iter_batches)
+
+    open_event_source(
+        path,
+        ["label_h0"],
+        lineage_path=manifest_path,
+        feature_columns=[f"feat_{group:03d}" for group in range(group_count)],
+    )
+
+    assert len(projected) == 1
+    columns, batch_size = projected[0]
+    assert len(columns) == group_count * 4
+    assert batch_size * len(columns) <= 1_000_000
+
+
+def test_global_adjustment_version_mismatch_across_record_batches_has_row_context(
+    tmp_path, monkeypatch
+):
+    frame = _governed_frame()
+    frame.loc[1, "feature_adj_factor_version"] = VERSION[:-1] + "b"
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+    manifest = load_event_lineage(_write_manifest(tmp_path))
+    monkeypatch.setattr("helix.data.event_table.AUDIT_VALIDATION_BATCH_SIZE", 1)
+
+    with pytest.raises(
+        EventLineageError,
+        match=r"feat_a.*inconsistent adjustment version.*row 1.*20240103.*000002\.SZ",
+    ):
+        validate_event_parquet_fields(path, manifest, ["feat_a"], calendar=CALENDAR)
+
+
+def test_global_adjustment_version_mismatch_across_audit_groups_has_row_context(tmp_path):
+    frame = _governed_frame()
+    frame["other_source"] = frame["feature_source_date"]
+    frame["other_asof"] = frame["feature_as_of_time"]
+    frame["other_basis"] = "hfq"
+    frame["other_version"] = VERSION[:-1] + "b"
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+    payload = _manifest_dict()
+    payload["fields"]["feat_b"] = {
+        "source_date": "other_source",
+        "as_of_time": "other_asof",
+        "price_basis": "other_basis",
+        "adj_factor_version": "other_version",
+        "horizon": 0,
+    }
+    manifest = load_event_lineage(_write_manifest(tmp_path, payload))
+
+    with pytest.raises(
+        EventLineageError,
+        match=r"feat_b.*inconsistent adjustment version.*row 0.*20240102.*000001\.SZ",
+    ):
+        validate_event_parquet_fields(
+            path, manifest, ["feat_a", "feat_b"], calendar=CALENDAR
+        )
+
+
+def test_governed_panel_final_read_excludes_all_numeric_audit_groups(tmp_path, monkeypatch):
+    group_count = 459
+    data: dict[str, list] = {
+        "trade_date": ["20240102"],
+        "stock_code": ["000001.SZ"],
+        "label_h0": [1.0],
+    }
+    fields: dict[str, dict] = {}
+    audit_columns: set[str] = set()
+    feature_names: list[str] = []
+    for group in range(group_count):
+        name = f"feat_{group:03d}"
+        feature_names.append(name)
+        data[name] = [float(group)]
+        audit = {
+            "source_date": f"source_{group}",
+            "as_of_time": f"asof_{group}",
+            "price_basis": f"basis_{group}",
+            "adj_factor_version": f"version_{group}",
+            "horizon": 0,
+        }
+        fields[name] = audit
+        audit_columns.update(value for key, value in audit.items() if key != "horizon")
+        data[audit["source_date"]] = ["20240102"]
+        data[audit["as_of_time"]] = ["2024-01-02T15:00:00+08:00"]
+        data[audit["price_basis"]] = ["hfq"]
+        data[audit["adj_factor_version"]] = [VERSION]
+    fields["label_h0"] = fields["feat_000"].copy()
+    path = tmp_path / "wide-events.parquet"
+    pd.DataFrame(data).to_parquet(path, index=False)
+    lineage_path = _write_manifest(
+        tmp_path, {"schema_version": 1, "fields": fields}
+    )
+
+    validated: list[str] = []
+
+    def fake_validate(path, manifest, governed, **kwargs):
+        validated.extend(governed)
+        validated.extend(kwargs.get("outcome_fields", ()))
+
+    monkeypatch.setattr("helix.data.event_table.validate_event_parquet_fields", fake_validate)
+    original_read = pd.read_parquet
+    event_projections: list[set[str]] = []
+
+    def recording_read(path_arg, *args, **kwargs):
+        if Path(path_arg) == path:
+            event_projections.append(set(kwargs["columns"]))
+        return original_read(path_arg, *args, **kwargs)
+
+    monkeypatch.setattr(pd, "read_parquet", recording_read)
+
+    panel = load_event_panel(
+        path,
+        label_columns=["label_h0"],
+        feature_columns=feature_names,
+        lineage_path=lineage_path,
+    )
+
+    assert len(validated) == group_count + 1
+    assert event_projections
+    assert all(not (projection & audit_columns) for projection in event_projections)
+    assert panel.n_rows == 1
+    assert panel.field_names() == feature_names
+
+
+def test_explicit_feature_columns_reject_physical_audit_columns(tmp_path):
+    frame = _governed_frame()
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+
+    with pytest.raises(EventLineageError, match="feature_columns.*audit.*feature_source_date"):
+        load_event_panel(
+            path,
+            label_columns=["label_d2_return_hfq"],
+            feature_columns=["feat_a", "feature_source_date"],
+            lineage_path=_write_manifest(tmp_path),
+            calendar_path=tmp_path / "calendar.parquet",
+        )
+
+
+def test_streaming_source_rejects_explicit_audit_feature_before_read(tmp_path):
+    path = tmp_path / "events.parquet"
+    _governed_frame().to_parquet(path, index=False)
+
+    with pytest.raises(EventLineageError, match="feature_columns.*audit.*feature_source_date"):
+        open_event_source(
+            path,
+            ["label_d2_return_hfq"],
+            lineage_path=_write_manifest(tmp_path),
+            calendar_path=_write_calendar(tmp_path),
+            feature_columns=["feat_a", "feature_source_date"],
+        )
+
+
+def test_streaming_grids_cannot_emit_a_physical_audit_column(tmp_path):
+    path = tmp_path / "events.parquet"
+    _governed_frame().to_parquet(path, index=False)
+    index, _, keys = open_event_source(
+        path,
+        ["label_d2_return_hfq"],
+        lineage_path=_write_manifest(tmp_path),
+        calendar_path=_write_calendar(tmp_path),
+        feature_columns=["feat_a"],
+    )
+
+    with pytest.raises(EventLineageError, match="stream.*audit.*feature_source_date"):
+        list(stream_feature_grids(path, keys, index, ["feature_source_date"]))
+
+
+@pytest.mark.parametrize("requested", [["rogue_future"], ["label_d2_return_hfq"]])
+def test_streaming_grids_accept_only_validated_feature_allowlist_before_read(
+    tmp_path, monkeypatch, requested
+):
+    frame = _governed_frame().assign(rogue_future=[9.0, 10.0])
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+    index, _, keys = open_event_source(
+        path,
+        ["label_d2_return_hfq"],
+        lineage_path=_write_manifest(tmp_path),
+        calendar_path=_write_calendar(tmp_path),
+        feature_columns=["feat_a"],
+    )
+    reads: list[list[str]] = []
+
+    def forbidden_read(*args, **kwargs):
+        reads.append(kwargs.get("columns", []))
+        raise AssertionError("parquet must not be read for a rejected stream request")
+
+    monkeypatch.setattr("pyarrow.parquet.read_table", forbidden_read)
+
+    with pytest.raises(EventLineageError, match="stream.*validated feature"):
+        list(stream_feature_grids(path, keys, index, requested))
+    assert reads == []
+
+
+@pytest.mark.parametrize("loader", ["panel", "source"])
+def test_positive_horizon_field_is_rejected_when_used_as_a_feature(tmp_path, loader):
+    frame = _governed_frame()
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+    payload = _manifest_dict()
+    payload["fields"]["feat_a"] = {
+        "source_date": "outcome_source_date",
+        "as_of_time": "outcome_as_of_time",
+        "price_basis": "outcome_price_basis",
+        "adj_factor_version": "outcome_adj_factor_version",
+        "horizon": 2,
+    }
+    lineage = _write_manifest(tmp_path, payload)
+    kwargs = {
+        "lineage_path": lineage,
+        "calendar_path": _write_calendar(tmp_path),
+        "feature_columns": ["feat_a"],
+    }
+
+    with pytest.raises(EventLineageError, match="feature.*feat_a.*horizon=0"):
+        if loader == "panel":
+            load_event_panel(path, ["label_d2_return_hfq"], **kwargs)
+        else:
+            open_event_source(path, ["label_d2_return_hfq"], **kwargs)
+
+
+def test_custom_event_key_columns_are_used_by_bounded_validation(tmp_path):
+    frame = _governed_frame().rename(columns={"trade_date": "date", "stock_code": "ticker"})
+    path = tmp_path / "events.parquet"
+    frame.to_parquet(path, index=False)
+
+    index, labels, _ = open_event_source(
+        path,
+        ["label_d2_return_hfq"],
+        date_column="date",
+        code_column="ticker",
+        lineage_path=_write_manifest(tmp_path),
+        calendar_path=_write_calendar(tmp_path),
+        feature_columns=["feat_a"],
+    )
+
+    assert index.dates.tolist() == ["20240102", "20240103"]
+    assert labels["label_d2_return_hfq"].shape == index.shape
+    panel = load_event_panel(
+        path,
+        ["label_d2_return_hfq"],
+        feature_columns=["feat_a"],
+        lineage_path=_write_manifest(tmp_path),
+        calendar_path=_write_calendar(tmp_path),
+        date_column="date",
+        code_column="ticker",
+    )
+    assert panel.dates.tolist() == ["20240102", "20240103"]
 
 
 def test_ragged_days_pack_into_slots(frame):
@@ -276,7 +994,7 @@ def test_event_mining_uses_only_complete_training_outcomes(monkeypatch):
         labels={
             pipeline_events.PRIMARY_TARGET: close_return + 0.02,
             pipeline_events.BINARY_TARGET: (close_return > 0.002).astype(float),
-            "label_d2_return": close_return,
+            pipeline_events.RETURN_TARGET: close_return,
         },
     )
     captured: dict[str, object] = {}

@@ -16,6 +16,7 @@ import pandas as pd
 
 from .config import Config
 from .data.panel import Panel, build_panel
+from .data.price_lineage import PriceLineageError
 from .data.store import ParquetStore
 from .data.universe import build_universe
 from .dl.checkpoint import latest_checkpoint, load_checkpoint, require_matching_factors
@@ -36,6 +37,7 @@ from .splits import complete_outcome_window, search_window, walk_forward
 log = get_logger(__name__)
 
 PANEL_CACHE_REQUIRED_FIELDS = ("limit_price_observed",)
+PANEL_CACHE_REQUIRED_ADJUSTED_FIELDS = ("open_hfq", "high_hfq", "low_hfq", "close_hfq")
 
 
 @dataclass
@@ -71,10 +73,14 @@ def prepare(cfg: Config, rebuild: bool = False) -> Prepared:
     panel_path = cache_dir(cfg) / "panel.npz"
     rebuild_panel = rebuild or not panel_path.exists()
     if not rebuild_panel:
-        panel = Panel.load(panel_path)
-        missing = [field for field in PANEL_CACHE_REQUIRED_FIELDS if field not in panel]
-        if missing:
-            log.warning("cached panel lacks required fields %s; rebuilding", missing)
+        try:
+            panel = Panel.load(panel_path)
+            missing = [field for field in PANEL_CACHE_REQUIRED_FIELDS if field not in panel]
+            if missing:
+                raise PriceLineageError(f"missing required fields {missing}")
+            panel.require_adjusted_prices(PANEL_CACHE_REQUIRED_ADJUSTED_FIELDS, "cached panel")
+        except PriceLineageError as exc:
+            log.warning("cached panel lacks valid provenance: %s; rebuilding", exc)
             rebuild_panel = True
             rebuild = True
         else:

@@ -41,11 +41,27 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from fill_impact import build_model, build_regressor, daily_ic, feature_columns
+from fill_impact import build_model, build_regressor, daily_ic
 from fillability import REQUIRED_COLUMNS, unfillable_mask
+
+from helix.data.event_lineage import (
+    EventLineageError,
+    audit_column_names,
+    load_event_calendar,
+    load_event_lineage,
+    require_independent_event_calendar,
+)
+from helix.data.event_table import numeric_feature_columns, validate_event_parquet_fields
+from helix.pipeline_events import BINARY_TARGET, PRIMARY_TARGET, RETURN_TARGET
+
+ENTRY_HFQ = "label_px_d1_open_hfq"
+HIGH_HFQ = "label_px_d2_high_hfq"
+EXIT_HFQ = "label_px_d2_close_hfq"
+RETURN_HFQ = RETURN_TARGET
 
 #: Statutory A-share round-trip costs, in basis points of notional.
 #: Stamp duty is sell-side only and was halved to 5bp on 2023-08-28; every out-of-sample
@@ -59,6 +75,31 @@ STAMP_CUT_DATE = "20230828"
 
 def _digits(date: str) -> str:
     return "".join(ch for ch in date if ch.isdigit())
+
+
+def complete_training_mask(
+    frame: pd.DataFrame,
+    calendar: tuple[str, ...],
+    train_end: str,
+    horizon: int,
+) -> np.ndarray:
+    """Select D0 rows whose exact D+h session does not exceed ``train_end``."""
+    if type(horizon) is not int or horizon < 0:
+        raise EventLineageError("training outcome horizon must be an integer >= 0")
+    sessions = tuple(_digits(value) for value in calendar)
+    positions = {value: position for position, value in enumerate(sessions)}
+    cutoff = positions.get(_digits(train_end))
+    if cutoff is None:
+        raise EventLineageError(f"train_end {train_end!r} is not an event trading session")
+    decisions = frame["trade_date"].astype(str).map(_digits)
+    missing = next((value for value in decisions if value not in positions), None)
+    if missing is not None:
+        raise EventLineageError(
+            f"training decision date {missing!r} is not in the event trading calendar"
+        )
+    return np.asarray(
+        [positions[value] + horizon <= cutoff for value in decisions], dtype=bool
+    )
 
 #: A new book opens every day while the previous one is still held, so capital is split
 #: across this many overlapping tranches. touch_offset - entry_offset + 1 = 2.
@@ -88,14 +129,14 @@ def target_hit(frame: pd.DataFrame, target_ratio: float) -> np.ndarray:
     a strictly better strategy than any that exists. `main` checks this reproduces the
     published label at 1.08 before trusting it anywhere else.
     """
-    return ((frame["label_px_d2_high"].to_numpy(dtype=float)
-             / frame["label_px_d1_open"].to_numpy(dtype=float)) >= target_ratio)
+    return ((frame[HIGH_HFQ].to_numpy(dtype=float)
+             / frame[ENTRY_HFQ].to_numpy(dtype=float)) >= target_ratio)
 
 
 def gross_returns(frame: pd.DataFrame, target_ratio: float, exit_rule: str) -> np.ndarray:
     """Per-trade gross return under the chosen exit assumption."""
-    to_close = (frame["label_px_d2_close"].to_numpy(dtype=float)
-                / frame["label_px_d1_open"].to_numpy(dtype=float)) - 1.0
+    to_close = (frame[EXIT_HFQ].to_numpy(dtype=float)
+                / frame[ENTRY_HFQ].to_numpy(dtype=float)) - 1.0
     if exit_rule == "close":
         return to_close
     return np.where(target_hit(frame, target_ratio), target_ratio - 1.0, to_close)
@@ -199,8 +240,8 @@ def run_book(scored: pd.DataFrame, hold_k: int, signal_k: int,
         # Hit rate follows `target_ratio` too, so lift describes the level being traded
         # rather than the 8% the table happens to label.
         hit = target_hit(picked, target_ratio)
-        to_close = (picked["label_px_d2_close"].to_numpy(dtype=float)
-                    / picked["label_px_d1_open"].to_numpy(dtype=float)) - 1.0
+        to_close = (picked[EXIT_HFQ].to_numpy(dtype=float)
+                    / picked[ENTRY_HFQ].to_numpy(dtype=float)) - 1.0
         rows.append({
             "date": date,
             "positions": len(picked),
@@ -228,7 +269,8 @@ def run_book(scored: pd.DataFrame, hold_k: int, signal_k: int,
     # them. Mixing the two would let a threshold flatter its own per-trade number by
     # sitting out the days it expected to lose, while the equity curve says otherwise.
     traded = daily[daily["positions"] > 0]
-    hit, base = float(traded["hit_rate"].mean()), float(daily["base_rate"].mean())
+    mean_hit = float(traded["hit_rate"].mean())
+    mean_base = float(daily["base_rate"].mean())
     years = len(daily) / TRADING_DAYS
     final = float(daily["equity"].iloc[-1])
     summary = {
@@ -240,9 +282,9 @@ def run_book(scored: pd.DataFrame, hold_k: int, signal_k: int,
         # unfillable, the shortlist is doing the work and its depth is a real assumption.
         "avg_fill_depth": round(float(traded["fill_depth"].mean()), 3),
         "short_day_rate": round(float(traded["short"].mean()), 6),
-        "hit_rate": round(hit, 6),
-        "base_rate": round(base, 6),
-        "lift": round(hit / max(base, 1e-12), 4),
+        "hit_rate": round(mean_hit, 6),
+        "base_rate": round(mean_base, 6),
+        "lift": round(mean_hit / max(mean_base, 1e-12), 4),
         "win_to_close": round(float(traded["win_to_close"].mean()), 6),
         "loss_to_close": round(float(traded["loss_to_close"].mean()), 6),
         "gross_per_trade": round(float(traded["gross_return"].mean()), 6),
@@ -260,12 +302,78 @@ def run_book(scored: pd.DataFrame, hold_k: int, signal_k: int,
     return summary, daily[["date", "positions", "portfolio_return", "equity"]]
 
 
+def load_backtest_frame(
+    input_path: str,
+    lineage_path: str,
+    calendar_path: str,
+    label: str,
+    ic_target: str,
+    return_col: str,
+) -> tuple[
+    pd.DataFrame,
+    list[str],
+    dict,
+    tuple[str, ...],
+    list[str],
+    np.ndarray,
+    int,
+]:
+    """Govern the source, then retain only functional backtest columns."""
+    require_independent_event_calendar(input_path, calendar_path)
+    source_path = Path(input_path)
+    manifest = load_event_lineage(lineage_path)
+    calendar = load_event_calendar(calendar_path)
+    features = numeric_feature_columns(
+        source_path,
+        [label, ic_target, return_col],
+        extra_excluded=tuple(audit_column_names(manifest)),
+    )
+    price_columns = [ENTRY_HFQ, HIGH_HFQ, EXIT_HFQ]
+    outcomes = [label, ic_target, return_col, *price_columns]
+    governed = [*features, *outcomes]
+    validate_event_parquet_fields(
+        source_path,
+        manifest,
+        features,
+        outcome_fields=outcomes,
+        calendar=calendar,
+    )
+    needed = sorted(
+        {
+            "trade_date",
+            label,
+            ic_target,
+            return_col,
+            *price_columns,
+            *REQUIRED_COLUMNS,
+            *features,
+        }
+    )
+    frame = pd.read_parquet(source_path, columns=needed)
+    source_row_count = len(frame)
+    source_positions = np.arange(source_row_count)
+    frame["trade_date"] = frame["trade_date"].astype(str)
+    frame["unfillable"] = unfillable_mask(frame)
+    complete = frame[[label, ic_target, return_col, *price_columns]].notna().all(axis=1)
+    return (
+        frame.loc[complete],
+        features,
+        manifest,
+        calendar,
+        governed,
+        source_positions[complete.to_numpy()],
+        source_row_count,
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", required=True)
-    ap.add_argument("--label", default="label_d2_hit_8pct")
-    ap.add_argument("--ic-target", default="label_d2_peak_return")
-    ap.add_argument("--return-col", default="label_d2_return",
+    ap.add_argument("--lineage", required=True)
+    ap.add_argument("--calendar", required=True)
+    ap.add_argument("--label", default=BINARY_TARGET)
+    ap.add_argument("--ic-target", default=PRIMARY_TARGET)
+    ap.add_argument("--return-col", default=RETURN_HFQ,
                     help="close[D+2]/open[D+1] - 1, i.e. what the close exit earns.")
     ap.add_argument("--rank-by", default="classify",
                     choices=("classify", "regress", "regress-cs"),
@@ -299,6 +407,7 @@ def main() -> None:
                     help="Per-day portfolio return for every (seed, exit, slippage). "
                          "Feeds window_stats.py.")
     args = ap.parse_args()
+    require_independent_event_calendar(args.input, args.calendar)
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     slippages = [float(s) for s in args.slippage_grid.split(",") if s.strip()]
     # None first, so the ungated book is always the reference every gate is read against.
@@ -309,20 +418,29 @@ def main() -> None:
     if signal_k < max(holds):
         raise SystemExit(f"--signal-k {signal_k} 小于最大持仓数 {max(holds)}，候选不够建仓")
 
-    features = feature_columns(args.input)
-    price_cols = ["label_px_d1_open", "label_px_d2_high", "label_px_d2_close"]
-    needed = sorted({"trade_date", args.label, args.ic_target, args.return_col,
-                     *price_cols, *REQUIRED_COLUMNS, *features})
-    df = pd.read_parquet(args.input, columns=needed)
-    df["trade_date"] = df["trade_date"].astype(str)
-    df["unfillable"] = unfillable_mask(df)
-    df = df.dropna(subset=[args.label, args.ic_target, args.return_col, *price_cols])
+    (
+        df,
+        features,
+        manifest,
+        calendar,
+        governed,
+        source_positions,
+        source_row_count,
+    ) = load_backtest_frame(
+        args.input,
+        args.lineage,
+        args.calendar,
+        args.label,
+        args.ic_target,
+        args.return_col,
+    )
+    price_cols = [ENTRY_HFQ, HIGH_HFQ, EXIT_HFQ]
     print(f"features {len(features)}  rows {len(df):,}  rank-by {args.rank_by}")
 
     # The return column has to be the quantity the close exit actually earns, or ranking
     # on it optimises something else. Cheap to check, so check rather than trust the name.
-    implied = (df["label_px_d2_close"].to_numpy(dtype=float)
-               / df["label_px_d1_open"].to_numpy(dtype=float)) - 1.0
+    implied = (df[EXIT_HFQ].to_numpy(dtype=float)
+               / df[ENTRY_HFQ].to_numpy(dtype=float)) - 1.0
     if not np.allclose(implied, df[args.return_col].to_numpy(dtype=float), atol=1e-6):
         raise SystemExit(f"{args.return_col} 不等于 close[D+2]/open[D+1]-1，不能当回归目标")
 
@@ -339,7 +457,22 @@ def main() -> None:
     cut = int(np.searchsorted(dates, args.split_date, "right"))
     train_end = dates[max(cut - 1, 0)]
     test_start = dates[min(cut + args.embargo_days, len(dates) - 1)]
-    train = df[df["trade_date"] <= train_end]
+    training_horizon = max(manifest[field].horizon for field in governed)
+    train_mask = complete_training_mask(
+        df, calendar, train_end=train_end, horizon=training_horizon
+    )
+    train = df[train_mask]
+    governed_training_rows = np.zeros(source_row_count, dtype=bool)
+    governed_training_rows[source_positions[train_mask]] = True
+    validate_event_parquet_fields(
+        args.input,
+        manifest,
+        features,
+        outcome_fields=[field for field in governed if field not in features],
+        calendar=calendar,
+        train_end=train_end,
+        row_mask=governed_training_rows,
+    )
     test = df[df["trade_date"] >= test_start]
     print(f"train ~{train_end} ({len(train):,}) | test {test_start}~ ({len(test):,})")
     if _digits(test_start) < STAMP_CUT_DATE:

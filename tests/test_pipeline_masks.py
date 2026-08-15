@@ -10,9 +10,12 @@ import pandas as pd
 from helix import pipeline
 from helix.config import Config, DataConfig, GPConfig, SplitConfig
 from helix.data.panel import Panel
+from helix.data.price_lineage import AdjustmentStamp
 from helix.eval.backtest import BacktestResult
 from helix.gp.library import FactorLibrary, FactorSpec
 from helix.labels.touch_label import LabelSet
+
+TEST_ADJ_VERSION = "raw-times-same-day-adj-v1:" + "0" * 64
 
 
 def make_prepared() -> pipeline.Prepared:
@@ -46,6 +49,7 @@ def make_prepared() -> pipeline.Prepared:
         entry_price=np.where(valid, values, np.nan),
         target_price=np.where(valid, values * 1.08, np.nan),
         exit_price=np.where(valid, values, np.nan),
+        adjustment=AdjustmentStamp("hfq", TEST_ADJ_VERSION),
     )
     return pipeline.Prepared(
         panel=panel,

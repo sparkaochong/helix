@@ -8,13 +8,16 @@ import pytest
 
 from helix.config import BacktestConfig, LabelConfig
 from helix.data.panel import Panel
+from helix.data.price_lineage import AdjustmentStamp, PriceLineageError, make_hfq_lineage
 from helix.eval import backtest as backtest_module
 from helix.eval.backtest import run_backtest
 from helix.labels.touch_label import LabelSet
 
+TEST_ADJ_VERSION = "raw-times-same-day-adj-v1:" + "0" * 64
+
 
 def make_labels(
-    y, entry, exit_price, valid=None, touch_tradable=None, entry_valid=None
+    y, entry, exit_price, valid=None, touch_tradable=None, entry_valid=None, adjustment=None
 ) -> LabelSet:
     y = np.asarray(y, dtype=float)
     entry = np.asarray(entry, dtype=float)
@@ -32,6 +35,7 @@ def make_labels(
         entry_price=entry,
         target_price=entry * 1.08,
         exit_price=exit_price,
+        adjustment=adjustment or AdjustmentStamp("hfq", TEST_ADJ_VERSION),
         entry_valid=(
             valid.copy()
             if entry_valid is None
@@ -67,10 +71,13 @@ def make_exit_panel(n_dates=8, n_codes=1, **overrides) -> Panel:
         "is_trading": np.ones(shape),
     }
     fields.update(overrides)
+    dates = np.array([f"2024010{i}" for i in range(1, n_dates + 1)])
+    lineage = make_hfq_lineage(dates, TEST_ADJ_VERSION)
     return Panel(
-        dates=np.array([f"2024010{i}" for i in range(1, n_dates + 1)]),
+        dates=dates,
         codes=np.array([f"00000{j}.SZ" for j in range(n_codes)]),
         fields={k: np.asarray(v, dtype=float) for k, v in fields.items()},
+        price_lineage={"open_hfq": lineage, "close_hfq": lineage},
     )
 
 
@@ -164,6 +171,184 @@ def test_each_symbol_uses_its_actual_daily_limit(cfg):
 
 def test_realistic_exit_switch_defaults_off():
     assert BacktestConfig().enable_realistic_exit is False
+
+
+def test_backtest_rejects_raw_basis_label_stamp_before_accounting(cfg):
+    labels = make_labels(
+        [[1.0]], [[10.0]], [[11.0]], adjustment=AdjustmentStamp("raw", TEST_ADJ_VERSION)
+    )
+
+    with pytest.raises(PriceLineageError, match=r"run_backtest.*raw.*adj_factor_version"):
+        run_backtest(
+            np.array([[1.0]]),
+            labels,
+            np.ones((1, 1), dtype=bool),
+            np.array(["20240101"]),
+            cfg,
+            free(top_k=1),
+        )
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "",
+        "raw-times-same-day-adj-v1:abc",
+        "unsupported:" + "0" * 64,
+        "raw-times-same-day-adj-v1:" + "A" * 64,
+    ],
+)
+def test_backtest_rejects_invalid_label_adjustment_version_before_accounting(cfg, version):
+    labels = make_labels(
+        [[1.0]], [[10.0]], [[11.0]], adjustment=AdjustmentStamp("hfq", version)
+    )
+
+    with pytest.raises(PriceLineageError, match=r"run_backtest.*adj_factor_version"):
+        run_backtest(
+            np.array([[1.0]]),
+            labels,
+            np.ones((1, 1), dtype=bool),
+            np.array(["20240101"]),
+            cfg,
+            free(top_k=1),
+        )
+
+
+def test_realistic_exit_validates_labels_before_reporting_missing_panel(cfg):
+    labels = make_labels([[1.0]], [[10.0]], [[11.0]])
+
+    with pytest.raises(ValueError, match="enable_realistic_exit requires an aligned market panel"):
+        run_backtest(
+            np.array([[1.0]]),
+            labels,
+            np.ones((1, 1), dtype=bool),
+            np.array(["20240101"]),
+            cfg,
+            free(top_k=1, enable_realistic_exit=True),
+        )
+
+
+def test_realistic_exit_rejects_invalid_labels_before_reporting_missing_panel(cfg):
+    labels = make_labels(
+        [[1.0]], [[10.0]], [[11.0]], adjustment=AdjustmentStamp("raw", TEST_ADJ_VERSION)
+    )
+
+    with pytest.raises(PriceLineageError, match=r"run_backtest.*raw.*adj_factor_version"):
+        run_backtest(
+            np.array([[1.0]]),
+            labels,
+            np.ones((1, 1), dtype=bool),
+            np.array(["20240101"]),
+            cfg,
+            free(top_k=1, enable_realistic_exit=True),
+        )
+
+
+def test_realistic_exit_rejects_panel_without_adjusted_price_lineage(cfg):
+    panel = make_exit_panel(n_dates=5)
+    panel.price_lineage.pop("close_hfq")
+    labels = make_labels(
+        np.zeros((5, 1)), np.full((5, 1), 10.0), np.full((5, 1), 10.0)
+    )
+
+    with pytest.raises(PriceLineageError, match=r"run_backtest\.realistic_exit.*close_hfq"):
+        run_backtest(
+            np.array([[1.0], [np.nan], [np.nan], [np.nan], [np.nan]]),
+            labels,
+            np.array([[True], [False], [False], [False], [False]]),
+            panel.dates,
+            cfg,
+            free(top_k=1, enable_realistic_exit=True),
+            panel=panel,
+        )
+
+
+def test_realistic_exit_rejects_panel_with_different_adjustment_stamp(cfg):
+    panel = make_exit_panel(n_dates=5)
+    panel_version = "raw-times-same-day-adj-v1:" + "1" * 64
+    panel_lineage = make_hfq_lineage(panel.dates, panel_version)
+    panel.price_lineage = {"open_hfq": panel_lineage, "close_hfq": panel_lineage}
+    labels = make_labels(
+        np.zeros((5, 1)), np.full((5, 1), 10.0), np.full((5, 1), 10.0)
+    )
+
+    with pytest.raises(
+        PriceLineageError, match=rf"{panel_version}.*{TEST_ADJ_VERSION}"
+    ):
+        run_backtest(
+            np.array([[1.0], [np.nan], [np.nan], [np.nan], [np.nan]]),
+            labels,
+            np.array([[True], [False], [False], [False], [False]]),
+            panel.dates,
+            cfg,
+            free(top_k=1, enable_realistic_exit=True),
+            panel=panel,
+        )
+
+
+def test_realistic_exit_uses_matching_panel_and_label_adjustment_stamp(cfg):
+    panel = make_exit_panel(n_dates=5)
+    labels = make_labels(
+        np.zeros((5, 1)), np.full((5, 1), 10.0), np.full((5, 1), 10.0)
+    )
+
+    result = run_backtest(
+        np.array([[1.0], [np.nan], [np.nan], [np.nan], [np.nan]]),
+        labels,
+        np.array([[True], [False], [False], [False], [False]]),
+        panel.dates,
+        cfg,
+        free(top_k=1, enable_realistic_exit=True),
+        panel=panel,
+    )
+
+    assert result.daily["gross_return"].iloc[0] == pytest.approx(0.0)
+
+
+def test_realistic_exit_uses_hfq_prices_not_raw_ohlc_for_returns(cfg):
+    labels = make_labels(
+        np.zeros((5, 1)), np.full((5, 1), 10.0), np.full((5, 1), 10.0)
+    )
+    predictions = np.array([[1.0], [np.nan], [np.nan], [np.nan], [np.nan]])
+    candidates = np.array([[True], [False], [False], [False], [False]])
+    baseline = make_exit_panel(n_dates=5)
+    changed_raw = make_exit_panel(n_dates=5)
+    changed_raw.fields["open"][1, 0] = 10.5
+    changed_raw.fields["high"][2, 0] = 10.5
+    changed_raw.fields["close"][2, 0] = 10.4
+
+    baseline_result = run_backtest(
+        predictions,
+        labels,
+        candidates,
+        baseline.dates,
+        cfg,
+        free(top_k=1, enable_realistic_exit=True),
+        panel=baseline,
+    )
+    changed_raw_result = run_backtest(
+        predictions,
+        labels,
+        candidates,
+        changed_raw.dates,
+        cfg,
+        free(top_k=1, enable_realistic_exit=True),
+        panel=changed_raw,
+    )
+
+    baseline_trade = baseline_result.trades.iloc[0]
+    changed_raw_trade = changed_raw_result.trades.iloc[0]
+    assert baseline_result.daily["n_executed"].tolist() == [1]
+    assert changed_raw_result.daily["n_executed"].tolist() == [1]
+    assert baseline_trade["exit_session"] == changed_raw_trade["exit_session"] == "d2_close"
+    for field in (
+        "exit_index",
+        "entry_price",
+        "exit_price",
+        "realistic_gross_return",
+        "realistic_net_return",
+    ):
+        assert changed_raw_trade[field] == pytest.approx(baseline_trade[field])
 
 
 def test_realistic_mode_uses_deferred_price_and_records_trade(cfg):

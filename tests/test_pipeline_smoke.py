@@ -21,6 +21,7 @@ from helix.config import (
     SplitConfig,
 )
 from helix.data.panel import Panel
+from helix.data.price_lineage import make_hfq_lineage
 from helix.dl.dataset import normalize_factors
 from helix.dl.train import train_walk_forward
 from helix.eval.backtest import run_backtest
@@ -32,6 +33,7 @@ from helix.labels.touch_label import build_touch_label
 from helix.splits import search_window, walk_forward
 
 N_DATES, N_CODES = 280, 60
+VERSION = "raw-times-same-day-adj-v1:" + "0" * 64
 
 
 @pytest.fixture(scope="module")
@@ -69,10 +71,17 @@ def market() -> Panel:
         "pb": rng.uniform(0.8, 8.0, size=shape),
         "pe_ttm": rng.uniform(8.0, 60.0, size=shape),
     }
+    dates = np.datetime_as_string(
+        np.datetime64("2020-01-01") + np.arange(N_DATES), unit="D"
+    )
     return Panel(
-        dates=np.array([f"{20200101 + i:08d}" for i in range(N_DATES)]),
+        dates=dates,
         codes=np.array([f"{600000 + j:06d}.SH" for j in range(N_CODES)]),
         fields={k: np.asarray(v, dtype=np.float64) for k, v in fields.items()},
+        price_lineage={
+            name: make_hfq_lineage(dates, VERSION)
+            for name in ("open_hfq", "high_hfq", "low_hfq", "close_hfq", "pre_close_hfq")
+        },
     )
 
 

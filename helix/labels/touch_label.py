@@ -17,11 +17,12 @@ Three details decide whether this label is usable or garbage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
 from ..config import LabelConfig
+from ..data.price_lineage import AdjustmentStamp
 from ..eval.shared_entry_check import entry_is_fillable
 from ..features.operators import lead
 from ..logging_setup import get_logger
@@ -40,6 +41,7 @@ class LabelSet:
     target_price: np.ndarray  # (T, N) entry * target_ratio
     exit_price: np.ndarray   # (T, N) back-adjusted D+2 close, for the non-touch exit
     entry_valid: np.ndarray | None = None  # (T, N) bool, D+1 entry actually fillable
+    adjustment: AdjustmentStamp = field(kw_only=True)  # governed source for all adjusted label prices
 
     @property
     def executable_entry(self) -> np.ndarray:
@@ -53,6 +55,9 @@ class LabelSet:
 
 def build_touch_label(panel, universe: np.ndarray, cfg: LabelConfig) -> LabelSet:
     """Build the touch label for every ``(date, stock)`` cell of ``panel``."""
+    adjustment = panel.require_adjusted_prices(
+        ("open_hfq", "high_hfq", "close_hfq"), "build_touch_label"
+    )
     entry_off, touch_off = cfg.entry_offset, cfg.touch_offset
 
     open_hfq_entry = lead(panel.f64("open_hfq"), entry_off)
@@ -87,6 +92,7 @@ def build_touch_label(panel, universe: np.ndarray, cfg: LabelConfig) -> LabelSet
         entry_price=np.where(entry_valid, open_hfq_entry, np.nan),
         target_price=np.where(entry_valid, target, np.nan),
         exit_price=np.where(valid, close_hfq_exit, np.nan),
+        adjustment=adjustment,
         entry_valid=entry_valid,
     )
     log.info(

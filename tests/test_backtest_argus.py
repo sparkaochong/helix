@@ -9,6 +9,7 @@ move taken out of it.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -18,17 +19,29 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+import backtest_argus  # noqa: E402
+import mine_argus  # noqa: E402
 from backtest_argus import (  # noqa: E402
     COMMISSION_BPS,
+    ENTRY_HFQ,
+    EXIT_HFQ,
+    HIGH_HFQ,
     STAMP_SELL_BPS,
     TRANSFER_BPS,
+    complete_training_mask,
     cost_rates,
     cross_sectional_z,
     gross_returns,
+    load_backtest_frame,
     net_return,
     run_book,
     target_hit,
 )
+from fillability import unfillable_mask  # noqa: E402
+
+from helix.data.event_lineage import EventLineageError  # noqa: E402
+
+VERSION = "raw-times-same-day-adj-v1:" + "a" * 64
 
 
 def test_stamp_duty_is_charged_on_the_sell_side_only():
@@ -72,8 +85,9 @@ def _picks(hit: tuple[int, ...], to_close: tuple[float, ...],
         max(t, 0.08 if h else 0.0) for h, t in zip(hit, to_close, strict=True))
     return pd.DataFrame({
         "label_px_d1_open": [open_d1] * len(to_close),
-        "label_px_d2_high": [open_d1 * (1 + p) for p in peaks],
-        "label_px_d2_close": [open_d1 * (1 + r) for r in to_close],
+        ENTRY_HFQ: [open_d1] * len(to_close),
+        HIGH_HFQ: [open_d1 * (1 + p) for p in peaks],
+        EXIT_HFQ: [open_d1 * (1 + r) for r in to_close],
     })
 
 
@@ -99,6 +113,223 @@ def test_the_take_profit_level_decides_which_trades_it_applies_to():
     assert gross_returns(frame, 1.08, "target") == pytest.approx([0.08, 0.08])
     assert gross_returns(frame, 1.10, "target") == pytest.approx([0.10, -0.02])
     assert target_hit(frame, 1.10) == pytest.approx([True, False])
+
+
+def test_raw_open_cannot_change_hits_or_returns_but_hfq_entry_can():
+    frame = _picks(hit=(1, 0), to_close=(0.10, -0.05))
+    expected_hit = target_hit(frame, 1.08)
+    expected_return = gross_returns(frame, 1.08, "close")
+
+    changed_raw = frame.assign(label_px_d1_open=[1.0, 1000.0])
+    np.testing.assert_array_equal(target_hit(changed_raw, 1.08), expected_hit)
+    np.testing.assert_allclose(gross_returns(changed_raw, 1.08, "close"), expected_return)
+
+    changed_hfq = frame.copy()
+    changed_hfq[ENTRY_HFQ] = [9.0, 9.0]
+    assert target_hit(changed_hfq, 1.08).tolist() != expected_hit.tolist()
+    assert gross_returns(changed_hfq, 1.08, "close") != pytest.approx(expected_return)
+
+
+def test_fillability_still_uses_raw_open_not_hfq_entry():
+    frame = _picks(hit=(1,), to_close=(0.0,)).assign(
+        stock_code="000001.SZ", label_open_gap=0.1, label_px_d1_open=11.0
+    )
+    assert unfillable_mask(frame).tolist() == [True]
+
+    frame[ENTRY_HFQ] = 1000.0
+    assert unfillable_mask(frame).tolist() == [True]
+    frame["label_px_d1_open"] = np.nan
+    assert unfillable_mask(frame).tolist() == [False]
+
+
+def test_training_rows_require_complete_d2_by_training_boundary():
+    frame = pd.DataFrame({"trade_date": ["20240102", "20240103", "20240104"]})
+    calendar = ("20240102", "20240103", "20240104", "20240105", "20240108")
+
+    mask = complete_training_mask(frame, calendar, train_end="20240104", horizon=2)
+
+    assert mask.tolist() == [True, False, False]
+
+
+def test_backtest_cli_rejects_omitted_lineage(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["backtest_argus.py", "--input", "events.parquet"])
+    with pytest.raises(SystemExit, match="2"):
+        backtest_argus.main()
+    assert "--lineage" in capsys.readouterr().err
+
+
+def test_mine_cli_rejects_omitted_lineage(monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["mine_argus.py", "--input", "events.parquet", "--calendar", "calendar.parquet"],
+    )
+    with pytest.raises(SystemExit, match="2"):
+        mine_argus.main()
+    assert "--lineage" in capsys.readouterr().err
+
+
+def test_mine_rejects_positive_horizon_field_discovered_as_feature(tmp_path, monkeypatch):
+    labels = list(mine_argus.DEFAULT_LABELS)
+    frame = pd.DataFrame(
+        {
+            "trade_date": ["20240102"],
+            "stock_code": ["000001.SZ"],
+            "feat_future": [1.0],
+            **{label: [0.0] for label in labels},
+            "outcome_source": ["20240104"],
+            "outcome_asof": ["2024-01-04T15:00:00+08:00"],
+            "basis": ["hfq"],
+            "version": [VERSION],
+        }
+    )
+    event_path = tmp_path / "events.parquet"
+    frame.to_parquet(event_path, index=False)
+    audit = {
+        "source_date": "outcome_source",
+        "as_of_time": "outcome_asof",
+        "price_basis": "basis",
+        "adj_factor_version": "version",
+        "horizon": 2,
+    }
+    lineage_path = tmp_path / "lineage.json"
+    lineage_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "fields": {"feat_future": audit, **{label: audit for label in labels}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    calendar_path = tmp_path / "calendar.parquet"
+    pd.DataFrame(
+        {"cal_date": ["20240102", "20240103", "20240104"], "is_open": 1}
+    ).to_parquet(calendar_path, index=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mine_argus.py",
+            "--input",
+            str(event_path),
+            "--lineage",
+            str(lineage_path),
+            "--calendar",
+            str(calendar_path),
+        ],
+    )
+    monkeypatch.setattr(
+        mine_argus, "numeric_feature_columns", lambda *args, **kwargs: ["feat_future"]
+    )
+
+    with pytest.raises(EventLineageError, match="feature.*feat_future.*horizon=0"):
+        mine_argus.main()
+
+
+def test_backtest_rejects_event_file_as_its_own_calendar(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "backtest_argus.py",
+            "--input",
+            "same.parquet",
+            "--calendar",
+            "same.parquet",
+            "--lineage",
+            "missing.json",
+        ],
+    )
+    with pytest.raises(EventLineageError, match="calendar.*independently"):
+        backtest_argus.main()
+
+
+def test_backtest_final_read_excludes_all_numeric_audit_groups(tmp_path, monkeypatch):
+    group_count = 459
+    data: dict[str, list] = {
+        "trade_date": ["20240102"],
+        "stock_code": ["000001.SZ"],
+        "label_d2_hit_8pct_hfq": [1.0],
+        "label_d2_peak_return_hfq": [0.1],
+        "label_d2_return_hfq": [0.05],
+        ENTRY_HFQ: [10.0],
+        HIGH_HFQ: [11.0],
+        EXIT_HFQ: [10.5],
+        "label_px_d1_open": [10.0],
+        "label_open_gap": [0.0],
+    }
+    fields: dict[str, dict] = {}
+    audits: set[str] = set()
+    feature_names: list[str] = []
+    for group in range(group_count):
+        feature = f"feat_{group:03d}"
+        feature_names.append(feature)
+        data[feature] = [float(group)]
+        audit = {
+            "source_date": f"source_{group}",
+            "as_of_time": f"asof_{group}",
+            "price_basis": f"basis_{group}",
+            "adj_factor_version": f"version_{group}",
+            "horizon": 0,
+        }
+        fields[feature] = audit
+        audits.update(value for key, value in audit.items() if key != "horizon")
+        data[audit["source_date"]] = ["20240102"]
+        data[audit["as_of_time"]] = ["2024-01-02T15:00:00+08:00"]
+        data[audit["price_basis"]] = ["hfq"]
+        data[audit["adj_factor_version"]] = [VERSION]
+    for outcome in (
+        "label_d2_hit_8pct_hfq",
+        "label_d2_peak_return_hfq",
+        "label_d2_return_hfq",
+        ENTRY_HFQ,
+        HIGH_HFQ,
+        EXIT_HFQ,
+    ):
+        fields[outcome] = fields["feat_000"].copy()
+    event_path = tmp_path / "wide-events.parquet"
+    pd.DataFrame(data).to_parquet(event_path, index=False)
+    lineage_path = tmp_path / "lineage.json"
+    lineage_path.write_text(
+        json.dumps({"schema_version": 1, "fields": fields}), encoding="utf-8"
+    )
+    calendar_path = tmp_path / "calendar.parquet"
+    pd.DataFrame({"cal_date": ["20240102"], "is_open": [1]}).to_parquet(
+        calendar_path, index=False
+    )
+
+    validated: list[str] = []
+
+    def fake_validate(path, manifest, governed, **kwargs):
+        validated.extend(governed)
+        validated.extend(kwargs.get("outcome_fields", ()))
+
+    monkeypatch.setattr(backtest_argus, "validate_event_parquet_fields", fake_validate)
+    original_read = pd.read_parquet
+    event_projections: list[set[str]] = []
+
+    def recording_read(path_arg, *args, **kwargs):
+        if Path(path_arg) == event_path:
+            event_projections.append(set(kwargs["columns"]))
+        return original_read(path_arg, *args, **kwargs)
+
+    monkeypatch.setattr(pd, "read_parquet", recording_read)
+
+    frame, features, *_ = load_backtest_frame(
+        event_path,
+        lineage_path,
+        calendar_path,
+        "label_d2_hit_8pct_hfq",
+        "label_d2_peak_return_hfq",
+        "label_d2_return_hfq",
+    )
+
+    assert len(validated) == group_count + 6
+    assert features == feature_names
+    assert event_projections
+    assert all(not (projection & audits) for projection in event_projections)
+    assert frame["unfillable"].tolist() == [False]
 
 
 def _book(scores, unfillable, hit, to_close) -> pd.DataFrame:
