@@ -114,3 +114,9 @@ requires recalibration.
 
 Passing G1 does not override G3. A factor rejected by G3 remains rejected even when its G1
 statistics exceed the placebo thresholds.
+
+<!-- 文档中文命名维护记录（REQ-GH-10）
+updated: 2026-11-04
+首次创建日期未核实；保留原有历史日期。
+变更记录：2026-11-04，同步中文文件名与实际引用；正文历史、版本及验收结论保留。
+-->

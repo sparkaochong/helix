@@ -1,3 +1,9 @@
 # helix
 
-需求与进度唯一入口：[docs/requirements.md](docs/requirements.md)。任务先认领稳定 ID；维护研发与上线两种状态和验证证据。遵守用户全局协作规则：任务分支、worktree、PR；构建与测试只在 Mac mini；不提交凭据；项目文档与 Obsidian `06-Projects/helix/` 保持一致。
+需求与进度唯一入口：[需求总表](docs/需求总表.md)。任务先认领稳定 ID；维护研发与上线两种状态和验证证据。遵守用户全局协作规则：任务分支、worktree、PR；构建与测试只在 Mac mini；不提交凭据；项目文档与 Obsidian `06-Projects/helix/` 保持一致。
+
+<!-- 文档中文命名维护记录（REQ-GH-10）
+updated: 2026-11-04
+首次创建日期未核实；保留原有历史日期。
+变更记录：2026-11-04，同步中文文件名与实际引用；正文历史、版本及验收结论保留。
+-->
