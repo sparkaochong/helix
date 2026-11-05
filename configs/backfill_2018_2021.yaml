@@ -1,0 +1,93 @@
+# Historical backfill config: 2018-01-01 .. 2021-11-30.
+#
+# The local store only covers 2021-12-01 onward (see the 2026-08-15 data baseline
+# audit + docs/data-sources.md); this config exists purely to run:
+#
+#   helix download --config configs/backfill_2018_2021.yaml
+#
+# `download_dated()` skips trade_date/table combinations already on disk
+# (helix/data/store.py::existing_dates), so this is safe to run repeatedly, resume
+# after an interruption, and won't touch or duplicate the 2021-12-01..present data
+# already downloaded under configs/default.yaml. Not meant for `prepare`/`mine` --
+# use configs/default.yaml (or override --config) for those once the backfill lands.
+#
+# Rough cost: 950 trading days x 4 date-partitioned tables (daily/adj_factor/
+# daily_basic/stk_limit) ~= 3,800 API calls, plus one paginated namechange/stock_basic
+# static refresh. At data.requests_per_minute below, that's tens of minutes to a few
+# hours depending on Tushare's actual per-call latency and retry backoff -- run it in
+# the background and let it resume if interrupted.
+#
+# Once complete, revert configs/default.yaml's and configs/argus_neutral.yaml's
+# data.start_date (and helix/config.py's DataConfig default) back to "20180101".
+
+data:
+  root: data
+  start_date: "20180101"
+  end_date: "20211130"
+  calendar_exchange: SSE
+  requests_per_minute: 400
+  max_retries: 5
+
+universe:
+  exclude_st: true
+  min_list_days: 120
+  exclude_exchanges: ["BJ"]
+  min_amount_kcny: 20000
+  min_close: 2.0
+  max_close: 1000.0
+
+label:
+  entry_offset: 1
+  touch_offset: 2
+  target_ratio: 1.08
+  exclude_entry_limit_up: true
+  limit_price_eps: 0.001
+
+split:
+  train_days: 750
+  valid_days: 120
+  test_days: 120
+  step_days: 120
+  embargo_days: 5
+
+gp:
+  population: 400
+  generations: 25
+  tournament_size: 7
+  crossover_prob: 0.6
+  mutation_prob: 0.3
+  init_depth: [2, 5]
+  max_depth: 8
+  max_nodes: 40
+  windows: [3, 5, 10, 20, 60]
+  min_daily_samples: 50
+  min_coverage: 0.4
+  max_abs_corr: 0.7
+  n_keep: 24
+  search_max_stocks: 2000
+  hall_of_fame: 60
+  seed: 20240101
+
+dl:
+  seq_len: 20
+  hidden_size: 96
+  num_layers: 2
+  dropout: 0.2
+  batch_size: 4096
+  epochs: 30
+  lr: 0.001
+  weight_decay: 0.00001
+  early_stopping_patience: 5
+  pos_weight_cap: 20.0
+  clip_sigma: 4.0
+  seed: 20240101
+
+backtest:
+  top_k: 4
+  exit_rule: close
+  enable_realistic_exit: false
+  commission_bps: 2.5
+  transfer_bps: 0.1
+  stamp_sell_bps: 5.0
+  stamp_sell_bps_before_cut: 10.0
+  slippage_bps: 10.0

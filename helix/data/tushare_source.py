@@ -64,6 +64,26 @@ class TushareSource:
                 time.sleep(backoff)
         raise RuntimeError(f"{api} failed after {self.cfg.data.max_retries} retries") from last_err
 
+    def _call_paginated(self, api: str, page_size: int = 5000, **kwargs) -> pd.DataFrame:
+        """Page through an interface that silently caps single-call rows.
+
+        ``namechange`` returns at most ~10,000 rows per call with no error when the
+        true result set is larger -- a request for "everything" silently becomes
+        "the first page of everything". Looping on ``offset``/``limit`` until a
+        short page comes back is the only way to get the true total.
+        """
+        frames: list[pd.DataFrame] = []
+        offset = 0
+        while True:
+            page = self._call(api, offset=offset, limit=page_size, **kwargs)
+            if page is None or page.empty:
+                break
+            frames.append(page)
+            if len(page) < page_size:
+                break
+            offset += page_size
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
     # -------------------------------------------------------------- calendar --
     def trade_dates(self) -> list[str]:
         """Open trade dates in the configured range, ascending."""
@@ -95,16 +115,16 @@ class TushareSource:
 
     # -------------------------------------------------------------- download --
     def download_static(self) -> None:
-        basic_live = self._call("stock_basic", exchange="", list_status="L", fields=",".join(schema.STOCK_BASIC.columns))
-        basic_dead = self._call("stock_basic", exchange="", list_status="D", fields=",".join(schema.STOCK_BASIC.columns))
-        basic_pause = self._call("stock_basic", exchange="", list_status="P", fields=",".join(schema.STOCK_BASIC.columns))
+        basic_live = self._call_paginated("stock_basic", exchange="", list_status="L", fields=",".join(schema.STOCK_BASIC.columns))
+        basic_dead = self._call_paginated("stock_basic", exchange="", list_status="D", fields=",".join(schema.STOCK_BASIC.columns))
+        basic_pause = self._call_paginated("stock_basic", exchange="", list_status="P", fields=",".join(schema.STOCK_BASIC.columns))
         basic = pd.concat([basic_live, basic_dead, basic_pause], ignore_index=True)
         if "delist_date" not in basic.columns:
             basic["delist_date"] = pd.NA
         self.store.write_static(schema.STOCK_BASIC, basic)
         log.info("stock_basic: %d symbols (L/D/P combined)", len(basic))
 
-        names = self._call("namechange", fields=",".join(schema.NAMECHANGE.columns))
+        names = self._call_paginated("namechange", fields=",".join(schema.NAMECHANGE.columns))
         self.store.write_static(schema.NAMECHANGE, names)
         log.info("namechange: %d rows", len(names))
 
