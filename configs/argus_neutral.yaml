@@ -3,7 +3,9 @@
 # scales with the number of base columns; the budget is cut to match.
 data:
   root: data
-  start_date: '20180101'
+  # 2026-08-15: actual downloaded coverage only reaches back to 2021-12-01; revert
+  # to '20180101' once the 2018-01~2021-11 backfill lands (configs/backfill_2018_2021.yaml).
+  start_date: '20211201'
   end_date: ''
   calendar_exchange: SSE
   requests_per_minute: 400

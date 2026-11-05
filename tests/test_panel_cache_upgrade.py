@@ -101,7 +101,7 @@ def test_prepare_rebuilds_a_panel_with_partial_lineage_metadata(monkeypatch, tmp
         fresh.add(field, np.ones(shape), price_lineage=lineage)
     rebuilds: list[bool] = []
     field_rebuilds: list[bool] = []
-    monkeypatch.setattr(pipeline, "build_panel", lambda *args: rebuilds.append(True) or fresh)
+    monkeypatch.setattr(pipeline, "build_panel", lambda *args, **kwargs: rebuilds.append(True) or fresh)
     monkeypatch.setattr(
         pipeline,
         "compute_base_fields",

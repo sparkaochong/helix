@@ -211,7 +211,7 @@ def main() -> None:
     store = ParquetStore(cfg.data.root)
 
     log.info("building HFQ panel %s..%s from %s", start, end or "(latest)", cfg.data.root)
-    panel = build_panel(store, start, end)
+    panel = build_panel(store, start, end, calendar_exchange=cfg.data.calendar_exchange)
     universe_mask = build_universe(panel, store, cfg.universe)
     frame = build_event_frame(panel, universe_mask, cfg)
 

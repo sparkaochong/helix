@@ -1,0 +1,13 @@
+# Mac mini 代码同步验收
+
+需求：REQ-GH-7；负责人：Codex /root。研发状态：开发中；上线状态：无需上线（代码协作迁移，不改变生产服务）。
+
+来源：`origin/fix/data-baseline-remediation`；基线 GitHub main：`8a55a79f71f59d846a4a783d3c8e315411e4cc31`。
+
+本次排除运行缓存、浏览器跟踪、凭据和大体量研究数据；原工作区及已存在 WIP 分支保持，不改写历史。其他功能需求的负责人、研发/上线状态和验收门禁不因同步任务改变。
+
+后续记录 Mac mini 适用验证结果、PR 和目标 SHA。存量盘点未完成，未把全部历史分支当作可直接合并的交付物。
+
+验证结果（2026-11-04，Mac mini）：Mac mini：pytest 全套退出 0；gitleaks 与 diff-check 通过。
+
+源码已准备，待 PR 合入和 Mini 默认工作区 SHA 核对；当前需求研发状态仍为待验收。
