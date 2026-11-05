@@ -12,13 +12,13 @@ import pytest
 
 import scripts.g3_style_ablation as g3
 from helix.config import BacktestConfig
+from helix.eval.bootstrap import circular_block_bootstrap_indices
 from helix.gp.library import FactorLibrary, FactorSpec
 from scripts.g3_style_ablation import (
     TRAIN_END,
     TRAIN_START,
     backtest_top_k,
     bootstrap_metric_summary,
-    circular_block_bootstrap_indices,
     compute_trailing_styles,
     decide_go,
     load_placebo_icir_p95,
@@ -261,15 +261,16 @@ def test_at_least_three_unique_seeds_are_required(seeds):
 
 
 def test_circular_block_bootstrap_is_reproducible_and_keeps_whole_dates():
-    first = circular_block_bootstrap_indices(11, block_length=4, seed=13)
-    second = circular_block_bootstrap_indices(11, block_length=4, seed=13)
-    other = circular_block_bootstrap_indices(11, block_length=4, seed=42)
+    first = circular_block_bootstrap_indices(11, block_length=4, seeds=(13, 42))[0]
+    second = circular_block_bootstrap_indices(11, block_length=4, seeds=(13, 42))[0]
+    other = circular_block_bootstrap_indices(11, block_length=4, seeds=(42, 13))[0]
 
     np.testing.assert_array_equal(first, second)
     assert not np.array_equal(first, other)
     assert len(first) == 11
     assert ((np.diff(first).reshape(-1)[:3] % 11) == 1).all()
     assert first.min() >= 0 and first.max() < 11
+    assert g3.circular_block_bootstrap_indices is circular_block_bootstrap_indices
 
 
 def test_bootstrap_summary_uses_sample_standard_deviation():
@@ -278,10 +279,7 @@ def test_bootstrap_summary_uses_sample_standard_deviation():
 
     seeds = [7, 13, 42]
     summary = bootstrap_metric_summary(9, 3, seeds, metric)
-    values = np.array(
-        [circular_block_bootstrap_indices(9, 3, seed)[0] for seed in seeds],
-        dtype=float,
-    )
+    values = circular_block_bootstrap_indices(9, 3, seeds)[:, 0].astype(float)
 
     assert summary["score"]["mean"] == pytest.approx(values.mean())
     assert summary["score"]["std"] == pytest.approx(values.std(ddof=1))

@@ -21,6 +21,10 @@ from helix.config import PROJECT_ROOT, BacktestConfig, Config
 from helix.data.event_table import build_event_panel
 from helix.data.tushare_source import TushareSource
 from helix.eval.backtest import _cost_rates, _net_returns, summarize_portfolio_returns
+from helix.eval.bootstrap import (
+    circular_block_bootstrap_indices,
+    summarize_metric_runs,
+)
 from helix.eval.ic import daily_ic, summarize_ic
 from helix.eval.metrics import daily_gini, summarize_daily
 from helix.eval.style_neutralize import build_style_design, style_residualize
@@ -177,18 +181,6 @@ def split_training_outcomes(
     return decision_train.reset_index(drop=True), boundary.reset_index(drop=True)
 
 
-def circular_block_bootstrap_indices(
-    n_dates: int, block_length: int, seed: int
-) -> np.ndarray:
-    if n_dates <= 0 or block_length <= 0:
-        raise ValueError("n_dates and block_length must be positive")
-    rng = np.random.default_rng(seed)
-    block_count = int(np.ceil(n_dates / block_length))
-    starts = rng.integers(0, n_dates, size=block_count)
-    offsets = np.arange(block_length)
-    return ((starts[:, None] + offsets[None, :]) % n_dates).reshape(-1)[:n_dates]
-
-
 def bootstrap_metric_summary(
     n_dates: int,
     block_length: int,
@@ -196,21 +188,8 @@ def bootstrap_metric_summary(
     metric: Callable[[np.ndarray], dict[str, float]],
 ) -> dict[str, dict[str, float | list[float]]]:
     seed_values = validate_seed_contract(seeds)
-    runs = [
-        metric(circular_block_bootstrap_indices(n_dates, block_length, seed))
-        for seed in seed_values
-    ]
-    keys = tuple(dict.fromkeys(key for run in runs for key in run))
-    output: dict[str, dict[str, float | list[float]]] = {}
-    for key in keys:
-        values = np.asarray([run.get(key, np.nan) for run in runs], dtype=np.float64)
-        finite = values[np.isfinite(values)]
-        output[key] = {
-            "mean": float(finite.mean()) if finite.size else float("nan"),
-            "std": float(finite.std(ddof=1)) if finite.size > 1 else 0.0,
-            "values": values.tolist(),
-        }
-    return output
+    indices = circular_block_bootstrap_indices(n_dates, block_length, seed_values)
+    return summarize_metric_runs([metric(index) for index in indices])
 
 
 def compute_trailing_styles(
