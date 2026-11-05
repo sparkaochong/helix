@@ -48,7 +48,7 @@ DEFAULT_INPUT = ROOT / "data/raw/argus_quant_working.parquet"
 DEFAULT_LIBRARY = ROOT / "data/artifacts/argus/event_factors.json"
 DEFAULT_PRICE_CACHE = ROOT / "data/raw/d2_exit_cache"
 DEFAULT_CONFIG = ROOT / "configs/default.yaml"
-DESIGNATED_REPORT = ROOT / "docs/risk/adjustment_unification_fix.md"
+DESIGNATED_REPORT = ROOT / "docs/risk/后复权基线统一修复说明.md"
 DEFAULT_REPORT = DESIGNATED_REPORT
 
 EXPECTED_RAW_IC = -0.0627748063907745
@@ -866,7 +866,7 @@ def render_report(payload: dict[str, Any]) -> str:
 
 **目标错配是主导亏损原因。** `gp_000` 的历史准入目标与 D+2 收盘净收益目标错配；本次工作只建立可审计的合规复权基线，不修复老因子的盈利能力。后续新一代 GP 因子必须从带四元血缘的 HFQ 新链路生成。
 
-现有 `gp_000` 成品特征与 event 表仅作为“修复前 legacy 基线”保留。其上游价格口径和 `source_date/as_of_time/price_basis/adj_factor_version` 不可追溯，本报告不将其补写为已验证 raw 或 HFQ，也不改写任何既有实验结论。详见[治理台账 D10](../factor-governance.md)与[既有专项审计](gp000_loss_attribution.md)。
+现有 `gp_000` 成品特征与 event 表仅作为“修复前 legacy 基线”保留。其上游价格口径和 `source_date/as_of_time/price_basis/adj_factor_version` 不可追溯，本报告不将其补写为已验证 raw 或 HFQ，也不改写任何既有实验结论。详见[治理台账 D10](../Helix因子研发规范与风控总纲.md)与[既有专项审计](gp_000亏损根因排查与复权全链路审计.md)。
 
 ## 修复合同
 
@@ -941,7 +941,7 @@ CLI 标准输出同时提供严格 JSON，其中 `legacy_unverified_lineage=true
 
 - “修复前 raw”只描述 event outcome 与历史行情缓存的重建关系，不代表 legacy 特征的上游价格口径已获认证。
 - 本次没有重新训练、调参或改变正式因子方向；分数由冻结的正式表达式和既有成品特征确定，两个对照臂不重新选股。
-- 本报告不替代、不覆盖 `docs/risk/gp000_loss_attribution.md`，也不修改历史 artifacts。
+- 本报告不替代、不覆盖 `docs/risk/gp_000亏损根因排查与复权全链路审计.md`，也不修改历史 artifacts。
 - 新一代 GP 因子不得通过 legacy adapter 进入正式训练；必须使用新的 HFQ 血缘强契约链路。
 - 报告发布与输入完整性实现依赖 POSIX `dir_fd`、`O_DIRECTORY`、`O_NOFOLLOW` 和 descriptor-relative rename；不具备这些能力的平台会在读取或写入前明确终止。
 """

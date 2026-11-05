@@ -46,7 +46,7 @@ MIN_DAILY_SAMPLES = 50
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT = ROOT / "data/raw/argus_quant_working.parquet"
 DEFAULT_BARS = ROOT / "data/raw/suspension_cache/bars_20220301_20241031_79.parquet"
-DEFAULT_REPORT = ROOT / "docs/risk/objective_pnl_alignment.md"
+DEFAULT_REPORT = ROOT / "docs/risk/目标函数与真实P&L对齐专项报告.md"
 LIBRARIES = {
     "formal": ROOT / "data/artifacts/argus/event_factors.json",
     "argus_multi": ROOT / "data/artifacts/argus_multi/event_factors.json",

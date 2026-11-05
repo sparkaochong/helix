@@ -1,7 +1,7 @@
 # Historical backfill config: 2018-01-01 .. 2021-11-30.
 #
 # The local store only covers 2021-12-01 onward (see the 2026-08-15 data baseline
-# audit + docs/data-sources.md); this config exists purely to run:
+# audit + docs/Helix数据源目录.md); this config exists purely to run:
 #
 #   helix download --config configs/backfill_2018_2021.yaml
 #

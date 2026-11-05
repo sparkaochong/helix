@@ -42,7 +42,7 @@ DEFAULT_N40_LIBRARY = Path("data/artifacts/argus_n40/event_factors.json")
 DEFAULT_MULTI_LIBRARY = Path("data/artifacts/argus_multi/event_factors.json")
 DEFAULT_DISTRIBUTION = Path("data/artifacts/placebo_ic_distribution.parquet")
 DEFAULT_SCREENING = Path("data/artifacts/placebo_factor_screening.parquet")
-DEFAULT_REPORT = Path("docs/risk/placebo_ic_calibration.md")
+DEFAULT_REPORT = Path("docs/risk/安慰剂IC与Gini校准.md")
 
 BEGIN_MARKER = "# BEGIN PLACEBO CALIBRATION"
 END_MARKER = "# END PLACEBO CALIBRATION"

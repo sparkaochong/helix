@@ -11,7 +11,7 @@ modules' fail-closed lineage validators. This module returns a canonical ``YYYYM
 *string* -- the raw-store convention -- for the different, currently-hypothetical use
 case of joining the legacy event table against the raw tables. It does not rewrite
 ``argus_quant_working.parquet`` itself; that file is a frozen legacy artifact per
-``docs/factor-governance.md``.
+``docs/Helix因子研发规范与风控总纲.md``.
 """
 
 from __future__ import annotations

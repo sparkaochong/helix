@@ -60,7 +60,7 @@ DEFAULT_PRICE_CACHE = ROOT / "data/raw/d2_exit_cache"
 DEFAULT_STYLE_MARKET = ROOT / "data/artifacts/g3_style_market.parquet"
 DEFAULT_INDUSTRIES = ROOT / "data/artifacts/g3_sw2021_members.parquet"
 DEFAULT_CONFIG = ROOT / "configs/default.yaml"
-DEFAULT_REPORT = ROOT / "docs/risk/gp000_loss_attribution.md"
+DEFAULT_REPORT = ROOT / "docs/risk/gp_000亏损根因排查与复权全链路审计.md"
 DEFAULT_JSON = ROOT / "data/artifacts/gp000_loss_attribution.json"
 DEFAULT_DAILY = ROOT / "data/artifacts/gp000_loss_attribution_daily.parquet"
 DEFAULT_EQUITY_SVG = ROOT / "docs/risk/assets/gp000_loss_attribution_equity.svg"
@@ -1877,7 +1877,7 @@ def build_evidence(
         "8% 触达优化目标，而生产验收是 D+2 收盘净收益；对应 D+2 IC="
         f"{d2_return_ic:.4f}，风格中性 CAGR={style['style_neutral']['cagr']:.2%}，"
         "说明剥离风格后仍无可用纯 alpha。详见"
-        "[治理台账 D10](../factor-governance.md)。"
+        "[治理台账 D10](../Helix因子研发规范与风控总纲.md)。"
     )
     metadata = {
         "train_start": TRAIN_START,

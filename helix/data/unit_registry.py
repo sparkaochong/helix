@@ -1,6 +1,6 @@
 """Cross-source unit conversions for Tushare fields that share a name but not a unit.
 
-``stock_bak_daily`` is not ingested by Helix (see docs/data-sources.md) -- nothing in
+``stock_bak_daily`` is not ingested by Helix (see docs/Helix数据源目录.md) -- nothing in
 this codebase reads ``bak_daily.amount`` today. This module exists so that *if* it
 ever is ingested, the conversion is a single reviewed call site instead of tribal
 knowledge someone has to rediscover the hard way: ``daily.amount`` (the table Helix

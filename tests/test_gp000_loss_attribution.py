@@ -1042,13 +1042,13 @@ def test_emit_audit_trace_logs_each_checkpoint(
 
 def test_d10_ledger_and_report_are_reciprocally_linked() -> None:
     root = Path(__file__).resolve().parents[1]
-    ledger = (root / "docs/factor-governance.md").read_text(encoding="utf-8")
-    report = (root / "docs/risk/gp000_loss_attribution.md").read_text(
+    ledger = (root / "docs/Helix因子研发规范与风控总纲.md").read_text(encoding="utf-8")
+    report = (root / "docs/risk/gp_000亏损根因排查与复权全链路审计.md").read_text(
         encoding="utf-8"
     )
 
-    assert "[专项报告](risk/gp000_loss_attribution.md)" in ledger
-    assert "[治理台账 D10](../factor-governance.md)" in report
+    assert "[专项报告](risk/gp_000亏损根因排查与复权全链路审计.md)" in ledger
+    assert "[治理台账 D10](../Helix因子研发规范与风控总纲.md)" in report
     for frozen_impact in ("1,425 个收益样本不同", "48 个真实 hit 翻转", "+0.022226%"):
         assert frozen_impact in ledger
 
