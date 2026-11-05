@@ -878,7 +878,7 @@ def main() -> None:
         default=Path("data/artifacts/d2_limit_down_bias_daily.parquet"),
     )
     parser.add_argument(
-        "--report-out", type=Path, default=Path("docs/risk/d2_limit_down_bias.md")
+        "--report-out", type=Path, default=Path("docs/risk/D+2跌停递延平仓偏差量化.md")
     )
     parser.add_argument("--refresh-market", action="store_true")
     args = parser.parse_args()

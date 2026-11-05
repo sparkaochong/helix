@@ -65,7 +65,7 @@ DEFAULT_PLACEBO = PROJECT_ROOT / "data/artifacts/placebo_ic_distribution.parquet
 DEFAULT_MARKET_CACHE = PROJECT_ROOT / "data/artifacts/g3_style_market.parquet"
 DEFAULT_INDUSTRY_CACHE = PROJECT_ROOT / "data/artifacts/g3_sw2021_members.parquet"
 DEFAULT_RESULT = PROJECT_ROOT / "data/artifacts/g3_style_ablation.json"
-DEFAULT_REPORT = PROJECT_ROOT / "docs/risk/g3_style_ablation.md"
+DEFAULT_REPORT = PROJECT_ROOT / "docs/risk/G3风格因子消融验证.md"
 
 
 def _date_text(values: pd.Series | np.ndarray | Sequence[object]) -> np.ndarray:

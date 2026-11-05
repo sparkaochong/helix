@@ -197,9 +197,9 @@ def test_full_chain_fails_closed_at_first_price_node_without_lineage() -> None:
 
 def test_d10_and_adjustment_report_keep_exact_reciprocal_evidence() -> None:
     root = Path(__file__).resolve().parents[1]
-    ledger = (root / "docs/factor-governance.md").read_text(encoding="utf-8")
-    report = (root / "docs/risk/adjustment_unification_fix.md").read_text(encoding="utf-8")
-    historical = (root / "docs/risk/gp000_loss_attribution.md").read_text(encoding="utf-8")
+    ledger = (root / "docs/Helix因子研发规范与风控总纲.md").read_text(encoding="utf-8")
+    report = (root / "docs/risk/后复权基线统一修复说明.md").read_text(encoding="utf-8")
+    historical = (root / "docs/risk/gp_000亏损根因排查与复权全链路审计.md").read_text(encoding="utf-8")
     d10_rows = [line for line in ledger.splitlines() if line.startswith("| **D10**")]
     assert len(d10_rows) == 1
     d10 = d10_rows[0]
@@ -238,11 +238,11 @@ def test_d10_and_adjustment_report_keep_exact_reciprocal_evidence() -> None:
 
     ledger_links = dict(re.findall(r"\[([^]]+)]\(([^)]+)\)", status))
     assert ledger_links == {
-        "专项报告": "risk/gp000_loss_attribution.md",
-        "修复说明": "risk/adjustment_unification_fix.md",
+        "专项报告": "risk/gp_000亏损根因排查与复权全链路审计.md",
+        "修复说明": "risk/后复权基线统一修复说明.md",
     }
-    assert "[治理台账 D10](../factor-governance.md)" in report
-    assert "[治理台账 D10](../factor-governance.md)" in historical
+    assert "[治理台账 D10](../Helix因子研发规范与风控总纲.md)" in report
+    assert "[治理台账 D10](../Helix因子研发规范与风控总纲.md)" in historical
 
     report_net = re.search(
         r"\| Top4 单笔净收益 \| (-?\d+\.\d+)% \| (-?\d+\.\d+)% \| ([+-]?\d+\.\d+)% \|",

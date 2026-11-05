@@ -226,7 +226,7 @@ def test_render_is_read_only_and_publish_only_accepts_designated_report(
 
     report_dir = tmp_path / "worktree" / "docs" / "risk"
     report_dir.mkdir(parents=True)
-    output = report_dir / "adjustment_unification_fix.md"
+    output = report_dir / "后复权基线统一修复说明.md"
     monkeypatch.setattr(baseline_module, "DESIGNATED_REPORT", output)
 
     publish_report(report, output)
@@ -236,7 +236,7 @@ def test_render_is_read_only_and_publish_only_accepts_designated_report(
     publish_report(report, output)
     assert stat.S_IMODE(output.stat().st_mode) == 0o640
 
-    historical = report_dir / "gp000_loss_attribution.md"
+    historical = report_dir / "gp_000亏损根因排查与复权全链路审计.md"
     historical.write_bytes(b"historical-sentinel")
     other_doc = report_dir / "other.md"
     outside = tmp_path / "main-data" / "artifact.md"
@@ -286,7 +286,7 @@ def test_publish_is_anchored_against_parent_symlink_substitution(
 ) -> None:
     report_dir = tmp_path / "worktree" / "docs" / "risk"
     report_dir.mkdir(parents=True)
-    designated = report_dir / "adjustment_unification_fix.md"
+    designated = report_dir / "后复权基线统一修复说明.md"
     moved_dir = tmp_path / "moved-risk"
     outside_dir = tmp_path / "outside"
     outside_dir.mkdir()
@@ -326,7 +326,7 @@ def test_publish_rejects_docs_ancestor_substitution(
     worktree = tmp_path / "worktree"
     report_dir = worktree / "docs" / "risk"
     report_dir.mkdir(parents=True)
-    designated = report_dir / "adjustment_unification_fix.md"
+    designated = report_dir / "后复权基线统一修复说明.md"
     moved_docs = tmp_path / "moved-docs"
     outside = tmp_path / "outside"
     (outside / "risk").mkdir(parents=True)

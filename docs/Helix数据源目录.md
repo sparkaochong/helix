@@ -1,6 +1,10 @@
+---
+updated: 2026-11-04
+---
+
 # Helix 数据源目录
 
-> **文档定位**：记录 Tushare Pro token 当前实际可访问的接口目录，作为评估"是否值得为某个因子方向新增数据接入"时的查表依据。`helix/data/schema.py` 是**已接入**表的唯一权威契约；本文覆盖的是**已验证可访问但尚未接入**的接口，帮助判断 `docs/factor-governance.md` §3.7 所说的"引入新的原始信息"具体有哪些选项。
+> **文档定位**：记录 Tushare Pro token 当前实际可访问的接口目录，作为评估"是否值得为某个因子方向新增数据接入"时的查表依据。`helix/data/schema.py` 是**已接入**表的唯一权威契约；本文覆盖的是**已验证可访问但尚未接入**的接口，帮助判断 `docs/Helix因子研发规范与风控总纲.md` §3.7 所说的"引入新的原始信息"具体有哪些选项。
 >
 > **核验方式**：对每个接口发一次最小参数的真实请求（`trade_date=20260731` 或 `ts_code=000001.SZ` 或最近一期报告期），记录返回行数与字段数；权限错误与参数错误分别标注，不混为一谈。
 > **核验日期**：2026-08-15（token 更换后）
@@ -9,7 +13,7 @@
 
 ## 1. 已接入 helix 的数据源
 
-这 7 张表由 `helix/data/schema.py` 定义、`tushare_source.py` 下载、`ParquetStore` 落盘，是当前面板构建（`panel.py`）唯一依赖的数据来源。字段契约、单位口径、复权规则见 `docs/architecture.md` §3 与本次基线校验报告。
+这 7 张表由 `helix/data/schema.py` 定义、`tushare_source.py` 下载、`ParquetStore` 落盘，是当前面板构建（`panel.py`）唯一依赖的数据来源。字段契约、单位口径、复权规则见 `docs/Helix架构设计文档.md` §3 与本次基线校验报告。
 
 | 接口 | 用途 | 状态 |
 |---|---|---|
@@ -142,15 +146,15 @@
 ## 4. 接入前必须核对的口径陷阱
 
 1. **`bak_daily.amount` 是万元，`daily.amount` 是千元**——相差 10 倍，混用会产生量级错误（详见基线校验报告 Step 2）。**已加装守护工具** `helix/data/unit_registry.py::bak_daily_amount_to_kcny()`（含真实数值对回归测试 `tests/test_unit_registry.py`），但 `bak_daily` 本身仍未接入下载管道——真正接入时必须走这个转换，不能绕开。
-2. **`daily`/`adj_factor`/`daily_basic`/`stk_limit` 等已接入表全部用 `trade_date=YYYYMMDD`**；新接口逐个确认日期字段格式后再对齐。**已加装统一工具** `helix/data/dates.py::normalize_trade_date()`，兼容 `YYYYMMDD` 与 `YYYY-MM-DD`。这解决的是"以后要 join 不同格式的表"这个通用问题；`argus_quant_working.parquet` 本身用 `YYYY-MM-DD`，`docs/factor-governance.md` 已把它冻结为 legacy 基线，**不会**被这个工具改写——它是给未来 join 代码用的桥接函数，不是文件迁移脚本。
+2. **`daily`/`adj_factor`/`daily_basic`/`stk_limit` 等已接入表全部用 `trade_date=YYYYMMDD`**；新接口逐个确认日期字段格式后再对齐。**已加装统一工具** `helix/data/dates.py::normalize_trade_date()`，兼容 `YYYYMMDD` 与 `YYYY-MM-DD`。这解决的是"以后要 join 不同格式的表"这个通用问题；`argus_quant_working.parquet` 本身用 `YYYY-MM-DD`，`docs/Helix因子研发规范与风控总纲.md` 已把它冻结为 legacy 基线，**不会**被这个工具改写——它是给未来 join 代码用的桥接函数，不是文件迁移脚本。
 3. 财务类接口（`income`/`balancesheet`/`cashflow`/`fina_indicator`）返回**多个口径版本**（如 `balancesheet` 同一 `period` 返回合并 / 母公司两行），接入前需明确按 `report_type` / `comp_type` 过滤，避免重复行造成面板错位。
-4. 任何新接入的数据源，落盘前都必须过 `helix/data/schema.py` 同款的显式列契约校验，不能绕开 `docs/factor-governance.md` §5.1 的标签前缀盲扫等既有防泄漏机制。
+4. 任何新接入的数据源，落盘前都必须过 `helix/data/schema.py` 同款的显式列契约校验，不能绕开 `docs/Helix因子研发规范与风控总纲.md` §5.1 的标签前缀盲扫等既有防泄漏机制。
 
 ---
 
 ## 5. 与因子挖掘方向的对应关系
 
-`docs/factor-governance.md` §3.7 指出，继续挖因子必须引入"表外新信息"（盘口、资讯、其他频率），而不是对已有列重新编码。上表里对应的候选方向：
+`docs/Helix因子研发规范与风控总纲.md` §3.7 指出，继续挖因子必须引入"表外新信息"（盘口、资讯、其他频率），而不是对已有列重新编码。上表里对应的候选方向：
 
 | 方向 | 候选接口 |
 |---|---|
@@ -180,3 +184,13 @@
 | `trade_date` 格式桥接 | **已加装工具**，见 §4 第 2 条 |
 
 完整的修复前后对比、校验数据与剩余风险见修复验证报告（Artifact，随本轮提交发布）。
+
+<!-- 文档中文命名维护记录（REQ-GH-10）
+updated: 2026-11-04
+首次创建日期未核实；保留原有历史日期。
+变更记录：2026-11-04，同步中文文件名与实际引用；正文历史、版本及验收结论保留。
+-->
+
+## 变更记录
+
+- 2026-11-04：文档中文命名与引用同步。
